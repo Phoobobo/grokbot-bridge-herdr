@@ -1,0 +1,123 @@
+# grokbot-bridge-herdr
+
+[中文](#中文) · [English](#english)
+
+## 中文
+
+让 Grok Bot 通过 [Herdr](https://herdr.dev) 驱动和监控你本机的编码 agent（grok、codex），并且可以把你自己的某些窗格交给 Grok Bot 接管、随时收回。
+
+- **状态回调**：Herdr 插件监听 `pane.agent_status_changed`，只对“托管窗格”生效；agent 进入 `done` / `idle` / `blocked` 时向 Grok Bot 的 webhook 发一条很小的 JSON（不含终端输出、不含密钥），带去重，后台 curl 不会卡住 Herdr。
+- **托管窗格登记表**：`~/.local/state/grokbot-bridge-herdr/managed.json`，按 pane id 记录 task、agent 名称、类型、仓库、worktree、来源（launched / handover）。
+- **交接 / 收回**：在 Herdr 命令面板对当前窗格执行 “Grok Bot: take over this pane” 或 “Grok Bot: give this pane back to me”。托管窗格会显示 `🤖 Grok Bot: <task>` 标记。
+- **`gbb` 命令行**：Grok Bot 通过远程 shell 调用，全部 JSON 输出：`launch / list / status / read / send / keys / wait / result / stop / handover / reclaim / doctor / test-webhook`。
+
+### 安装
+
+```sh
+git clone git@github.com:Phoobobo/grokbot-bridge-herdr.git ~/Workspace/grokbot-bridge-herdr
+cd ~/Workspace/grokbot-bridge-herdr && ./install.sh      # 软链 gbb 到 ~/.local/bin，并 herdr plugin link
+mkdir -p ~/.config/grokbot-bridge-herdr
+cp config.example.toml ~/.config/grokbot-bridge-herdr/config.toml
+chmod 600 ~/.config/grokbot-bridge-herdr/config.toml     # 不是 600 就拒绝发送
+# 编辑 config.toml：填 webhook_url、webhook_header_name、webhook_header_value（从 Grok Bot routine 面板复制）
+gbb doctor && gbb test-webhook
+```
+
+依赖：herdr ≥ 0.9.0、jq、git、curl（macOS 自带 jq/curl/git）。卸载：`./uninstall.sh`（保留配置、登记表、日志和 worktree）。
+
+### 快捷键（可选）
+
+在 `~/.config/herdr/config.toml` 里加（先确认按键没被占用），然后 `herdr server reload-config`：
+
+```toml
+[[keys.command]]
+key = "prefix+g"
+type = "plugin_action"
+command = "phoobobo.grokbot-bridge.handover"
+description = "hand pane to Grok Bot"
+
+[[keys.command]]
+key = "prefix+G"
+type = "plugin_action"
+command = "phoobobo.grokbot-bridge.reclaim"
+description = "take pane back from Grok Bot"
+```
+
+### 安全边界
+
+- 只处理登记过的窗格；`gbb stop` 只关闭 gbb 自己创建的工作区，交接来的窗格只注销、不关闭。
+- 从不执行 `herdr server stop`；从不在 Grok 的 “Help improve Grok” 横幅上选 Opt in。
+- webhook 只含 id 和状态；鉴权 header 通过 stdin 传给 curl，不出现在进程列表；日志只记录主机名。
+- 可选 `allowed_repos` 限制 `gbb launch` 能用的仓库。
+
+### Codex
+
+`gbb launch --kind codex` 同样可用（herdr 0.9.3 + codex-cli 0.164.0 已测）。注意：
+
+- 新目录首次启动会弹 “Trust this folder?”，之后可能还有 “hooks need review” 界面。gbb 返回 `state: startup_blocked`，由 Grok Bot 先 `gbb read` 看清再用 `gbb keys` 处理（不会自动信任 hooks），然后 `gbb send` 发任务。
+- herdr 目前拿不到 codex 的 session id，`gbb result` 给出 `cd <worktree> && codex resume --last`。
+- `codex exec --json` 适合无界面的一次性任务；`codex app-server` 仍是实验性接口。走 herdr 的好处是窗格可见、可接管、状态统一。
+
+## English
+
+Let Grok Bot drive and watch local coding agents (grok, codex) through [Herdr](https://herdr.dev), and let you hand some of your own panes over to Grok Bot and take them back.
+
+- **Status webhook** — the plugin hooks `pane.agent_status_changed`, acts only on managed panes, and POSTs a small JSON (no terminal output, no secrets) on `done` / `idle` / `blocked`. Debounced; curl runs in the background with a short timeout, so Herdr never blocks.
+- **Managed-pane registry** — `~/.local/state/grokbot-bridge-herdr/managed.json`, keyed by pane id: task id, agent name, kind, repo, worktree, origin (`launched` | `handover`).
+- **Handover / reclaim** — pane actions in the Herdr command palette: "Grok Bot: take over this pane" and "Grok Bot: give this pane back to me". Managed panes show a `🤖 Grok Bot: <task>` marker.
+- **`gbb` CLI** — what Grok Bot calls over remote shell; every command prints JSON.
+
+### Install
+
+See the Chinese section above for the commands (`./install.sh`, copy `config.example.toml` to `~/.config/grokbot-bridge-herdr/config.toml`, `chmod 600`, fill `webhook_url` + `webhook_header_name` + `webhook_header_value` from the Grok Bot routine panel, then `gbb doctor && gbb test-webhook`). Optional keybindings are shown above.
+
+### Commands
+
+```text
+gbb launch --repo <path> --kind grok|codex --task <id> [--worktree <branch>|--no-worktree] [--base <ref>]
+           (--prompt <text> | --prompt-file <f>) [-- <agent args>]
+    git worktree under ~/.local/share/grokbot-bridge-herdr/worktrees/<repo>-<task> (branch gbb/<task>),
+    new Herdr workspace with --no-focus, `herdr agent start` with retry, settle, prompt with stall retry,
+    registers the pane. Returns task_id, pane_id, agent_name, worktree, branch, status, session_id.
+gbb list                          managed panes + live status
+gbb status <task|pane>            herdr agent info + git status/log + session id + resume command
+gbb read <task|pane> [--lines N]  terminal text (use to inspect blocked dialogs)
+gbb send <task|pane> <text>       follow-up prompt
+gbb keys <task|pane> <key>...     answer dialogs (e.g. enter, esc, down, y)
+gbb wait <task|pane> [--until S]  block until a state (fallback when webhooks are not configured)
+gbb result <task|pane>            commits since launch, diff stat, branch, uncommitted, session id, resume
+gbb stop <task|pane>              close only the workspace gbb created; handover panes are just unregistered
+gbb handover --pane <id> [--note] / gbb reclaim --pane <id>
+gbb doctor / gbb test-webhook
+```
+
+### Codex
+
+`gbb launch --kind codex` works the same way (tested with Herdr 0.9.3 and codex-cli 0.164.0). On first start in a new folder codex shows "Trust this folder?" and possibly a "hooks need review" screen. gbb returns `state: startup_blocked`; Grok Bot inspects it with `gbb read`, answers with `gbb keys` (it never trusts hooks automatically), then sends the task with `gbb send`. Herdr does not report codex session ids yet, so `gbb result` suggests `cd <worktree> && codex resume --last`. `codex exec --json` suits headless one-shot jobs and `codex app-server` is still experimental; the Herdr route keeps a visible pane you can take over, with the same status signal as grok.
+
+### Notes from testing
+
+- Grok's default permission policy auto-approves most shell commands (including `rm` inside the repo and `curl`), so `blocked` mostly comes from interactive questions or real permission prompts.
+- `herdr plugin action invoke` acts on the focused pane; use the command palette or a keybinding in the pane you want to hand over.
+
+### Webhook payload
+
+```json
+{"source":"grokbot-bridge-herdr","version":"0.1.0","event":"agent_status","hostname":"mbp",
+ "task_id":"demo","pane_id":"wAX:p1","workspace_id":"wAX","agent_kind":"grok","agent_name":"gb-demo",
+ "origin":"launched","repo":"/Users/me/repo","worktree":"/Users/me/.local/share/grokbot-bridge-herdr/worktrees/repo-demo",
+ "branch":"gbb/demo","status":"done","ts":"2026-10-28T00:00:00Z"}
+```
+
+`event` is one of `agent_status` (with `status` = `done` | `idle` | `blocked`), `handover`, `reclaim`, `stopped`, `pane_closed`, `test`.
+
+### End-to-end check
+
+```sh
+gbb launch --repo ~/scratch-repo --kind grok --task e2e --prompt "Create hello.txt and commit it"
+gbb wait e2e --until done --until idle --until blocked --timeout 300000
+gbb result e2e && gbb stop e2e
+tail ~/.local/state/grokbot-bridge-herdr/bridge.log
+```
+
+Architecture and rationale: [docs/decisions/0001-architecture.md](docs/decisions/0001-architecture.md).

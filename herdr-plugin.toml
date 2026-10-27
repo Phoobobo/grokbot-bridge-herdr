@@ -1,0 +1,28 @@
+id = "phoobobo.grokbot-bridge"
+name = "Grok Bot Bridge"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Let Grok Bot drive and watch agent panes: status webhooks, managed-pane registry, handover/reclaim"
+platforms = ["macos", "linux"]
+
+# Status changes of managed panes -> webhook to Grok Bot (done / idle / blocked only).
+[[events]]
+on = "pane.agent_status_changed"
+command = ["/bin/sh", "bin/gbb", "hook"]
+
+# Forget managed panes that close so the registry never points at a reused pane id.
+[[events]]
+on = "pane.closed"
+command = ["/bin/sh", "bin/gbb", "hook"]
+
+[[actions]]
+id = "handover"
+title = "Grok Bot: take over this pane"
+contexts = ["pane"]
+command = ["/bin/sh", "bin/gbb", "action", "handover"]
+
+[[actions]]
+id = "reclaim"
+title = "Grok Bot: give this pane back to me"
+contexts = ["pane"]
+command = ["/bin/sh", "bin/gbb", "action", "reclaim"]

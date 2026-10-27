@@ -1,0 +1,24 @@
+# ~/.config/grokbot-bridge-herdr/config.toml   (chmod 600 — gbb refuses to send otherwise)
+# Copy:  mkdir -p ~/.config/grokbot-bridge-herdr && cp config.example.toml ~/.config/grokbot-bridge-herdr/config.toml && chmod 600 ~/.config/grokbot-bridge-herdr/config.toml
+
+# Grok Bot routine webhook URL (shown in the routine's trigger panel).
+webhook_url = ""
+
+# Auth header Grok Bot expects. Copy the exact header name and the key from the routine panel.
+webhook_header_name = ""
+webhook_header_value = ""
+
+# Seconds before the background POST gives up (never blocks Herdr).
+webhook_timeout_sec = 5
+
+# Repeated identical `blocked` events within this window are dropped.
+debounce_sec = 15
+
+# Seconds to let the agent TUI settle after `herdr agent start` before the first prompt.
+startup_settle_sec = 4
+
+# Optional: only allow `gbb launch` in repos under these paths (single line). Empty = any git repo.
+# allowed_repos = ["~/Workspace", "~/herdr-bridge-test"]
+
+# Env overrides: GBB_WEBHOOK_URL, GBB_WEBHOOK_HEADER_NAME, GBB_WEBHOOK_HEADER_VALUE, GBB_CONFIG,
+# GBB_STATE_DIR (default ~/.local/state/grokbot-bridge-herdr), GBB_DATA_DIR (default ~/.local/share/grokbot-bridge-herdr)
