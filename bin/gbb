@@ -49,6 +49,16 @@ cfg_list() {
   sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\[\(.*\)\][[:space:]]*\$/\1/p" "$CONFIG_FILE" | head -n 1 |
     tr ',' '\n' | sed 's/^[[:space:]]*"//; s/"[[:space:]]*$//' | sed '/^$/d'
 }
+# cfg_array <key> — single-line TOML array of double-quoted strings -> one item per line.
+# Unlike cfg_list it keeps commas and escaped quotes inside items (e.g. "model_reasoning_effort=\"xhigh\""),
+# by parsing the array as JSON (TOML basic strings with standard escapes are valid JSON).
+# Returns 1 if the key is present but not parseable.
+cfg_array() {
+  [ -f "$CONFIG_FILE" ] || return 0
+  raw=$(sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\(\[.*\]\)[[:space:]]*\$/\1/p" "$CONFIG_FILE" | head -n 1)
+  [ -n "$raw" ] || return 0
+  printf '%s' "$raw" | jq -r 'if type == "array" and all(.[]; type == "string") then .[] else error("not a string array") end' 2>/dev/null
+}
 file_mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null; }
 expand_home() { case "$1" in "~") printf '%s' "$HOME" ;; "~/"*) printf '%s/%s' "$HOME" "${1#\~/}" ;; *) printf '%s' "$1" ;; esac; }
 abspath() { (cd "$1" 2>/dev/null && pwd -P); }
@@ -275,35 +285,88 @@ arm_pane() { # arm_pane <pane>: from now on status changes produce webhooks
   registry_update 'if .panes[$p] then .panes[$p].armed = true else . end' --arg p "$1"
 }
 
-prompt_with_retry() { # prompt_with_retry <name> <text> -> sets PROMPT_RESULT
-  n="$1"; text="$2"; attempt=0
-  snippet=$(printf '%s' "$text" | head -n 1 | cut -c1-24)
+# screen_tail <pane> [lines] — last non-blank lines of the visible screen.
+screen_tail() { "$HERDR" pane read "$1" --source visible --lines 60 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n "${2:-8}"; }
+agent_status_of() { "$HERDR" agent get "$1" 2>/dev/null | jq -r '.result.agent.agent_status // empty'; }
+# Codex's TUI shows "• Working (Ns • esc to interrupt)" while a turn runs; herdr's status can lag behind it.
+screen_busy() { screen_tail "$1" 12 | grep -E -q 'esc to interrupt|Working \('; }
+
+# wait_input_ready <pane> <kind> — after `herdr agent start` reports ready, codex can still be loading
+# (animated splash, MCP/plugin startup) and silently drops typed input. Wait until the agent is idle/done,
+# the screen has stopped changing for two polls, and (codex) the "›" composer line is drawn.
+# Bounded by startup_ready_timeout_sec (default 90); returns 1 on timeout but launch still tries to prompt.
+wait_input_ready() {
+  pane="$1"; k="$2"
+  limit=$(cfg_get startup_ready_timeout_sec); limit=${limit:-90}
+  t0=$(now); prev=""; stable=0
+  while [ $(($(now) - t0)) -lt "$limit" ]; do
+    st=$(agent_status_of "$pane")
+    cur=$(screen_tail "$pane" 8)
+    ok=1
+    case "$st" in idle | done) ;; *) ok=0 ;; esac
+    [ "$k" = codex ] && { printf '%s\n' "$cur" | grep -q '^›' || ok=0; }
+    if [ "$ok" = 1 ] && [ -n "$cur" ] && [ "$cur" = "$prev" ]; then stable=$((stable + 1)); else stable=0; fi
+    [ "$stable" -ge 2 ] && { log "input ready $pane after $(($(now) - t0))s"; return 0; }
+    prev="$cur"; sleep 1
+  done
+  log "input not confirmed ready $pane after ${limit}s (status=$st)"
+  return 1
+}
+
+# prompt_with_retry <agent-name> <pane> <text> -> sets PROMPT_RESULT (always a JSON document), returns
+# 0 delivered, 1 failed, 2 agent blocked. Never re-types text that is already in the composer or transcript,
+# so a slow status signal cannot cause the same prompt to be submitted twice.
+prompt_with_retry() {
+  n="$1"; pp="$2"; text="$3"; attempt=0
+  PROMPT_RESULT=""; last_code=""
+  # Character-safe snippet (jq slices code points; `cut -c` on macOS slices bytes and breaks CJK text).
+  snippet=$(printf '%s' "$text" | head -n 1 | jq -Rr '.[0:16]' 2>/dev/null)
   while [ "$attempt" -lt 4 ]; do
     attempt=$((attempt + 1))
     out=$("$HERDR" agent prompt "$n" "$text" --wait --until working --until blocked --until done --timeout 30000 2>&1)
     if printf '%s' "$out" | jq -e '.result' >/dev/null 2>&1; then PROMPT_RESULT="$out"; return 0; fi
-    code=$(printf '%s' "$out" | jq -r '.error.code // "unknown"' 2>/dev/null)
+    code=$(printf '%s' "$out" | jq -r '.error.code // "unparsed_error"' 2>/dev/null); code=${code:-unparsed_error}
+    last_code="$code"
     log "prompt attempt $attempt failed: $code"
     case "$code" in
       agent_prompt_stalled | timeout)
-        st=$("$HERDR" agent get "$n" 2>/dev/null | jq -r '.result.agent.agent_status')
-        case "$st" in working | blocked) PROMPT_RESULT=$("$HERDR" agent get "$n" 2>&1); return 0 ;; esac
-        # Text may be sitting in the input box: submit it instead of re-typing.
-        if [ -n "$snippet" ] && "$HERDR" agent read "$n" --source visible 2>/dev/null | tail -n 12 | grep -F -q "$snippet"; then
-          "$HERDR" agent send-keys "$n" enter >/dev/null 2>&1; sleep 3
-          st=$("$HERDR" agent get "$n" 2>/dev/null | jq -r '.result.agent.agent_status')
-          case "$st" in working | blocked | done) PROMPT_RESULT=$("$HERDR" agent get "$n" 2>&1); return 0 ;; esac
+        # Herdr may simply not have seen "working" yet; give it a moment before deciding.
+        i=0
+        while [ "$i" -lt 6 ]; do
+          st=$(agent_status_of "$n")
+          case "$st" in working | blocked) PROMPT_RESULT=$("$HERDR" agent get "$n" 2>&1); return 0 ;; esac
+          if screen_busy "$pp"; then PROMPT_RESULT=$("$HERDR" agent get "$n" 2>&1); log "prompt delivered (screen busy) $pp"; return 0; fi
+          i=$((i + 1)); sleep 1
+        done
+        if [ -n "$snippet" ] && screen_tail "$pp" 40 | grep -F -q "$snippet"; then
+          # Text is on screen: either sitting in the composer (Enter was dropped) or already submitted.
+          if screen_tail "$pp" 8 | grep -F -q "$snippet"; then
+            log "prompt text in composer $pp: pressing enter"
+            "$HERDR" agent send-keys "$n" enter >/dev/null 2>&1
+          fi
+          j=0
+          while [ "$j" -lt 8 ]; do
+            sleep 1; j=$((j + 1))
+            st=$(agent_status_of "$n")
+            case "$st" in working | blocked) PROMPT_RESULT=$("$HERDR" agent get "$n" 2>&1); return 0 ;; esac
+            if screen_busy "$pp"; then PROMPT_RESULT=$("$HERDR" agent get "$n" 2>&1); return 0; fi
+          done
+          # On screen but no sign of work: do not re-type (would duplicate); report instead.
+          PROMPT_RESULT=$(jq -cn --arg c "$code" '{error:{code:"prompt_unconfirmed", message:"prompt text is on screen but the agent did not start working; inspect with gbb read", last_herdr_error:$c}}')
+          return 1
         fi
-        sleep 4 ;;
+        # Nothing on screen: input was dropped (agent still loading). Wait for the composer and retry.
+        wait_input_ready "$pp" "${GBB_PROMPT_KIND:-}" || sleep 3 ;;
       agent_blocked) PROMPT_RESULT="$out"; return 2 ;;
       *) PROMPT_RESULT="$out"; return 1 ;;
     esac
   done
+  PROMPT_RESULT=$(jq -cn --arg c "$last_code" --argjson a "$attempt" '{error:{code:"prompt_not_delivered", message:"agent did not accept the prompt after \($a) attempts", last_herdr_error:$c}}')
   return 1
 }
 
 cmd_launch() {
-  repo=""; kind="grok"; task=""; wt_branch=""; prompt=""; pfile=""; no_wt=0; base=""; agent_args=""
+  repo=""; kind="grok"; task=""; wt_branch=""; prompt=""; pfile=""; no_wt=0; base=""; explicit_args=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --repo) repo="$2"; shift 2 ;;
@@ -314,13 +377,24 @@ cmd_launch() {
       --base) base="$2"; shift 2 ;;
       --prompt) prompt="$2"; shift 2 ;;
       --prompt-file) pfile="$2"; shift 2 ;;
-      --) shift; agent_args="$*"; break ;;
+      --) shift; explicit_args=1; break ;; # rest of "$@" = agent args, passed through verbatim
       *) die usage "unknown launch option $1" ;;
     esac
   done
   need "$HERDR"; need jq; need git
   [ -n "$repo" ] && [ -n "$task" ] || die usage "gbb launch --repo <path> --kind grok|codex --task <id> [--worktree <branch>|--no-worktree] (--prompt <text>|--prompt-file <f>)"
   case "$kind" in grok | codex) ;; *) die usage "--kind must be grok or codex" ;; esac
+  [ "$explicit_args" = 1 ] || set -- # drop anything left over; only args after -- are agent args
+  if [ "$explicit_args" = 0 ]; then
+    # Per-kind defaults from config (codex_args / grok_args). An explicit `--` (even empty) overrides them.
+    defaults=$(cfg_array "${kind}_args") || die config_error "${kind}_args in $CONFIG_FILE must be a single-line array of double-quoted strings"
+    if [ -n "$defaults" ]; then
+      while IFS= read -r a; do set -- "$@" "$a"; done <<EOF
+$defaults
+EOF
+    fi
+  fi
+  args_json=$(jq -cn '$ARGS.positional' --args -- "$@")
   [ -n "$pfile" ] && { [ -f "$pfile" ] || die usage "prompt file not found"; prompt=$(cat "$pfile"); }
   [ -n "$prompt" ] || die usage "prompt required"
   tid=$(sanitize_id "$task"); [ -n "$tid" ] || die usage "bad task id"
@@ -353,8 +427,9 @@ cmd_launch() {
 
   # Register before start so status hooks for this pane are tracked from the first event.
   registry_update '.panes[$p] = {pane_id:$p, workspace_id:$ws, task_id:$task, agent_name:$n, kind:$k, repo:$r,
-      worktree:$wt, branch:$b, base_commit:$bc, origin:"launched", created_workspace:true, created_at:$t, last_status:null, armed:false}' \
-    --arg p "$pane" --arg ws "$ws" --arg task "$tid" --arg n "$name" --arg k "$kind" --arg r "$repo" --arg wt "$wt" \
+      worktree:$wt, branch:$b, base_commit:$bc, origin:"launched", created_workspace:true, created_at:$t, last_status:null, armed:false,
+      agent_args:$aa}' \
+    --argjson aa "$args_json" --arg p "$pane" --arg ws "$ws" --arg task "$tid" --arg n "$name" --arg k "$kind" --arg r "$repo" --arg wt "$wt" \
     --arg b "$branch" --arg bc "$base_commit" --arg t "$(iso_now)" || die registry_error "registry write failed"
   # Treat the startup idle as already seen so launch does not wake Grok Bot.
   printf 'idle 0\n' >"$LAST_DIR/$(printf '%s' "$pane" | tr ':' '_')"
@@ -364,8 +439,8 @@ cmd_launch() {
   attempt=0; started=""
   while [ "$attempt" -lt 3 ]; do
     attempt=$((attempt + 1))
-    # shellcheck disable=SC2086
-    out=$("$HERDR" agent start "$name" --kind "$kind" --pane "$pane" --timeout 60000 ${agent_args:+-- $agent_args} 2>&1)
+    # Each agent arg stays one argv word ("$@"); `${1+--}` adds the separator only when there are args.
+    out=$("$HERDR" agent start "$name" --kind "$kind" --pane "$pane" --timeout 60000 ${1+--} "$@" 2>&1)
     if printf '%s' "$out" | jq -e '.result.agent' >/dev/null 2>&1; then started=1; break; fi
     code=$(printf '%s' "$out" | jq -r '.error.code // "unknown"' 2>/dev/null)
     log "agent start attempt $attempt: $code"
@@ -384,13 +459,14 @@ cmd_launch() {
   fi
 
   settle=$(cfg_get startup_settle_sec); sleep "${settle:-4}"
+  wait_input_ready "$pane" "$kind"
   # Never opt in to the Grok "Help improve Grok" data-sharing banner; it is left untouched.
   arm_pane "$pane"
-  prompt_with_retry "$name" "$prompt"; prc=$?
+  GBB_PROMPT_KIND="$kind" prompt_with_retry "$name" "$pane" "$prompt"; prc=$?
   ag=$("$HERDR" agent get "$name" 2>/dev/null | jq -c '.result.agent // {}')
   jq -cn --argjson ag "$ag" --arg p "$pane" --arg ws "$ws" --arg task "$tid" --arg n "$name" --arg wt "$wt" \
-    --arg b "$branch" --arg k "$kind" --argjson prc "$prc" --arg pr "$(printf '%s' "$PROMPT_RESULT" | head -c 2000)" '
-    {ok:($prc==0), task_id:$task, pane_id:$p, workspace_id:$ws, agent_name:$n, kind:$k, worktree:$wt, branch:$b,
+    --arg b "$branch" --arg k "$kind" --argjson prc "$prc" --arg pr "$(printf '%s' "${PROMPT_RESULT:-}" | head -c 2000)" --argjson aa "$args_json" '
+    {ok:($prc==0), task_id:$task, pane_id:$p, workspace_id:$ws, agent_name:$n, kind:$k, agent_args:$aa, worktree:$wt, branch:$b,
      status:$ag.agent_status, session_id:($ag.agent_session.value // null),
      prompt_error:(if $prc==0 then null else ($pr | (try (fromjson | .error // .) catch .[0:300])) end)}'
 }
@@ -446,8 +522,8 @@ cmd_send() {
   [ $# -gt 0 ] || die usage "gbb send <task> <text>"
   require_entry "$t"
   arm_pane "$PANE"
-  prompt_with_retry "$(agent_target)" "$*"; prc=$?
-  printf '%s' "$PROMPT_RESULT" | jq -c --argjson prc "$prc" --arg p "$PANE" \
+  GBB_PROMPT_KIND=$(printf '%s' "$ENTRY" | jq -r '.kind // empty') prompt_with_retry "$(agent_target)" "$PANE" "$*"; prc=$?
+  printf '%s' "${PROMPT_RESULT:-}" | jq -c --argjson prc "$prc" --arg p "$PANE" \
     '{ok:($prc==0), pane_id:$p, status:(.result.agent.agent_status // null), error:(.error // null)}' 2>/dev/null ||
     jq -cn --argjson prc "$prc" --arg p "$PANE" '{ok:($prc==0), pane_id:$p, status:null, error:{code:"unparsed_result"}}'
 }

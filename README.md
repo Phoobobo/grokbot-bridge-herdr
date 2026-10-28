@@ -56,6 +56,8 @@ description = "take pane back from Grok Bot"
 
 - 新目录首次启动会弹 “Trust this folder?”，之后可能还有 “hooks need review” 界面。gbb 返回 `state: startup_blocked`，由 Grok Bot 先 `gbb read` 看清再用 `gbb keys` 处理（不会自动信任 hooks），然后 `gbb send` 发任务。
 - herdr 目前拿不到 codex 的 session id，`gbb result` 给出 `cd <worktree> && codex resume --last`。
+- 模型/推理强度：不带 `-- <agent args>` 时，gbb 使用配置里的 `codex_args` / `grok_args`（单行字符串数组，每项原样作为一个参数传给 agent）；都没有时用 agent 自己的默认值（codex 读 `~/.codex/config.toml`）。例：`codex_args = ["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=\"xhigh\""]`。显式 `--`（哪怕后面为空）会覆盖配置。codex 0.165 可用的 effort：low / medium / high / xhigh（Extra high）/ max / ultra。
+- 首条 prompt：codex 报 ready 后可能还在加载（动画 splash），会吞掉输入。gbb 先等 `›` 输入框出现且屏幕两次轮询不变（`startup_ready_timeout_sec`，默认 90），再发送；发送后若 herdr 报 stalled，先看 agent 是否其实已在工作、文字是否停在输入框（只补一次回车），确认没有送达才重发，不会重复提交。
 - `codex exec --json` 适合无界面的一次性任务；`codex app-server` 仍是实验性接口。走 herdr 的好处是窗格可见、可接管、状态统一。
 
 ## English
@@ -78,7 +80,9 @@ gbb launch --repo <path> --kind grok|codex --task <id> [--worktree <branch>|--no
            (--prompt <text> | --prompt-file <f>) [-- <agent args>]
     git worktree under ~/.local/share/grokbot-bridge-herdr/worktrees/<repo>-<task> (branch gbb/<task>),
     new Herdr workspace with --no-focus, `herdr agent start` with retry, settle, prompt with stall retry,
-    registers the pane. Returns task_id, pane_id, agent_name, worktree, branch, status, session_id.
+    registers the pane. Without `--`, uses codex_args / grok_args from the config. Waits for the input box
+    before the first prompt. Returns task_id, pane_id, agent_name, kind, agent_args, worktree, branch, status,
+    session_id, prompt_error.
 gbb list                          managed panes + live status
 gbb status <task|pane>            herdr agent info + git status/log + session id + resume command
 gbb read <task|pane> [--lines N]  terminal text (use to inspect blocked dialogs)
@@ -93,7 +97,7 @@ gbb doctor / gbb test-webhook
 
 ### Codex
 
-`gbb launch --kind codex` works the same way (tested with Herdr 0.9.3 and codex-cli 0.164.0). On first start in a new folder codex shows "Trust this folder?" and possibly a "hooks need review" screen. gbb returns `state: startup_blocked`; Grok Bot inspects it with `gbb read`, answers with `gbb keys` (it never trusts hooks automatically), then sends the task with `gbb send`. Herdr does not report codex session ids yet, so `gbb result` suggests `cd <worktree> && codex resume --last`. `codex exec --json` suits headless one-shot jobs and `codex app-server` is still experimental; the Herdr route keeps a visible pane you can take over, with the same status signal as grok.
+`gbb launch --kind codex` works the same way (tested with Herdr 0.9.3 and codex-cli 0.164.0). On first start in a new folder codex shows "Trust this folder?" and possibly a "hooks need review" screen. gbb returns `state: startup_blocked`; Grok Bot inspects it with `gbb read`, answers with `gbb keys` (it never trusts hooks automatically), then sends the task with `gbb send`. Herdr does not report codex session ids yet, so `gbb result` suggests `cd <worktree> && codex resume --last`. Model and effort: without `-- <agent args>`, gbb uses `codex_args` / `grok_args` from the config (single-line string array, each item passed as one argv word); with neither, the agent's own defaults apply (codex reads `~/.codex/config.toml`). Example: `codex_args = ["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=\"xhigh\""]`; an explicit `--` (even empty) overrides the config. Codex 0.165 efforts: low, medium, high, xhigh ("Extra high"), max, ultra. First prompt: codex can report ready while its splash is still loading and drops typed input, so gbb waits until the `›` composer is drawn and the screen is stable for two polls (`startup_ready_timeout_sec`, default 90) before typing; on `agent_prompt_stalled` it checks whether the agent is actually working or the text is sitting in the composer (one Enter), and re-types only when nothing reached the screen, so a prompt is never submitted twice. `codex exec --json` suits headless one-shot jobs and `codex app-server` is still experimental; the Herdr route keeps a visible pane you can take over, with the same status signal as grok.
 
 ### Notes from testing
 

@@ -17,6 +17,17 @@ debounce_sec = 15
 # Seconds to let the agent TUI settle after `herdr agent start` before the first prompt.
 startup_settle_sec = 4
 
+# Seconds to wait (after the settle) for the agent's input box to be drawn and the screen to stop changing
+# before the first prompt is typed. Codex can report "ready" while its splash is still animating and drops input.
+startup_ready_timeout_sec = 90
+
+# Optional per-kind default agent args for `gbb launch` (single line, double-quoted strings, JSON-style escapes).
+# Used only when launch is called without `-- <agent args>`; an explicit `--` (even with nothing after it) wins.
+# Each item is passed to the agent as one argument, so values with quotes/spaces are safe.
+# Empty or absent = the agent's own defaults (for codex: ~/.codex/config.toml).
+# codex_args = ["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=\"xhigh\""]
+# grok_args = []
+
 # Optional: only allow `gbb launch` in repos under these paths (single line). Empty = any git repo.
 # allowed_repos = ["~/Workspace", "~/herdr-bridge-test"]
 

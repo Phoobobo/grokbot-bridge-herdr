@@ -18,6 +18,7 @@ Every commit and pull request must leave enough context that later work can trac
 - `config.example.toml` — webhook config template. Real config lives in `~/.config/grokbot-bridge-herdr/config.toml` (mode 600) and is never committed.
 - `install.sh` / `uninstall.sh` — symlink `gbb` into `~/.local/bin` and link/unlink the plugin.
 - `tests/hook-test.sh` — offline hook/debounce test with a stubbed `herdr`.
+- `tests/prompt-test.sh` — offline prompt delivery/retry test with a stubbed `herdr` (~45 s).
 - `docs/decisions/` — ADRs.
 
 ## Guardrails (do not weaken without an ADR)
@@ -32,5 +33,5 @@ Every commit and pull request must leave enough context that later work can trac
 
 ## Verify
 
-- `sh tests/hook-test.sh` (offline).
+- `sh tests/hook-test.sh` and `sh tests/prompt-test.sh` (offline).
 - On a machine with Herdr: `gbb doctor`, then a launch in a scratch repo (see README "End-to-end check").
