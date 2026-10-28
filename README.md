@@ -125,3 +125,7 @@ tail ~/.local/state/grokbot-bridge-herdr/bridge.log
 ```
 
 Architecture and rationale: [docs/decisions/0001-architecture.md](docs/decisions/0001-architecture.md).
+
+## License / 许可
+
+MIT, see [LICENSE](LICENSE).
