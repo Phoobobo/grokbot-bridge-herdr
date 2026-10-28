@@ -6,6 +6,8 @@
 
 让 Grok Bot 通过 [Herdr](https://herdr.dev) 驱动和监控你本机的编码 agent（grok、codex），并且可以把你自己的某些窗格交给 Grok Bot 接管、随时收回。
 
+> **也可以给 ChatGPT dots 用。** 除了 Grok Bot，ChatGPT 的 dot 也能用同一套 gbb 驱动本机 agent、接收状态推送。这要借助配套的 MCP 服务 **[dots-tunnel-bridge](https://github.com/Phoobobo/dots-tunnel-bridge)**（基于 [uezo/dots-bridge](https://github.com/uezo/dots-bridge) 的 fork），它跑在本机 `127.0.0.1`，经 **OpenAI Secure MCP Tunnel** 暴露给 ChatGPT（无入站端口）。见下文 [配合 ChatGPT dots 使用](#配合-chatgpt-dots-使用)。
+
 - **状态回调**：Herdr 插件监听 `pane.agent_status_changed`，只对“托管窗格”生效；agent 进入 `done` / `idle` / `blocked` 时向 Grok Bot 的 webhook 发一条很小的 JSON（不含终端输出、不含密钥），带去重，后台 curl 不会卡住 Herdr。
 - **托管窗格登记表**：`~/.local/state/grokbot-bridge-herdr/managed.json`，按 pane id 记录 task、agent 名称、类型、仓库、worktree、来源（launched / handover）。
 - **交接 / 收回**：在 Herdr 命令面板对当前窗格执行 “Grok Bot: take over this pane” 或 “Grok Bot: give this pane back to me”。托管窗格会显示 `🤖 Grok Bot: <task>` 标记。
@@ -50,14 +52,24 @@ description = "take pane back from Grok Bot"
 - webhook 只含 id 和状态；鉴权 header 通过 stdin 传给 curl，不出现在进程列表；日志只记录主机名。
 - 可选 `allowed_repos` 限制 `gbb launch` 能用的仓库。
 
-### dots（ChatGPT）集成
+### 配合 ChatGPT dots 使用
 
-本机自建的 [dots-bridge](https://github.com/uezo/dots-bridge) MCP 服务可以把 `gbb` 暴露成工具，让 ChatGPT 的 dot 也能驱动本机 coding agent（实现放在 dots-bridge 的 `herdr_tools.py`，设 `DOTS_BRIDGE_HERDR_TOOLS=1` 才启用）：
+配套的 MCP 服务 [dots-tunnel-bridge](https://github.com/Phoobobo/dots-tunnel-bridge)（fork 自 [uezo/dots-bridge](https://github.com/uezo/dots-bridge)，经 OpenAI Secure MCP Tunnel 暴露给 ChatGPT）把 `gbb` 包装成 MCP 工具，让 ChatGPT 的 dot 也能驱动本机 coding agent。工具实现在 dots-tunnel-bridge 的 `src/dots_bridge/herdr_tools.py`，设 `DOTS_BRIDGE_HERDR_TOOLS=1` 才启用；完整说明见它的 [docs/HERDR.md](https://github.com/Phoobobo/dots-tunnel-bridge/blob/main/docs/HERDR.md)。
+
+设置步骤：
+
+1. 按本 README 安装 gbb，`gbb doctor` 正常。
+2. 按 [dots-tunnel-bridge README](https://github.com/Phoobobo/dots-tunnel-bridge#安装人工步骤) 装好 bridge + tunnel-client，并在 ChatGPT 里添加该 MCP server（Connection: Tunnel）。
+3. 生成 token 文件 `~/.config/dots-bridge/herdr_webhook_token`（mode 600），在 bridge 的 plist 里打开 `DOTS_BRIDGE_HERDR_TOOLS=1` 并重启 bridge。
+4. 在 `~/.config/grokbot-bridge-herdr/config.toml` 末尾加 `[[extra_webhooks]]`（见下方 English 部分的示例），`gbb test-webhook` 测试。
+5. ChatGPT 插件页 **Refresh** 工具，确认出现 12 个 `gbb_*`；让 dot 订阅 `app.message.created`（channel `herdr`，否则落到 `default`）。
+
+要点：
 
 - 工具：`gbb_list` / `gbb_status` / `gbb_read` / `gbb_result` / `gbb_doctor` / `gbb_wait`（最长 120 秒）只读；`gbb_launch`（自动附加“只开 draft PR”的要求）/ `gbb_send` / `gbb_keys` / `gbb_stop` / `gbb_handover` / `gbb_reclaim` 会改动状态。
 - 每个工具都以参数列表调用 `gbb`（不经过 shell），带超时和输入校验；send/keys/stop/reclaim 只作用于托管窗格，默认保护工作区 `wAS`、`wAT`（除非窗格是主动交接的）。
-- 状态推送：在 `config.toml` 末尾加 `[[extra_webhooks]]`，指向 `http://127.0.0.1:8765/herdr/webhook`，header `X-Dots-Herdr-Token`，值为 `~/.config/dots-bridge/herdr_webhook_token` 的内容。gbb 对每个目标各发一份相同的 payload，原 Grok Bot webhook 不受影响；dots-bridge 只接受本机请求，并把它变成 `herdr`（没有则 `default`）频道的 `app.message.created` 消息，`metadata.source = "herdr"`。
-- 改了工具后要在 ChatGPT 里重新扫描（Rescan）dot 的工具。设计见 [docs/decisions/0003](docs/decisions/0003-dots-bridge-tools-and-extra-webhooks.md)。
+- 状态推送：在 `config.toml` 末尾加 `[[extra_webhooks]]`，指向 `http://127.0.0.1:8765/herdr/webhook`，header `X-Dots-Herdr-Token`，值为 `~/.config/dots-bridge/herdr_webhook_token` 的内容。gbb 对每个目标各发一份相同的 payload，原 Grok Bot webhook 不受影响；dots-tunnel-bridge 只接受本机请求，并把它变成 `herdr`（没有则 `default`）频道的 `app.message.created` 消息，`metadata.source = "herdr"`。
+- 改了工具后要在 ChatGPT 插件页刷新（Refresh）dot 的工具。设计见 [docs/decisions/0003](docs/decisions/0003-dots-bridge-tools-and-extra-webhooks.md)。
 
 ### Codex
 
@@ -72,6 +84,8 @@ description = "take pane back from Grok Bot"
 ## English
 
 Let Grok Bot drive and watch local coding agents (grok, codex) through [Herdr](https://herdr.dev), and let you hand some of your own panes over to Grok Bot and take them back.
+
+> **Also works with ChatGPT dots.** Besides Grok Bot, a ChatGPT dot can drive the same agents through gbb and get their status pushed to it. This goes through the companion MCP server **[dots-tunnel-bridge](https://github.com/Phoobobo/dots-tunnel-bridge)** (a fork of [uezo/dots-bridge](https://github.com/uezo/dots-bridge)), which runs on `127.0.0.1` and is exposed to ChatGPT via **OpenAI Secure MCP Tunnel** (no inbound ports). See [Use with ChatGPT dots](#use-with-chatgpt-dots).
 
 - **Status webhook** — the plugin hooks `pane.agent_status_changed`, acts only on managed panes, and POSTs a small JSON (no terminal output, no secrets) on `done` / `idle` / `blocked`. Debounced; curl runs in the background with a short timeout, so Herdr never blocks.
 - **Managed-pane registry** — `~/.local/state/grokbot-bridge-herdr/managed.json`, keyed by pane id: task id, agent name, kind, repo, worktree, origin (`launched` | `handover`).
@@ -108,9 +122,19 @@ gbb doctor / gbb test-webhook
 
 `gbb launch --kind codex` works the same way (tested since Herdr 0.9.3 with codex-cli 0.164.0; last verified on Herdr 0.9.5 with codex-cli 0.165.0. From Herdr 0.9.5 codex status comes from screen detection instead of codex turn hooks; gbb needed no change). On first start in a new folder codex shows "Trust this folder?" and possibly a "hooks need review" screen. gbb returns `state: startup_blocked`; Grok Bot inspects it with `gbb read`, answers with `gbb keys` (it never trusts hooks automatically), then sends the task with `gbb send`. Herdr does not report codex session ids yet, so `gbb result` suggests `cd <worktree> && codex resume --last`. Model and effort: without `-- <agent args>`, gbb uses `codex_args` / `grok_args` from the config (single-line string array, each item passed as one argv word); with neither, the agent's own defaults apply (codex reads `~/.codex/config.toml`). Example: `codex_args = ["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=\"xhigh\""]`; an explicit `--` (even empty) overrides the config. Codex 0.165 efforts: low, medium, high, xhigh ("Extra high"), max, ultra. First prompt: codex can report ready while its splash is still loading and drops typed input, so gbb waits until the `›` composer is drawn and the screen is stable for two polls (`startup_ready_timeout_sec`, default 90) before typing; on `agent_prompt_stalled` it checks whether the agent is actually working or the text is sitting in the composer (one Enter), and re-types only when nothing reached the screen, so a prompt is never submitted twice. `codex exec --json` suits headless one-shot jobs and `codex app-server` is still experimental; the Herdr route keeps a visible pane you can take over, with the same status signal as grok.
 
-### dots (ChatGPT) integration
+### Use with ChatGPT dots
 
-A self-hosted [dots-bridge](https://github.com/uezo/dots-bridge) MCP server can expose `gbb` as tools so a ChatGPT dot can drive local coding agents too. The tools live in dots-bridge (`herdr_tools.py`, enabled by `DOTS_BRIDGE_HERDR_TOOLS=1`):
+The companion MCP server [dots-tunnel-bridge](https://github.com/Phoobobo/dots-tunnel-bridge) (a fork of [uezo/dots-bridge](https://github.com/uezo/dots-bridge), exposed to ChatGPT through OpenAI Secure MCP Tunnel) wraps `gbb` as MCP tools so a ChatGPT dot can drive local coding agents too. The tools live in dots-tunnel-bridge (`src/dots_bridge/herdr_tools.py`, enabled by `DOTS_BRIDGE_HERDR_TOOLS=1`); full docs: [docs/HERDR.md](https://github.com/Phoobobo/dots-tunnel-bridge/blob/main/docs/HERDR.md#english).
+
+Setup:
+
+1. Install gbb as above; `gbb doctor` is clean.
+2. Install the bridge and tunnel-client per the [dots-tunnel-bridge README](https://github.com/Phoobobo/dots-tunnel-bridge) and add it in ChatGPT as a custom MCP server (Connection: Tunnel).
+3. Create the token file `~/.config/dots-bridge/herdr_webhook_token` (mode 600), set `DOTS_BRIDGE_HERDR_TOOLS=1` in the bridge plist and restart the bridge.
+4. Append the `[[extra_webhooks]]` table below to `~/.config/grokbot-bridge-herdr/config.toml`; check with `gbb test-webhook`.
+5. **Refresh** the tools on the ChatGPT plugin page (12 `gbb_*` tools), and have the dot subscribe to `app.message.created` on channel `herdr` (else events land on `default`).
+
+Tools:
 
 | Tool | Kind | gbb call |
 |---|---|---|
@@ -132,7 +156,7 @@ header_name = "X-Dots-Herdr-Token"
 header_value = "<contents of ~/.config/dots-bridge/herdr_webhook_token>"
 ```
 
-Each extra target (max 5) gets the identical payload in its own background curl, header via stdin; the primary Grok Bot webhook is unchanged. `gbb doctor` reports `config.extra_webhooks.{count,hosts}` only. The receiver accepts loopback clients with the token only and posts an `app.message.created` message (`metadata.source = "herdr"`) to the dot's `herdr` channel, falling back to `default`. Rescan the dot's tools in ChatGPT after changing tools. Rationale: [docs/decisions/0003](docs/decisions/0003-dots-bridge-tools-and-extra-webhooks.md).
+Each extra target (max 5) gets the identical payload in its own background curl, header via stdin; the primary Grok Bot webhook is unchanged. `gbb doctor` reports `config.extra_webhooks.{count,hosts}` only. The receiver accepts loopback clients with the token only and posts an `app.message.created` message (`metadata.source = "herdr"`) to the dot's `herdr` channel, falling back to `default`. Refresh the dot's tools on the ChatGPT plugin page after changing tools. Rationale: [docs/decisions/0003](docs/decisions/0003-dots-bridge-tools-and-extra-webhooks.md).
 
 ### Notes from testing
 
@@ -159,7 +183,7 @@ gbb result e2e && gbb stop e2e
 tail ~/.local/state/grokbot-bridge-herdr/bridge.log
 ```
 
-Architecture and rationale: [docs/decisions/0001-architecture.md](docs/decisions/0001-architecture.md); dots integration: [0003](docs/decisions/0003-dots-bridge-tools-and-extra-webhooks.md).
+Architecture and rationale: [docs/decisions/0001-architecture.md](docs/decisions/0001-architecture.md); ChatGPT dots integration: [0003](docs/decisions/0003-dots-bridge-tools-and-extra-webhooks.md).
 
 ## License / 许可
 

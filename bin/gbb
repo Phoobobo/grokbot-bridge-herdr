@@ -170,7 +170,7 @@ notify_primary() {
   post_webhook primary "$url" "$hname" "$hval" "$tmo" "$payload"
 }
 
-# Extra receivers (e.g. a local dots-bridge) get the identical payload. Config file only, same 600 rule.
+# Extra receivers (e.g. a local dots-tunnel-bridge) get the identical payload. Config file only, same 600 rule.
 notify_extra() {
   payload="$1"
   [ -f "$CONFIG_FILE" ] || return 0

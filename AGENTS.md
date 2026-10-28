@@ -1,6 +1,6 @@
 # AGENTS.md — grokbot-bridge-herdr
 
-Herdr plugin + `gbb` CLI that let Grok Bot drive and watch coding agents (grok, codex) in Herdr panes on the user's machine.
+Herdr plugin + `gbb` CLI that let Grok Bot drive and watch coding agents (grok, codex) in Herdr panes on the user's machine. ChatGPT dots use the same `gbb` through the companion MCP server [dots-tunnel-bridge](https://github.com/Phoobobo/dots-tunnel-bridge) (fork of uezo/dots-bridge, exposed via OpenAI Secure MCP Tunnel), whose `gbb_*` tools call these subcommands and whose `/herdr/webhook` receives `[[extra_webhooks]]` — keep `gbb`'s JSON output, subcommand flags and webhook payload compatible with it (see `docs/decisions/0003`).
 
 ## Change context (required)
 
