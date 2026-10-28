@@ -474,7 +474,7 @@ EOF
 # ---------- inspection / control ----------
 session_of() { printf '%s' "$1" | jq -r '.agent_session.value // empty'; }
 resume_cmd() { # kind session
-  # Herdr 0.9.3 does not report codex session ids; codex resume --last (run in the worktree) picks the newest one.
+  # Herdr (checked up to 0.9.5) does not report codex session ids; codex resume --last (run in the worktree) picks the newest one.
   case "$1:$2" in
     grok:) return 0 ;;
     grok:*) printf 'grok --resume %s' "$2" ;;
