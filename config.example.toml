@@ -31,5 +31,12 @@ startup_ready_timeout_sec = 90
 # Optional: only allow `gbb launch` in repos under these paths (single line). Empty = any git repo.
 # allowed_repos = ["~/Workspace", "~/herdr-bridge-test"]
 
+# Optional extra receivers that get the identical payload (e.g. a local dots-bridge, see README "dots").
+# Must come AFTER all keys above (TOML tables end the top level). Max 5. Header is sent via curl stdin.
+# [[extra_webhooks]]
+# url = "http://127.0.0.1:8765/herdr/webhook"
+# header_name = "X-Dots-Herdr-Token"
+# header_value = ""   # contents of ~/.config/dots-bridge/herdr_webhook_token
+
 # Env overrides: GBB_WEBHOOK_URL, GBB_WEBHOOK_HEADER_NAME, GBB_WEBHOOK_HEADER_VALUE, GBB_CONFIG,
 # GBB_STATE_DIR (default ~/.local/state/grokbot-bridge-herdr), GBB_DATA_DIR (default ~/.local/share/grokbot-bridge-herdr)

@@ -102,8 +102,59 @@ host_name() { hostname -s 2>/dev/null || hostname; }
 herdr_json() { "$HERDR" "$@" 2>&1; } # herdr prints JSON on stdout, JSON errors on stderr
 
 # ---------- webhook ----------
-# notify <event-json>  — POST in background, never blocks caller.
+US=$(printf '\037') # field separator for cfg_extra_webhooks (non-whitespace, keeps empty fields)
+MAX_EXTRA_WEBHOOKS=5
+
+# cfg_extra_webhooks — `[[extra_webhooks]]` tables (url / header_name / header_value, double-quoted strings)
+# -> one "url<US>header_name<US>header_value" line per table that has a url. Tables must come after all
+# top-level keys (TOML rule); any other [table] header ends the current one.
+cfg_extra_webhooks() {
+  [ -f "$CONFIG_FILE" ] || return 0
+  awk -v us="$US" '
+    function flush() { if (in_t && url != "") printf "%s%s%s%s%s\n", url, us, hn, us, hv; url = ""; hn = ""; hv = "" }
+    /^[[:space:]]*\[\[[[:space:]]*extra_webhooks[[:space:]]*\]\][[:space:]]*(#.*)?$/ { flush(); in_t = 1; next }
+    /^[[:space:]]*\[/ { flush(); in_t = 0; next }
+    in_t && /^[[:space:]]*(url|header_name|header_value)[[:space:]]*=[[:space:]]*".*"[[:space:]]*$/ {
+      key = $0; sub(/^[[:space:]]*/, "", key); sub(/[[:space:]]*=.*$/, "", key)
+      val = $0; sub(/^[^=]*=[[:space:]]*"/, "", val); sub(/"[[:space:]]*$/, "", val)
+      if (key == "url") url = val; else if (key == "header_name") hn = val; else hv = val
+    }
+    END { flush() }' "$CONFIG_FILE" | head -n "$MAX_EXTRA_WEBHOOKS"
+}
+url_host() { printf '%s' "$1" | sed 's#^[a-z]*://##; s#/.*##'; }
+
+# post_webhook <label> <url> <header-name> <header-value> <timeout> <payload> — background POST, logs host only.
+post_webhook() {
+  label="$1"; purl="$2"; phn="$3"; phv="$4"; ptmo="$5"; ppayload="$6"
+  phost=$(url_host "$purl")
+  (
+    # Header passed via curl config on stdin so it never shows in `ps`.
+    out="$STATE_DIR/.curl.$$.$label"
+    {
+      printf 'url = "%s"\n' "$purl"
+      [ -n "$phn" ] && printf 'header = "%s: %s"\n' "$phn" "$phv"
+      printf 'header = "Content-Type: application/json"\n'
+    } | curl -sS -o /dev/null -w '%{http_code}' --max-time "$ptmo" -X POST --data-binary "$ppayload" -K - >"$out" 2>&1
+    rc=$?
+    code=$(cat "$out" 2>/dev/null | tail -c 200); rm -f "$out"
+    tag="webhook"; [ "$label" = primary ] || tag="webhook[$label]"
+    log "$tag POST host=$phost rc=$rc http=$code event=$(printf '%s' "$ppayload" | jq -c '{event,task_id,pane_id,status}')"
+  ) </dev/null >/dev/null 2>&1 &
+}
+
+config_mode_ok() {
+  m=$(file_mode "$CONFIG_FILE")
+  case "$m" in 600 | 400) return 0 ;; *) log "webhook skipped: $CONFIG_FILE mode is $m, must be 600 (chmod 600)"; return 1 ;; esac
+}
+
+# notify <event-json>  — POST in background to the primary webhook and any [[extra_webhooks]]; never blocks caller.
 notify() {
+  payload="$1"
+  notify_primary "$payload"
+  notify_extra "$payload"
+}
+
+notify_primary() {
   payload="$1"
   url="${GBB_WEBHOOK_URL:-$(cfg_get webhook_url)}"
   if [ -z "$url" ]; then
@@ -111,24 +162,32 @@ notify() {
     return 0
   fi
   if [ -f "$CONFIG_FILE" ] && [ -z "${GBB_WEBHOOK_URL:-}" ]; then
-    m=$(file_mode "$CONFIG_FILE")
-    case "$m" in 600 | 400) ;; *) log "webhook skipped: $CONFIG_FILE mode is $m, must be 600 (chmod 600)"; return 0 ;; esac
+    config_mode_ok || return 0
   fi
   hname="${GBB_WEBHOOK_HEADER_NAME:-$(cfg_get webhook_header_name)}"
   hval="${GBB_WEBHOOK_HEADER_VALUE:-$(cfg_get webhook_header_value)}"
   tmo="$(cfg_get webhook_timeout_sec)"; tmo="${tmo:-5}"
-  host=$(printf '%s' "$url" | sed 's#^[a-z]*://##; s#/.*##')
-  (
-    # Header passed via curl config on stdin so it never shows in `ps`.
-    {
-      printf 'url = "%s"\n' "$url"
-      [ -n "$hname" ] && printf 'header = "%s: %s"\n' "$hname" "$hval"
-      printf 'header = "Content-Type: application/json"\n'
-    } | curl -sS -o /dev/null -w '%{http_code}' --max-time "$tmo" -X POST --data-binary "$payload" -K - >"$STATE_DIR/.curl.$$" 2>&1
-    rc=$?
-    code=$(cat "$STATE_DIR/.curl.$$" 2>/dev/null | tail -c 200); rm -f "$STATE_DIR/.curl.$$"
-    log "webhook POST host=$host rc=$rc http=$code event=$(printf '%s' "$payload" | jq -c '{event,task_id,pane_id,status}')"
-  ) </dev/null >/dev/null 2>&1 &
+  post_webhook primary "$url" "$hname" "$hval" "$tmo" "$payload"
+}
+
+# Extra receivers (e.g. a local dots-bridge) get the identical payload. Config file only, same 600 rule.
+notify_extra() {
+  payload="$1"
+  [ -f "$CONFIG_FILE" ] || return 0
+  extras=$(cfg_extra_webhooks)
+  [ -n "$extras" ] || return 0
+  config_mode_ok || return 0
+  tmo="$(cfg_get webhook_timeout_sec)"; tmo="${tmo:-5}"
+  i=0
+  while IFS="$US" read -r xurl xhn xhv; do
+    i=$((i + 1))
+    case "$xurl" in
+      http://* | https://*) post_webhook "x$i" "$xurl" "$xhn" "$xhv" "$tmo" "$payload" ;;
+      *) log "webhook[x$i] skipped: url must start with http:// or https://" ;;
+    esac
+  done <<EOF_EXTRA
+$extras
+EOF_EXTRA
 }
 
 build_event() { # build_event <event> <status> <entry-json> [extra-json]
@@ -621,10 +680,12 @@ cmd_doctor() {
   jq -cn --arg v "$GBB_VERSION" --arg cfg "$CONFIG_FILE" --arg mode "$mode" --arg host "$host" \
     --arg hn "$(cfg_get webhook_header_name)" --arg hv "$( [ -n "$(cfg_get webhook_header_value)" ] && echo set)" \
     --arg herdr "$("$HERDR" --version 2>/dev/null)" --arg jq "$(jq --version)" --arg curl "$(command -v curl)" \
+    --arg xhosts "$(cfg_extra_webhooks | while IFS="$US" read -r xu _xn _xv; do url_host "$xu"; printf ' '; done)" \
     --arg reg "$REGISTRY" --arg log "$LOG" --argjson linked "${linked:-0}" --arg allow "$(cfg_list allowed_repos | tr '\n' ' ')" '
     {ok:true, version:$v, herdr:$herdr, jq:$jq, curl:($curl != ""), plugin_linked:($linked > 0),
      config:{path:$cfg, exists:($mode != ""), mode:(if $mode=="" then null else $mode end), mode_ok:($mode=="600" or $mode=="400"),
        webhook_host:(if $host=="" then null else $host end), header_name:(if $hn=="" then null else $hn end), header_value_set:($hv=="set"),
+       extra_webhooks:{count:($xhosts|split(" ")|map(select(.!=""))|length), hosts:($xhosts|split(" ")|map(select(.!="")))},
        allowed_repos:($allow|split(" ")|map(select(.!="")))},
      registry:$reg, log:$log}'
 }
@@ -633,7 +694,9 @@ cmd_test_webhook() {
   GBB_CTX=test
   notify "$(build_event test "" '{}')"
   t=$(cfg_get webhook_timeout_sec); sleep $(( ${t:-5} + 2 ))
-  jq -cn --arg l "$(tail -n 1 "$LOG")" '{ok:true, last_log:$l}'
+  n=$(( $(cfg_extra_webhooks | grep -c .) + 1 ))
+  jq -cn --arg l "$(tail -n 1 "$LOG")" --arg r "$(grep 'webhook' "$LOG" | tail -n "$n")" \
+    '{ok:true, last_log:$l, recent_webhook_logs:($r|split("\n")|map(select(.!="")))}'
 }
 
 usage() {

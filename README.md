@@ -50,6 +50,15 @@ description = "take pane back from Grok Bot"
 - webhook 只含 id 和状态；鉴权 header 通过 stdin 传给 curl，不出现在进程列表；日志只记录主机名。
 - 可选 `allowed_repos` 限制 `gbb launch` 能用的仓库。
 
+### dots（ChatGPT）集成
+
+本机自建的 [dots-bridge](https://github.com/uezo/dots-bridge) MCP 服务可以把 `gbb` 暴露成工具，让 ChatGPT 的 dot 也能驱动本机 coding agent（实现放在 dots-bridge 的 `herdr_tools.py`，设 `DOTS_BRIDGE_HERDR_TOOLS=1` 才启用）：
+
+- 工具：`gbb_list` / `gbb_status` / `gbb_read` / `gbb_result` / `gbb_doctor` / `gbb_wait`（最长 120 秒）只读；`gbb_launch`（自动附加“只开 draft PR”的要求）/ `gbb_send` / `gbb_keys` / `gbb_stop` / `gbb_handover` / `gbb_reclaim` 会改动状态。
+- 每个工具都以参数列表调用 `gbb`（不经过 shell），带超时和输入校验；send/keys/stop/reclaim 只作用于托管窗格，默认保护工作区 `wAS`、`wAT`（除非窗格是主动交接的）。
+- 状态推送：在 `config.toml` 末尾加 `[[extra_webhooks]]`，指向 `http://127.0.0.1:8765/herdr/webhook`，header `X-Dots-Herdr-Token`，值为 `~/.config/dots-bridge/herdr_webhook_token` 的内容。gbb 对每个目标各发一份相同的 payload，原 Grok Bot webhook 不受影响；dots-bridge 只接受本机请求，并把它变成 `herdr`（没有则 `default`）频道的 `app.message.created` 消息，`metadata.source = "herdr"`。
+- 改了工具后要在 ChatGPT 里重新扫描（Rescan）dot 的工具。设计见 [docs/decisions/0003](docs/decisions/0003-dots-bridge-tools-and-extra-webhooks.md)。
+
 ### Codex
 
 `gbb launch --kind codex` 同样可用（herdr 0.9.3 + codex-cli 0.164.0 起已测；最近一次：herdr 0.9.5 + codex-cli 0.165.0。herdr 0.9.5 起 codex 状态改为读屏判断，不再依赖 codex 的 turn hooks，gbb 无需改动）。注意：
@@ -99,6 +108,32 @@ gbb doctor / gbb test-webhook
 
 `gbb launch --kind codex` works the same way (tested since Herdr 0.9.3 with codex-cli 0.164.0; last verified on Herdr 0.9.5 with codex-cli 0.165.0. From Herdr 0.9.5 codex status comes from screen detection instead of codex turn hooks; gbb needed no change). On first start in a new folder codex shows "Trust this folder?" and possibly a "hooks need review" screen. gbb returns `state: startup_blocked`; Grok Bot inspects it with `gbb read`, answers with `gbb keys` (it never trusts hooks automatically), then sends the task with `gbb send`. Herdr does not report codex session ids yet, so `gbb result` suggests `cd <worktree> && codex resume --last`. Model and effort: without `-- <agent args>`, gbb uses `codex_args` / `grok_args` from the config (single-line string array, each item passed as one argv word); with neither, the agent's own defaults apply (codex reads `~/.codex/config.toml`). Example: `codex_args = ["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=\"xhigh\""]`; an explicit `--` (even empty) overrides the config. Codex 0.165 efforts: low, medium, high, xhigh ("Extra high"), max, ultra. First prompt: codex can report ready while its splash is still loading and drops typed input, so gbb waits until the `›` composer is drawn and the screen is stable for two polls (`startup_ready_timeout_sec`, default 90) before typing; on `agent_prompt_stalled` it checks whether the agent is actually working or the text is sitting in the composer (one Enter), and re-types only when nothing reached the screen, so a prompt is never submitted twice. `codex exec --json` suits headless one-shot jobs and `codex app-server` is still experimental; the Herdr route keeps a visible pane you can take over, with the same status signal as grok.
 
+### dots (ChatGPT) integration
+
+A self-hosted [dots-bridge](https://github.com/uezo/dots-bridge) MCP server can expose `gbb` as tools so a ChatGPT dot can drive local coding agents too. The tools live in dots-bridge (`herdr_tools.py`, enabled by `DOTS_BRIDGE_HERDR_TOOLS=1`):
+
+| Tool | Kind | gbb call |
+|---|---|---|
+| `gbb_list`, `gbb_status`, `gbb_read`, `gbb_result`, `gbb_doctor` | read-only | `list`, `status`, `read --lines/--visible`, `result`, `doctor` |
+| `gbb_wait` | read-only, max 120 s | `wait --until … --timeout` |
+| `gbb_launch` | starts an agent; appends a draft-PR-only policy to the prompt | `launch --repo --kind --task [--worktree/--no-worktree] [--base] --prompt` |
+| `gbb_send`, `gbb_keys` | input to a managed pane | `send`, `keys` |
+| `gbb_stop` | destructive, idempotent | `stop` |
+| `gbb_handover`, `gbb_reclaim` | ownership | `handover --pane [--note]`, `reclaim --pane` |
+
+Every call is an argv list (no shell) with an explicit PATH, a timeout and validated inputs. send/keys/stop/reclaim re-check `gbb list` and refuse unmanaged panes and the protected workspaces (`DOTS_BRIDGE_HERDR_PROTECTED_WORKSPACES`, default `wAS,wAT`) unless the pane was handed over.
+
+Status events: add to the end of `config.toml`
+
+```toml
+[[extra_webhooks]]
+url = "http://127.0.0.1:8765/herdr/webhook"
+header_name = "X-Dots-Herdr-Token"
+header_value = "<contents of ~/.config/dots-bridge/herdr_webhook_token>"
+```
+
+Each extra target (max 5) gets the identical payload in its own background curl, header via stdin; the primary Grok Bot webhook is unchanged. `gbb doctor` reports `config.extra_webhooks.{count,hosts}` only. The receiver accepts loopback clients with the token only and posts an `app.message.created` message (`metadata.source = "herdr"`) to the dot's `herdr` channel, falling back to `default`. Rescan the dot's tools in ChatGPT after changing tools. Rationale: [docs/decisions/0003](docs/decisions/0003-dots-bridge-tools-and-extra-webhooks.md).
+
 ### Notes from testing
 
 - Grok's default permission policy auto-approves most shell commands (including `rm` inside the repo and `curl`), so `blocked` mostly comes from interactive questions or real permission prompts.
@@ -124,7 +159,7 @@ gbb result e2e && gbb stop e2e
 tail ~/.local/state/grokbot-bridge-herdr/bridge.log
 ```
 
-Architecture and rationale: [docs/decisions/0001-architecture.md](docs/decisions/0001-architecture.md).
+Architecture and rationale: [docs/decisions/0001-architecture.md](docs/decisions/0001-architecture.md); dots integration: [0003](docs/decisions/0003-dots-bridge-tools-and-extra-webhooks.md).
 
 ## License / 许可
 

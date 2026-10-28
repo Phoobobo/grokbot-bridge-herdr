@@ -19,6 +19,7 @@ Every commit and pull request must leave enough context that later work can trac
 - `install.sh` / `uninstall.sh` — symlink `gbb` into `~/.local/bin` and link/unlink the plugin.
 - `tests/hook-test.sh` — offline hook/debounce test with a stubbed `herdr`.
 - `tests/prompt-test.sh` — offline prompt delivery/retry test with a stubbed `herdr` (~45 s).
+- `tests/webhook-test.sh` — offline primary + `[[extra_webhooks]]` delivery test against a local HTTP sink.
 - `docs/decisions/` — ADRs.
 
 ## Guardrails (do not weaken without an ADR)
@@ -33,5 +34,5 @@ Every commit and pull request must leave enough context that later work can trac
 
 ## Verify
 
-- `sh tests/hook-test.sh` and `sh tests/prompt-test.sh` (offline).
+- `sh tests/hook-test.sh`, `sh tests/prompt-test.sh` and `sh tests/webhook-test.sh` (offline).
 - On a machine with Herdr: `gbb doctor`, then a launch in a scratch repo (see README "End-to-end check").
