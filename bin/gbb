@@ -5,7 +5,7 @@
 # Deps: herdr, jq, git, curl (POSIX sh, macOS + Linux).
 set -u
 
-GBB_VERSION="0.1.0"
+GBB_VERSION="0.2.0"
 EMPTY_OBJ='{}'
 PLUGIN_ID="phoobobo.grokbot-bridge"
 META_SOURCE="plugin:phoobobo.grokbot-bridge"
@@ -123,38 +123,116 @@ cfg_extra_webhooks() {
 }
 url_host() { printf '%s' "$1" | sed 's#^[a-z]*://##; s#/.*##'; }
 
-# post_webhook <label> <url> <header-name> <header-value> <timeout> <payload> — background POST, logs host only.
-post_webhook() {
+# Owner names: who launched / owns a task (e.g. "dot", "canmouzhang"). Kept to a safe charset because they
+# end up in log lines, registry keys and config lookups.
+OWNER_RE='^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$'
+valid_owner() { printf '%s' "$1" | grep -Eq "$OWNER_RE"; }
+
+# cfg_owners — named callback targets -> one "name<US>url<US>header_name<US>header_value" line each.
+# Accepts `[[owners]]` tables with `name = "..."` and `[owners.<name>]` / `[owners."<name>"]` tables.
+# Like [[extra_webhooks]], these tables must come after all top-level keys.
+cfg_owners() {
+  [ -f "$CONFIG_FILE" ] || return 0
+  awk -v us="$US" '
+    function flush() { if (in_t && name != "" && url != "") printf "%s%s%s%s%s%s%s\n", name, us, url, us, hn, us, hv; name = ""; url = ""; hn = ""; hv = "" }
+    /^[[:space:]]*\[\[[[:space:]]*owners[[:space:]]*\]\][[:space:]]*(#.*)?$/ { flush(); in_t = 1; next }
+    /^[[:space:]]*\[[[:space:]]*owners\.[^]]+\][[:space:]]*(#.*)?$/ {
+      flush(); in_t = 1; n = $0; sub(/^[[:space:]]*\[[[:space:]]*owners\./, "", n); sub(/\].*$/, "", n)
+      gsub(/^[[:space:]"]+|[[:space:]"]+$/, "", n); name = n; next
+    }
+    /^[[:space:]]*\[/ { flush(); in_t = 0; next }
+    in_t && /^[[:space:]]*(name|url|header_name|header_value)[[:space:]]*=[[:space:]]*".*"[[:space:]]*$/ {
+      key = $0; sub(/^[[:space:]]*/, "", key); sub(/[[:space:]]*=.*$/, "", key)
+      val = $0; sub(/^[^=]*=[[:space:]]*"/, "", val); sub(/"[[:space:]]*$/, "", val)
+      if (key == "name") name = val; else if (key == "url") url = val; else if (key == "header_name") hn = val; else hv = val
+    }
+    END { flush() }' "$CONFIG_FILE"
+}
+# cfg_owner_target <name> -> "url<US>header_name<US>header_value" for that owner, or nothing.
+cfg_owner_target() {
+  cfg_owners | while IFS="$US" read -r on ou ohn ohv; do
+    [ "$on" = "$1" ] && { printf '%s%s%s%s%s\n' "$ou" "$US" "$ohn" "$US" "$ohv"; break; }
+  done
+}
+
+# post_sync <label> <url> <header-name> <header-value> <timeout> <payload> — foreground POST, logs host only.
+# Returns 0 on HTTP 2xx. Only ever called from a background job, so hooks never wait on it.
+post_sync() {
   label="$1"; purl="$2"; phn="$3"; phv="$4"; ptmo="$5"; ppayload="$6"
   phost=$(url_host "$purl")
-  (
-    # Header passed via curl config on stdin so it never shows in `ps`.
-    out="$STATE_DIR/.curl.$$.$label"
-    {
-      printf 'url = "%s"\n' "$purl"
-      [ -n "$phn" ] && printf 'header = "%s: %s"\n' "$phn" "$phv"
-      printf 'header = "Content-Type: application/json"\n'
-    } | curl -sS -o /dev/null -w '%{http_code}' --max-time "$ptmo" -X POST --data-binary "$ppayload" -K - >"$out" 2>&1
-    rc=$?
-    code=$(cat "$out" 2>/dev/null | tail -c 200); rm -f "$out"
-    tag="webhook"; [ "$label" = primary ] || tag="webhook[$label]"
-    log "$tag POST host=$phost rc=$rc http=$code event=$(printf '%s' "$ppayload" | jq -c '{event,task_id,pane_id,status}')"
-  ) </dev/null >/dev/null 2>&1 &
+  # Header passed via curl config on stdin so it never shows in `ps`.
+  out="$STATE_DIR/.curl.$$.$(printf '%s' "$label" | tr -c 'A-Za-z0-9_-' '_')"
+  {
+    printf 'url = "%s"\n' "$purl"
+    [ -n "$phn" ] && printf 'header = "%s: %s"\n' "$phn" "$phv"
+    printf 'header = "Content-Type: application/json"\n'
+  } | curl -sS -o /dev/null -w '%{http_code}' --max-time "$ptmo" -X POST --data-binary "$ppayload" -K - >"$out" 2>&1
+  rc=$?
+  code=$(tail -c 200 "$out" 2>/dev/null); rm -f "$out"
+  tag="webhook"; [ "$label" = primary ] || tag="webhook[$label]"
+  log "$tag POST host=$phost rc=$rc http=$code event=$(printf '%s' "$ppayload" | jq -c '{event,task_id,pane_id,status,owner,route}')"
+  [ "$rc" = 0 ] || return 1
+  case "$code" in 2[0-9][0-9]) return 0 ;; esac
+  return 1
 }
+# post_webhook — same, as a detached background job.
+post_webhook() { ( post_sync "$@" ) </dev/null >/dev/null 2>&1 & }
 
 config_mode_ok() {
   m=$(file_mode "$CONFIG_FILE")
   case "$m" in 600 | 400) return 0 ;; *) log "webhook skipped: $CONFIG_FILE mode is $m, must be 600 (chmod 600)"; return 1 ;; esac
 }
 
-# notify <event-json>  — POST in background to the primary webhook and any [[extra_webhooks]]; never blocks caller.
-notify() {
-  payload="$1"
-  notify_primary "$payload"
-  notify_extra "$payload"
+# with_route <payload> <route> [fallback-reason] — tag a payload with how it was routed.
+with_route() {
+  printf '%s' "$1" | jq -c --arg r "$2" --arg f "${3:-}" '. + {route:$r} + (if $f == "" then {} else {fallback_reason:$f} end)'
 }
 
-notify_primary() {
+webhook_timeout() { t="$(cfg_get webhook_timeout_sec)"; printf '%s' "${t:-5}"; }
+
+# notify <event-json> — route a status event (docs/decisions/0004). Never blocks the caller.
+#  * payload.owner set and `[[owners]]` has a target for it -> POST to that target only; if that fails
+#    (curl error or non-2xx), POST to the primary target instead (route "fallback").
+#  * no owner / owner without a target / bad owner URL -> primary target (route "primary"/"fallback").
+#  * [[extra_webhooks]] keep getting every event (route "extra"), except a URL the owner route already used.
+notify() {
+  payload="$1"
+  n_owner=$(printf '%s' "$payload" | jq -r '.owner // empty' 2>/dev/null)
+  tmo=$(webhook_timeout); skip_url=""; n_reason=""
+  if [ -n "$n_owner" ]; then
+    target=""; [ -f "$CONFIG_FILE" ] && target=$(cfg_owner_target "$n_owner")
+    if [ -z "$target" ]; then
+      n_reason=owner_not_configured
+    elif ! config_mode_ok; then
+      n_reason=owner_config_insecure
+    else
+      ourl=$(printf '%s' "$target" | cut -d "$US" -f 1)
+      case "$ourl" in
+        http://* | https://*)
+          skip_url="$ourl"
+          ohn=$(printf '%s' "$target" | cut -d "$US" -f 2); ohv=$(printf '%s' "$target" | cut -d "$US" -f 3-)
+          opayload=$(with_route "$payload" owner)
+          fpayload=$(with_route "$payload" fallback owner_delivery_failed)
+          (
+            post_sync "owner:$n_owner" "$ourl" "$ohn" "$ohv" "$tmo" "$opayload" || {
+              log "owner $n_owner delivery failed; falling back to primary"
+              notify_primary_sync "$fpayload"
+            }
+          ) </dev/null >/dev/null 2>&1 &
+          ;;
+        *) n_reason=owner_url_invalid; log "webhook[owner:$n_owner] skipped: url must start with http:// or https://" ;;
+      esac
+    fi
+  fi
+  if [ -z "$skip_url" ]; then
+    if [ -n "$n_reason" ]; then ppayload=$(with_route "$payload" fallback "$n_reason"); else ppayload=$(with_route "$payload" primary); fi
+    ( notify_primary_sync "$ppayload" ) </dev/null >/dev/null 2>&1 &
+  fi
+  notify_extra "$(with_route "$payload" extra)" "$skip_url"
+}
+
+# notify_primary_sync <payload> — the primary (fallback) target: webhook_url + header, env overridable.
+notify_primary_sync() {
   payload="$1"
   url="${GBB_WEBHOOK_URL:-$(cfg_get webhook_url)}"
   if [ -z "$url" ]; then
@@ -166,21 +244,22 @@ notify_primary() {
   fi
   hname="${GBB_WEBHOOK_HEADER_NAME:-$(cfg_get webhook_header_name)}"
   hval="${GBB_WEBHOOK_HEADER_VALUE:-$(cfg_get webhook_header_value)}"
-  tmo="$(cfg_get webhook_timeout_sec)"; tmo="${tmo:-5}"
-  post_webhook primary "$url" "$hname" "$hval" "$tmo" "$payload"
+  post_sync primary "$url" "$hname" "$hval" "$(webhook_timeout)" "$payload"
 }
 
-# Extra receivers (e.g. a local dots-tunnel-bridge) get the identical payload. Config file only, same 600 rule.
+# Extra receivers (e.g. a local dots-tunnel-bridge) get every event. Config file only, same 600 rule.
+# notify_extra <payload> [skip-url]: skip-url is the owner target already posted to (no duplicate delivery).
 notify_extra() {
-  payload="$1"
+  payload="$1"; skip="${2:-}"
   [ -f "$CONFIG_FILE" ] || return 0
   extras=$(cfg_extra_webhooks)
   [ -n "$extras" ] || return 0
   config_mode_ok || return 0
-  tmo="$(cfg_get webhook_timeout_sec)"; tmo="${tmo:-5}"
+  tmo=$(webhook_timeout)
   i=0
   while IFS="$US" read -r xurl xhn xhv; do
     i=$((i + 1))
+    if [ -n "$skip" ] && [ "$xurl" = "$skip" ]; then log "webhook[x$i] skipped: same target as the owner route"; continue; fi
     case "$xurl" in
       http://* | https://*) post_webhook "x$i" "$xurl" "$xhn" "$xhv" "$tmo" "$payload" ;;
       *) log "webhook[x$i] skipped: url must start with http:// or https://" ;;
@@ -195,7 +274,7 @@ build_event() { # build_event <event> <status> <entry-json> [extra-json]
     --arg host "$(host_name)" --arg ts "$(iso_now)" --arg v "$GBB_VERSION" '
     {source:"grokbot-bridge-herdr", version:$v, event:$event, hostname:$host,
      task_id:($e.task_id // null), pane_id:($e.pane_id // null), workspace_id:($e.workspace_id // null),
-     agent_kind:($e.kind // null), agent_name:($e.agent_name // null), origin:($e.origin // null),
+     agent_kind:($e.kind // null), agent_name:($e.agent_name // null), origin:($e.origin // null), owner:($e.owner // null),
      repo:($e.repo // null), worktree:($e.worktree // null), branch:($e.branch // null),
      status:(if $status == "" then null else $status end), ts:$ts} + $x'
 }
@@ -207,6 +286,38 @@ set_marker() { # set_marker <pane> <task>
 clear_marker() {
   "$HERDR" pane report-metadata "$1" --source "$META_SOURCE" --clear-display-agent \
     --clear-token grokbot --clear-token grokbot_task >/dev/null 2>&1 || true
+}
+
+# ---------- screen classification (codex) ----------
+# Herdr (0.9.5) reports Codex (0.166) startup dialogs and a never-prompted session as idle/done. gbb looks at
+# the bottom of the visible screen to tell those apart from a finished turn (docs/decisions/0004).
+# screen_bottom <pane> [lines] — last non-blank lines of the visible screen.
+screen_bottom() { "$HERDR" pane read "$1" --source visible --lines 60 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n "${2:-16}"; }
+
+# classify_text — reads screen text on stdin, prints one of:
+#   hooks_review   Codex "Hooks need review" startup dialog / banner (needs a trust decision)
+#   question       a question dialog is open, or queued ("⇧← to answer")
+#   dialog         another numbered choice dialog ("enter confirm|submit")
+#   fresh          main composer of a session that never ran a turn ("0 in · 0 out")
+#   ready          main composer of a session that has run
+#   (empty)        anything else (working, splash, unknown)
+classify_text() {
+  t=$(cat)
+  if printf '%s\n' "$t" | grep -Eiq 'hooks? needs? review|t trust all|continue without trusting'; then echo hooks_review; return; fi
+  if printf '%s\n' "$t" | grep -Eq 'to answer[[:space:]]*$|[?] [0-9]+ questions?[[:space:]]*$'; then echo question; return; fi
+  if printf '%s\n' "$t" | grep -Eq 'enter (submit|confirm)' && printf '%s\n' "$t" | grep -Eq '^[[:space:]]*(› )?[[:space:]]*[0-9]+\. '; then
+    if printf '%s\n' "$t" | grep -Eq 'enter submit'; then echo question; else echo dialog; fi
+    return
+  fi
+  if printf '%s\n' "$t" | grep -Eq '^›' && printf '%s\n' "$t" | grep -Eq 'Context [0-9]+% used|for shortcuts'; then
+    if printf '%s\n' "$t" | grep -Eq '(^|· )0 in · 0 out'; then echo fresh; else echo ready; fi
+    return
+  fi
+}
+screen_state() { screen_bottom "$1" 16 | classify_text; }
+# codex_model_line <pane> — e.g. "GPT-6.1-Sol xhigh" from the Codex footer (first segment before " · ").
+codex_model_line() {
+  screen_bottom "$1" 6 | grep -E 'Context [0-9]+% used' | tail -n 1 | sed 's/^[[:space:]]*//; s/ · .*$//' | head -c 80
 }
 
 # ---------- plugin hooks (called by herdr) ----------
@@ -224,7 +335,7 @@ cmd_hook() {
       st=$(printf '%s' "$js" | jq -r '.data.agent_status // empty')
       lastf="$LAST_DIR/$(printf '%s' "$pane" | tr ':' '_')"
       last=$(cat "$lastf" 2>/dev/null); last_st=${last%% *}; last_ts=${last#* }
-      printf '%s %s\n' "$st" "$(now)" >"$lastf"
+      printf '%s %s\n' "$st" "$(now)" >"$lastf" # rewritten below with the reclassified status
       # Launched panes stay unarmed until gbb sends the first prompt, so agent startup
       # (shell -> agent idle, possibly via working/unknown) never wakes Grok Bot.
       if [ "$(printf '%s' "$entry" | jq -r 'if .armed == false then "no" else "yes" end')" = no ]; then
@@ -233,15 +344,30 @@ cmd_hook() {
       case "$st" in
         working | unknown | "") exit 0 ;;
       esac
+      reason=""
+      if [ "$(printf '%s' "$entry" | jq -r '.kind // empty')" = codex ] && [ "$st" != working ]; then
+        ss=$(screen_state "$pane")
+        case "$ss" in
+          hooks_review | question | dialog) st=blocked; reason="$ss" ;;
+          fresh)
+            lu=$(printf '%s' "$entry" | jq -r '.launching_until // 0')
+            if [ "$(now)" -lt "${lu:-0}" ]; then log "fresh $pane while launching: ignored"; exit 0; fi
+            if [ "$(printf '%s' "$entry" | jq -r '.origin')" = launched ]; then st=blocked; reason=prompt_not_submitted; else st=idle; fi ;;
+        esac
+        [ -n "$reason" ] && log "reclassified $pane herdr=$(printf '%s' "$js" | jq -r '.data.agent_status') -> $st ($reason)"
+      fi
       # Debounce: done<->idle without work in between is the same "ready" state;
       # an identical status within debounce window is a duplicate.
+      printf '%s %s\n' "$st" "$(now)" >"$lastf"
       deb=$(cfg_get debounce_sec); deb=${deb:-15}
       case "$last_st:$st" in
         done:idle | idle:done | idle:idle | done:done) log "debounced $pane $last_st->$st"; exit 0 ;;
         blocked:blocked) if [ $(($(now) - ${last_ts:-0})) -lt "$deb" ]; then log "debounced $pane blocked"; exit 0; fi ;;
       esac
-      registry_update '.panes[$p].last_status=$s | .panes[$p].last_status_at=$t' --arg p "$pane" --arg s "$st" --arg t "$(iso_now)"
-      notify "$(build_event agent_status "$st" "$entry")"
+      registry_update '.panes[$p].last_status=$s | .panes[$p].last_status_at=$t | .panes[$p].blocked_reason=(if $r == "" then null else $r end)' \
+        --arg p "$pane" --arg s "$st" --arg t "$(iso_now)" --arg r "$reason"
+      notify "$(build_event agent_status "$st" "$entry" "$(jq -cn --arg r "$reason" --arg h "$(printf '%s' "$js" | jq -r '.data.agent_status')" \
+        '{herdr_status:$h} + (if $r == "" then {} else {blocked_reason:$r} end)')")"
       ;;
     pane.closed | pane.exited)
       registry_update 'del(.panes[$p])' --arg p "$pane"
@@ -264,8 +390,9 @@ ctx_pane() {
 toast() { "$HERDR" notification show "$1" --body "$2" --sound none >/dev/null 2>&1 || true; }
 
 # ---------- handover / reclaim ----------
-do_handover() { # do_handover <pane> <note> -> prints entry
-  pane="$1"; note="$2"
+do_handover() { # do_handover <pane> <note> [owner] -> prints entry
+  pane="$1"; note="$2"; howner="${3:-${GBB_OWNER:-}}"
+  [ -z "$howner" ] || valid_owner "$howner" || die usage "owner must match $OWNER_RE"
   info=$("$HERDR" pane get "$pane" 2>/dev/null) || die pane_not_found "pane $pane not found"
   existing=$(entry_for_pane "$pane")
   [ -z "$existing" ] || { printf '%s' "$existing"; return 0; }
@@ -284,8 +411,8 @@ do_handover() { # do_handover <pane> <note> -> prints entry
   registry_update '.panes[$p] = {pane_id:$p, workspace_id:$ws, task_id:$task, agent_name:(if $n=="" then null else $n end),
       kind:(if $k=="" then null else $k end), repo:(if $r=="" then null else $r end), worktree:(if $r=="" then null else $r end),
       cwd:$cwd, origin:"handover", note:(if $note=="" then null else $note end), created_at:$t, last_status:(if $s=="" then null else $s end),
-      created_workspace:false}' \
-    --arg p "$pane" --arg ws "$ws" --arg task "$task" --arg n "$name" --arg k "$kind" --arg r "$repo" --arg cwd "$cwd" \
+      created_workspace:false, owner:(if $o=="" then null else $o end)}' \
+    --arg o "$howner" --arg p "$pane" --arg ws "$ws" --arg task "$task" --arg n "$name" --arg k "$kind" --arg r "$repo" --arg cwd "$cwd" \
     --arg note "$note" --arg t "$(iso_now)" --arg s "$st" || die registry_error "could not write registry"
   [ -n "$st" ] && printf '%s %s\n' "$st" "$(now)" >"$LAST_DIR/$(printf '%s' "$pane" | tr ':' '_')"
   set_marker "$pane" "$task"
@@ -351,24 +478,74 @@ agent_status_of() { "$HERDR" agent get "$1" 2>/dev/null | jq -r '.result.agent.a
 screen_busy() { screen_tail "$1" 12 | grep -E -q 'esc to interrupt|Working \('; }
 
 # wait_input_ready <pane> <kind> — after `herdr agent start` reports ready, codex can still be loading
-# (animated splash, MCP/plugin startup) and silently drops typed input. Wait until the agent is idle/done,
-# the screen has stopped changing for two polls, and (codex) the "›" composer line is drawn.
-# Bounded by startup_ready_timeout_sec (default 90); returns 1 on timeout but launch still tries to prompt.
+# (animated splash, MCP/plugin startup) and silently drops typed input, or it can open a startup dialog
+# (e.g. "Hooks need review") whose numbered options would swallow typed text. Wait until the agent is
+# idle/done, the screen has stopped changing, and (codex) the main composer + footer are drawn with no dialog.
+# Bounded by startup_ready_timeout_sec (default 90). Returns 0 ready, 1 timeout, 3 a dialog needs an
+# answer (WAIT_STATE holds hooks_review|question|dialog).
 wait_input_ready() {
-  pane="$1"; k="$2"
+  pane="$1"; k="$2"; WAIT_STATE=""
   limit=$(cfg_get startup_ready_timeout_sec); limit=${limit:-90}
-  t0=$(now); prev=""; stable=0
+  need_stable=2
+  # Codex shows the hooks review dialog a few seconds after the composer when project/user hooks exist.
+  if [ "$k" = codex ] && { [ -f "${WAIT_CWD:-/nonexistent}/.codex/hooks.json" ] || [ -f "$HOME/.codex/hooks.json" ]; }; then need_stable=4; fi
+  t0=$(now); prev=""; stable=0; dstable=0
   while [ $(($(now) - t0)) -lt "$limit" ]; do
     st=$(agent_status_of "$pane")
-    cur=$(screen_tail "$pane" 8)
+    cur=$(screen_bottom "$pane" 16)
     ok=1
-    case "$st" in idle | done) ;; *) ok=0 ;; esac
-    [ "$k" = codex ] && { printf '%s\n' "$cur" | grep -q '^›' || ok=0; }
+    case "$st" in idle | done | blocked) ;; *) ok=0 ;; esac
+    if [ "$k" = codex ]; then
+      cs=$(printf '%s\n' "$cur" | classify_text)
+      case "$cs" in
+        hooks_review | question | dialog)
+          if [ "$cur" = "$prev" ]; then dstable=$((dstable + 1)); else dstable=0; fi
+          if [ "$dstable" -ge 1 ]; then WAIT_STATE="$cs"; log "startup dialog $pane: $cs"; return 3; fi
+          ok=0 ;;
+        fresh | ready) ;;
+        *) ok=0 ;;
+      esac
+      [ "$st" = blocked ] && ok=0
+    else
+      [ "$st" = blocked ] && ok=0
+    fi
     if [ "$ok" = 1 ] && [ -n "$cur" ] && [ "$cur" = "$prev" ]; then stable=$((stable + 1)); else stable=0; fi
-    [ "$stable" -ge 2 ] && { log "input ready $pane after $(($(now) - t0))s"; return 0; }
+    [ "$stable" -ge "$need_stable" ] && { log "input ready $pane after $(($(now) - t0))s"; return 0; }
     prev="$cur"; sleep 1
   done
   log "input not confirmed ready $pane after ${limit}s (status=$st)"
+  return 1
+}
+
+# verify_submitted <agent> <pane> <snippet> — codex: after herdr accepted a prompt, confirm the turn really
+# started. 0 yes, 1 no sign of it, 2 a dialog is showing instead (VERIFY_STATE). Presses Enter once if the
+# text is still sitting in the composer (the last "›" line), never re-types it.
+verify_submitted() {
+  vn="$1"; vp="$2"; vs="$3"; VERIFY_STATE=""; entered=0; k=0
+  while [ "$k" -lt 10 ]; do
+    if screen_busy "$vp"; then return 0; fi
+    cs=$(screen_state "$vp")
+    case "$cs" in
+      hooks_review | dialog) VERIFY_STATE="$cs"; return 2 ;;
+      question) return 0 ;; # the turn ran and asked something
+    esac
+    case "$(agent_status_of "$vn")" in working) return 0 ;; esac
+    if [ -n "$vs" ]; then
+      composer=$(screen_bottom "$vp" 16 | grep '^›' | tail -n 1)
+      if printf '%s' "$composer" | grep -Fq "$vs"; then
+        if [ "$entered" = 0 ]; then
+          log "verify: prompt still in composer $vp, pressing enter"
+          "$HERDR" agent send-keys "$vn" enter >/dev/null 2>&1; entered=1
+        fi
+      elif screen_tail "$vp" 60 | grep -Fq "$vs"; then
+        return 0 # echoed into the transcript above the composer
+      fi
+    elif [ "$cs" = ready ]; then
+      return 0
+    fi
+    k=$((k + 1)); sleep 1
+  done
+  log "verify: no sign of the turn on $vp"
   return 1
 }
 
@@ -383,7 +560,20 @@ prompt_with_retry() {
   while [ "$attempt" -lt 4 ]; do
     attempt=$((attempt + 1))
     out=$("$HERDR" agent prompt "$n" "$text" --wait --until working --until blocked --until done --timeout 30000 2>&1)
-    if printf '%s' "$out" | jq -e '.result' >/dev/null 2>&1; then PROMPT_RESULT="$out"; return 0; fi
+    if printf '%s' "$out" | jq -e '.result' >/dev/null 2>&1; then
+      PROMPT_RESULT="$out"
+      if [ "${GBB_PROMPT_KIND:-}" = codex ]; then
+        verify_submitted "$n" "$pp" "$snippet"; vrc=$?
+        [ "$vrc" = 0 ] && return 0
+        if [ "$vrc" = 2 ]; then
+          PROMPT_RESULT=$(jq -cn --arg s "$VERIFY_STATE" '{error:{code:"agent_blocked", blocked_reason:$s, message:"the agent opened a dialog instead of starting the turn; inspect with gbb read and answer with gbb answer"}}')
+          return 2
+        fi
+        PROMPT_RESULT=$(jq -cn '{error:{code:"prompt_unconfirmed", message:"herdr accepted the prompt but Codex shows no sign of the turn; inspect with gbb read"}}')
+        return 1
+      fi
+      return 0
+    fi
     code=$(printf '%s' "$out" | jq -r '.error.code // "unparsed_error"' 2>/dev/null); code=${code:-unparsed_error}
     last_code="$code"
     log "prompt attempt $attempt failed: $code"
@@ -425,7 +615,7 @@ prompt_with_retry() {
 }
 
 cmd_launch() {
-  repo=""; kind="grok"; task=""; wt_branch=""; prompt=""; pfile=""; no_wt=0; base=""; explicit_args=0
+  repo=""; kind="grok"; task=""; wt_branch=""; prompt=""; pfile=""; no_wt=0; base=""; explicit_args=0; owner="${GBB_OWNER:-}"
   while [ $# -gt 0 ]; do
     case "$1" in
       --repo) repo="$2"; shift 2 ;;
@@ -436,6 +626,7 @@ cmd_launch() {
       --base) base="$2"; shift 2 ;;
       --prompt) prompt="$2"; shift 2 ;;
       --prompt-file) pfile="$2"; shift 2 ;;
+      --owner) owner="$2"; shift 2 ;;
       --) shift; explicit_args=1; break ;; # rest of "$@" = agent args, passed through verbatim
       *) die usage "unknown launch option $1" ;;
     esac
@@ -443,6 +634,7 @@ cmd_launch() {
   need "$HERDR"; need jq; need git
   [ -n "$repo" ] && [ -n "$task" ] || die usage "gbb launch --repo <path> --kind grok|codex --task <id> [--worktree <branch>|--no-worktree] (--prompt <text>|--prompt-file <f>)"
   case "$kind" in grok | codex) ;; *) die usage "--kind must be grok or codex" ;; esac
+  [ -z "$owner" ] || valid_owner "$owner" || die usage "--owner/GBB_OWNER must match $OWNER_RE"
   [ "$explicit_args" = 1 ] || set -- # drop anything left over; only args after -- are agent args
   if [ "$explicit_args" = 0 ]; then
     # Per-kind defaults from config (codex_args / grok_args). An explicit `--` (even empty) overrides them.
@@ -487,8 +679,8 @@ EOF
   # Register before start so status hooks for this pane are tracked from the first event.
   registry_update '.panes[$p] = {pane_id:$p, workspace_id:$ws, task_id:$task, agent_name:$n, kind:$k, repo:$r,
       worktree:$wt, branch:$b, base_commit:$bc, origin:"launched", created_workspace:true, created_at:$t, last_status:null, armed:false,
-      agent_args:$aa}' \
-    --argjson aa "$args_json" --arg p "$pane" --arg ws "$ws" --arg task "$tid" --arg n "$name" --arg k "$kind" --arg r "$repo" --arg wt "$wt" \
+      agent_args:$aa, owner:(if $o == "" then null else $o end), launching_until:$lu}' \
+    --arg o "$owner" --argjson lu "$(($(now) + 600))" --argjson aa "$args_json" --arg p "$pane" --arg ws "$ws" --arg task "$tid" --arg n "$name" --arg k "$kind" --arg r "$repo" --arg wt "$wt" \
     --arg b "$branch" --arg bc "$base_commit" --arg t "$(iso_now)" || die registry_error "registry write failed"
   # Treat the startup idle as already seen so launch does not wake Grok Bot.
   printf 'idle 0\n' >"$LAST_DIR/$(printf '%s' "$pane" | tr ':' '_')"
@@ -511,24 +703,67 @@ EOF
   done
   [ -n "$started" ] || die agent_start_failed "$(printf '%s' "$out" | head -c 300)"
   if [ "$started" = blocked ]; then
-    jq -cn --arg p "$pane" --arg ws "$ws" --arg task "$tid" --arg n "$name" --arg wt "$wt" --arg b "$branch" \
-      '{ok:false, state:"startup_blocked", hint:"agent shows a startup dialog; inspect with gbb read, answer with gbb keys, then gbb send the prompt",
-        task_id:$task, pane_id:$p, workspace_id:$ws, agent_name:$n, worktree:$wt, branch:$b}'
+    launch_blocked "$pane" startup_dialog
     exit 0
   fi
 
   settle=$(cfg_get startup_settle_sec); sleep "${settle:-4}"
-  wait_input_ready "$pane" "$kind"
+  WAIT_CWD="$wt" wait_input_ready "$pane" "$kind"; wrc=$?
+  if [ "$wrc" = 3 ]; then
+    launch_blocked "$pane" "$WAIT_STATE"
+    exit 0
+  fi
   # Never opt in to the Grok "Help improve Grok" data-sharing banner; it is left untouched.
   arm_pane "$pane"
   GBB_PROMPT_KIND="$kind" prompt_with_retry "$name" "$pane" "$prompt"; prc=$?
+  if [ "$prc" = 2 ]; then
+    br=$(printf '%s' "${PROMPT_RESULT:-}" | jq -r '.error.blocked_reason // "agent_blocked"' 2>/dev/null)
+    launch_blocked "$pane" "${br:-agent_blocked}"
+    exit 0
+  fi
+  [ "$prc" = 0 ] || save_pending_prompt "$pane" "$prompt"
+  launch_finish "$pane" "$prc"
+}
+
+# launch_finish <pane> <prc> — clear the launching window and print the launch result.
+launch_finish() {
+  ml=""; [ "$kind" = codex ] && ml=$(codex_model_line "$1")
+  registry_update 'if .panes[$p] then (.panes[$p] |= (del(.launching_until) + (if $m == "" then {} else {agent_model:$m} end))) else . end' \
+    --arg p "$1" --arg m "$ml"
   ag=$("$HERDR" agent get "$name" 2>/dev/null | jq -c '.result.agent // {}')
-  jq -cn --argjson ag "$ag" --arg p "$pane" --arg ws "$ws" --arg task "$tid" --arg n "$name" --arg wt "$wt" \
-    --arg b "$branch" --arg k "$kind" --argjson prc "$prc" --arg pr "$(printf '%s' "${PROMPT_RESULT:-}" | head -c 2000)" --argjson aa "$args_json" '
+  pend=false; [ -f "$(pending_file "$1")" ] && pend=true
+  jq -cn --argjson ag "${ag:-$EMPTY_OBJ}" --arg p "$1" --arg ws "$ws" --arg task "$tid" --arg n "$name" --arg wt "$wt" \
+    --arg b "$branch" --arg k "$kind" --argjson prc "$2" --arg pr "$(printf '%s' "${PROMPT_RESULT:-}" | head -c 2000)" --argjson aa "$args_json" \
+    --arg o "$owner" --arg ml "$ml" --argjson pend "$pend" '
     {ok:($prc==0), task_id:$task, pane_id:$p, workspace_id:$ws, agent_name:$n, kind:$k, agent_args:$aa, worktree:$wt, branch:$b,
-     status:$ag.agent_status, session_id:($ag.agent_session.value // null),
+     owner:(if $o == "" then null else $o end), agent_model:(if $ml == "" then null else $ml end),
+     status:$ag.agent_status, session_id:($ag.agent_session.value // null), prompt_pending:$pend,
      prompt_error:(if $prc==0 then null else ($pr | (try (fromjson | .error // .) catch .[0:300])) end)}'
 }
+
+# launch_blocked <pane> <reason> — the agent opened a startup dialog before the first prompt: keep the
+# prompt (sent later by `gbb answer` / `gbb send --pending`), arm the pane, emit a blocked event, report.
+launch_blocked() {
+  save_pending_prompt "$1" "$prompt"
+  registry_update 'if .panes[$p] then (.panes[$p] |= (del(.launching_until) + {armed:true, last_status:"blocked", blocked_reason:$r})) else . end' \
+    --arg p "$1" --arg r "$2"
+  printf 'blocked %s\n' "$(now)" >"$LAST_DIR/$(printf '%s' "$1" | tr ':' '_')"
+  e=$(entry_for_pane "$1")
+  notify "$(build_event agent_status blocked "$e" "$(jq -cn --arg r "$2" '{blocked_reason:$r, prompt_pending:true}')")"
+  jq -cn --arg p "$1" --arg ws "$ws" --arg task "$tid" --arg n "$name" --arg wt "$wt" --arg b "$branch" --arg r "$2" --arg o "$owner" \
+    --arg scr "$(screen_bottom "$1" 12)" '
+    {ok:false, state:"startup_blocked", blocked_reason:$r, prompt_pending:true,
+     hint:"the agent shows a startup dialog and the prompt was NOT typed. Read it (gbb read --visible), answer with gbb answer <task> <option> (or gbb keys); the saved prompt is then submitted automatically (or run gbb send <task> --pending)",
+     screen:($scr|split("\n")), task_id:$task, pane_id:$p, workspace_id:$ws, agent_name:$n, worktree:$wt, branch:$b,
+     owner:(if $o == "" then null else $o end)}'
+}
+
+pending_file() { printf '%s/pending/%s' "$STATE_DIR" "$(printf '%s' "$1" | tr ':' '_')"; }
+save_pending_prompt() {
+  mkdir -p "$STATE_DIR/pending" && chmod 700 "$STATE_DIR/pending"
+  f=$(pending_file "$1"); (umask 077; printf '%s' "$2" >"$f")
+}
+clear_pending_prompt() { rm -f "$(pending_file "$1")"; }
 
 # ---------- inspection / control ----------
 session_of() { printf '%s' "$1" | jq -r '.agent_session.value // empty'; }
@@ -559,8 +794,16 @@ cmd_status() {
     gl=$(git -C "$wt" log --oneline -n 8 2>/dev/null)
   fi
   sid=$(session_of "${ag}"); k=$(printf '%s' "$ENTRY" | jq -r '.kind // empty')
-  jq -cn --argjson e "$ENTRY" --argjson ag "$ag" --arg gs "$gs" --arg gl "$gl" --arg sid "$sid" --arg rc "$(resume_cmd "$k" "$sid")" '
-    {ok:true, entry:$e, agent:(if $ag then ($ag | {agent, name, agent_status, pane_id, workspace_id, cwd, foreground_cwd, completion_seq, terminal_title_stripped}) else null end),
+  ss=""; ml=""
+  if [ "$k" = codex ] && [ "$ag" != null ]; then
+    if screen_busy "$PANE"; then ss=working; else ss=$(screen_state "$PANE"); fi
+    ml=$(codex_model_line "$PANE")
+  fi
+  pend=false; [ -f "$(pending_file "$PANE")" ] && pend=true
+  jq -cn --argjson e "$ENTRY" --argjson ag "$ag" --arg gs "$gs" --arg gl "$gl" --arg sid "$sid" --arg rc "$(resume_cmd "$k" "$sid")" \
+    --arg ss "$ss" --arg ml "$ml" --argjson pend "$pend" '
+    {ok:true, entry:$e, owner:($e.owner // null), screen_state:(if $ss=="" then null else $ss end),
+     agent_model:(if $ml=="" then ($e.agent_model // null) else $ml end), prompt_pending:$pend, agent:(if $ag then ($ag | {agent, name, agent_status, pane_id, workspace_id, cwd, foreground_cwd, completion_seq, terminal_title_stripped}) else null end),
      alive:($ag != null), session_id:(if $sid=="" then null else $sid end), resume:(if $rc=="" then null else $rc end),
      git:{status:($gs|split("\n")|map(select(.!=""))), log:($gl|split("\n")|map(select(.!="")))}}'
 }
@@ -576,15 +819,133 @@ cmd_read() {
 
 agent_target() { n=$(printf '%s' "$ENTRY" | jq -r '.agent_name // empty'); printf '%s' "${n:-$PANE}"; }
 
+ANSWER_HINT='answer it with: gbb answer <task> <option-number|label> (opens a queued question with shift+left, moves with up/down, presses enter, verifies). Manual: gbb read <task> --visible, then gbb keys <task> shift+left, gbb keys <task> down|up..., gbb keys <task> enter. Hooks review: option 2 = trust all, 3 = continue without trusting (or gbb keys <task> esc to skip)'
+
 cmd_send() {
   t="${1:-}"; shift 2>/dev/null
-  [ $# -gt 0 ] || die usage "gbb send <task> <text>"
+  pending=0; [ "${1:-}" = --pending ] && { pending=1; shift; }
+  [ $# -gt 0 ] || [ "$pending" = 1 ] || die usage "gbb send <task> <text> | gbb send <task> --pending"
   require_entry "$t"
+  k=$(printf '%s' "$ENTRY" | jq -r '.kind // empty')
+  if [ "$pending" = 1 ]; then
+    pf=$(pending_file "$PANE"); [ -f "$pf" ] || die no_pending_prompt "no pending launch prompt for $PANE"
+    text=$(cat "$pf")
+  else
+    text="$*"
+  fi
+  if [ "$k" = codex ]; then
+    # Never type into a dialog: digits / letters can pick an option.
+    cs=$(screen_state "$PANE")
+    case "$cs" in hooks_review | question | dialog)
+      jq -cn --arg p "$PANE" --arg cs "$cs" --arg h "$ANSWER_HINT" --arg scr "$(screen_bottom "$PANE" 14)" \
+        '{ok:false, pane_id:$p, status:"blocked", error:{code:"agent_blocked", blocked_reason:$cs, message:"the agent is waiting on a dialog/question; the text was NOT sent", hint:$h}, screen:($scr|split("\n"))}'
+      exit 1 ;;
+    esac
+  fi
   arm_pane "$PANE"
-  GBB_PROMPT_KIND=$(printf '%s' "$ENTRY" | jq -r '.kind // empty') prompt_with_retry "$(agent_target)" "$PANE" "$*"; prc=$?
-  printf '%s' "${PROMPT_RESULT:-}" | jq -c --argjson prc "$prc" --arg p "$PANE" \
-    '{ok:($prc==0), pane_id:$p, status:(.result.agent.agent_status // null), error:(.error // null)}' 2>/dev/null ||
+  GBB_PROMPT_KIND="$k" prompt_with_retry "$(agent_target)" "$PANE" "$text"; prc=$?
+  [ "$prc" = 0 ] && [ "$pending" = 1 ] && clear_pending_prompt "$PANE"
+  [ "$prc" = 0 ] && [ "$pending" = 0 ] && [ -f "$(pending_file "$PANE")" ] && clear_pending_prompt "$PANE" # superseded by a manual prompt
+  printf '%s' "${PROMPT_RESULT:-}" | jq -c --argjson prc "$prc" --arg p "$PANE" --arg h "$ANSWER_HINT" \
+    '{ok:($prc==0), pane_id:$p, status:(.result.agent.agent_status // null),
+      error:(if .error then (.error + (if ((.error.code // "") | test("blocked")) then {hint:$h} else {} end)) else null end)}' 2>/dev/null ||
     jq -cn --argjson prc "$prc" --arg p "$PANE" '{ok:($prc==0), pane_id:$p, status:null, error:{code:"unparsed_result"}}'
+}
+
+# options_from_text — stdin: dialog screen; prints "<n>\t<selected 0|1>\t<label>" for the last numbered list (starting at 1).
+options_from_text() {
+  awk '
+    { line=$0; sel=0
+      if (match(line, /^[[:space:]]*›[[:space:]]*/)) { sel=1; line=substr(line, RLENGTH+1) } else { sub(/^[[:space:]]+/, "", line) }
+      if (match(line, /^[0-9]+\. /)) {
+        n=substr(line, 1, RLENGTH-2)+0; lab=substr(line, RLENGTH+1)
+        if (n == 1) { cnt=0 }
+        if (n == cnt+1) { cnt++; num[cnt]=n; s[cnt]=sel; l[cnt]=lab }
+      }
+    }
+    END { for (i=1; i<=cnt; i++) printf "%d\t%d\t%s\n", num[i], s[i], l[i] }'
+}
+dialog_open() { printf '%s\n' "$1" | grep -Eq 'enter (submit|confirm)'; }
+
+# gbb answer <task> <option-number|label> — answer a Codex question dialog / queued question / startup dialog.
+cmd_answer() {
+  t="${1:-}"; choice="${2:-}"
+  [ -n "$t" ] && [ -n "$choice" ] || die usage "gbb answer <task> <option-number|label>"
+  require_entry "$t"
+  tgt=$(agent_target)
+  scr=$(screen_bottom "$PANE" 30)
+  if ! dialog_open "$scr"; then
+    if printf '%s\n' "$scr" | grep -Eq 'to answer[[:space:]]*$'; then
+      "$HERDR" agent send-keys "$tgt" shift+left >/dev/null 2>&1; log "answer $PANE: opened queued question"
+      sleep 1; scr=$(screen_bottom "$PANE" 30)
+    fi
+  fi
+  dialog_open "$scr" || {
+    jq -cn --arg p "$PANE" --arg scr "$scr" '{ok:false, pane_id:$p, error:{code:"no_dialog",
+      message:"no numbered dialog is open (for a \"t trust all · enter review · esc close\" banner use gbb keys <task> t|enter|esc)"}, screen:($scr|split("\n"))}'
+    exit 1; }
+  opts=$(printf '%s\n' "$scr" | options_from_text)
+  [ -n "$opts" ] || die no_options "dialog has no numbered options; use gbb keys"
+  case "$choice" in
+    *[!0-9]*) want=$(printf '%s\n' "$opts" | awk -F '\t' -v c="$choice" 'index(tolower($3), tolower(c)) {print $1}')
+      [ "$(printf '%s\n' "$want" | grep -c .)" = 1 ] || die ambiguous_choice "label '$choice' matches $(printf '%s\n' "$want" | grep -c .) options: $(printf '%s' "$opts" | tr '\t\n' ' ;')" ;;
+    *) want="$choice" ;;
+  esac
+  printf '%s\n' "$opts" | awk -F '\t' -v w="$want" '$1 == w {f=1} END {exit !f}' || die bad_choice "no option $want: $(printf '%s' "$opts" | tr '\t\n' ' ;')"
+  tries=0
+  while :; do
+    cur=$(printf '%s\n' "$opts" | awk -F '\t' '$2 == 1 {print $1; exit}')
+    [ -n "$cur" ] || cur=1
+    [ "$cur" = "$want" ] && break
+    tries=$((tries + 1)); [ "$tries" -le 3 ] || die answer_nav_failed "could not move the selection to option $want (at $cur)"
+    if [ "$want" -gt "$cur" ]; then key=down; d=$((want - cur)); else key=up; d=$((cur - want)); fi
+    keys=""; i=0; while [ "$i" -lt "$d" ]; do keys="$keys $key"; i=$((i + 1)); done
+    # shellcheck disable=SC2086
+    "$HERDR" agent send-keys "$tgt" $keys >/dev/null 2>&1
+    sleep 1; scr=$(screen_bottom "$PANE" 30); opts=$(printf '%s\n' "$scr" | options_from_text)
+  done
+  label=$(printf '%s\n' "$opts" | awk -F '\t' -v w="$want" '$1 == w {print $3; exit}')
+  "$HERDR" agent send-keys "$tgt" enter >/dev/null 2>&1
+  log "answer $PANE: option $want ($label)"
+  sleep 2
+  after=$(screen_bottom "$PANE" 30); still=false
+  if dialog_open "$after" && [ "$(printf '%s\n' "$after" | options_from_text)" = "$opts" ]; then still=true; fi
+  arm_pane "$PANE"
+  sent=null
+  pf=$(pending_file "$PANE")
+  if [ "$still" = false ] && [ -f "$pf" ]; then
+    k=$(printf '%s' "$ENTRY" | jq -r '.kind // empty')
+    WAIT_CWD=$(printf '%s' "$ENTRY" | jq -r '.worktree // .cwd // empty') wait_input_ready "$PANE" "$k"; wrc=$?
+    if [ "$wrc" = 0 ]; then
+      GBB_PROMPT_KIND="$k" prompt_with_retry "$tgt" "$PANE" "$(cat "$pf")"; prc=$?
+      if [ "$prc" = 0 ]; then clear_pending_prompt "$PANE"; sent=true; else sent=false; fi
+    else
+      sent=false; log "answer $PANE: pending prompt kept (wait rc=$wrc ${WAIT_STATE:-})"
+    fi
+  fi
+  st=$(agent_status_of "$PANE")
+  jq -cn --arg p "$PANE" --arg w "$want" --arg l "$label" --argjson still "$still" --argjson sent "$sent" --arg st "$st" \
+    --arg ws "${WAIT_STATE:-}" --arg scr "$(screen_bottom "$PANE" 10)" '
+    {ok:($still|not), pane_id:$p, answered:{option:($w|tonumber), label:$l}, dialog_still_open:$still,
+     pending_prompt_sent:$sent, next_dialog:(if $ws=="" then null else $ws end), status_after:$st, screen:($scr|split("\n"))}'
+}
+
+# gbb owner <task> [<name>|--clear] — show or reassign who receives this task'"'"'s callbacks.
+cmd_owner() {
+  t="${1:-}"; v="${2:-}"
+  require_entry "$t"
+  if [ -n "$v" ]; then
+    if [ "$v" = --clear ]; then v=""; else valid_owner "$v" || die usage "owner must match $OWNER_RE"; fi
+    registry_update '.panes[$p].owner = (if $o == "" then null else $o end)' --arg p "$PANE" --arg o "$v"
+    log "owner $PANE -> ${v:-<none>}"
+    ENTRY=$(entry_for_pane "$PANE")
+  fi
+  o=$(printf '%s' "$ENTRY" | jq -r '.owner // empty')
+  route=primary; why=""
+  if [ -n "$o" ]; then
+    if [ -n "$(cfg_owner_target "$o")" ]; then route="owner:$o"; else route=fallback; why=owner_not_configured; fi
+  fi
+  jq -cn --arg p "$PANE" --arg o "$o" --arg r "$route" --arg w "$why" '{ok:true, pane_id:$p, owner:(if $o=="" then null else $o end), route:$r, fallback_reason:(if $w=="" then null else $w end)}'
 }
 
 cmd_keys() {
@@ -650,6 +1011,7 @@ cmd_stop() {
       "$HERDR" pane close "$PANE" >/dev/null 2>&1 && closed=true
     fi
   fi
+  clear_pending_prompt "$PANE"
   e=$(do_reclaim "$PANE" stopped)
   [ -n "$sid" ] && printf '%s\n' "$e" | jq -c --arg s "$sid" '. + {session_id:$s, ended:"stopped_session"}' >>"$HISTORY"
   jq -cn --argjson e "$e" --argjson c "$closed" --arg sid "$sid" '{ok:true, task_id:$e.task_id, origin:$e.origin, workspace_closed:$c,
@@ -658,10 +1020,10 @@ cmd_stop() {
 }
 
 cmd_handover_cli() {
-  pane=""; note=""
-  while [ $# -gt 0 ]; do case "$1" in --pane) pane="$2"; shift 2 ;; --note) note="$2"; shift 2 ;; *) pane="$1"; shift ;; esac; done
-  [ -n "$pane" ] || die usage "gbb handover --pane <id> [--note <text>]"
-  e=$(do_handover "$pane" "$note")
+  pane=""; note=""; howner=""
+  while [ $# -gt 0 ]; do case "$1" in --pane) pane="$2"; shift 2 ;; --note) note="$2"; shift 2 ;; --owner) howner="$2"; shift 2 ;; *) pane="$1"; shift ;; esac; done
+  [ -n "$pane" ] || die usage "gbb handover --pane <id> [--note <text>] [--owner <name>]"
+  e=$(do_handover "$pane" "$note" "$howner")
   printf '%s' "$e" | jq -e '.ok == false' >/dev/null 2>&1 && { printf '%s\n' "$e"; exit 1; }
   jq -cn --argjson e "$e" '{ok:true, entry:$e}'
 }
@@ -681,20 +1043,33 @@ cmd_doctor() {
     --arg hn "$(cfg_get webhook_header_name)" --arg hv "$( [ -n "$(cfg_get webhook_header_value)" ] && echo set)" \
     --arg herdr "$("$HERDR" --version 2>/dev/null)" --arg jq "$(jq --version)" --arg curl "$(command -v curl)" \
     --arg xhosts "$(cfg_extra_webhooks | while IFS="$US" read -r xu _xn _xv; do url_host "$xu"; printf ' '; done)" \
-    --arg reg "$REGISTRY" --arg log "$LOG" --argjson linked "${linked:-0}" --arg allow "$(cfg_list allowed_repos | tr '\n' ' ')" '
+    --arg reg "$REGISTRY" --arg log "$LOG" --argjson linked "${linked:-0}" --arg allow "$(cfg_list allowed_repos | tr '\n' ' ')" \
+    --arg owners "$(cfg_owners | while IFS="$US" read -r on ou _hn ohv; do printf '%s\t%s\t%s\n' "$on" "$(url_host "$ou")" "$( [ -n "$ohv" ] && echo set)"; done)" \
+    --argjson cargs "$(cfg_array codex_args | jq -R . | jq -sc .)" --arg cdef "$(codex_user_defaults)" '
     {ok:true, version:$v, herdr:$herdr, jq:$jq, curl:($curl != ""), plugin_linked:($linked > 0),
      config:{path:$cfg, exists:($mode != ""), mode:(if $mode=="" then null else $mode end), mode_ok:($mode=="600" or $mode=="400"),
        webhook_host:(if $host=="" then null else $host end), header_name:(if $hn=="" then null else $hn end), header_value_set:($hv=="set"),
        extra_webhooks:{count:($xhosts|split(" ")|map(select(.!=""))|length), hosts:($xhosts|split(" ")|map(select(.!="")))},
-       allowed_repos:($allow|split(" ")|map(select(.!="")))},
+       allowed_repos:($allow|split(" ")|map(select(.!=""))),
+       owners:[$owners|split("\n")[]|select(.!="")|split("\t")|{name:.[0], host:.[1], header_value_set:(.[2]=="set")}],
+       codex_args:$cargs},
+     codex_user_defaults:($cdef|split("\n")|map(select(.!=""))),
+     codex_args_note:(if ($cargs|length)==0 then "codex_args is empty: Codex uses model/model_reasoning_effort from ~/.codex/config.toml (see codex_user_defaults)" else null end),
      registry:$reg, log:$log}'
 }
 
+codex_user_defaults() { # top-level model settings of ~/.codex/config.toml (no secrets live there)
+  f="${CODEX_HOME:-$HOME/.codex}/config.toml"; [ -f "$f" ] || return 0
+  awk '/^[[:space:]]*\[/ {exit} /^[[:space:]]*(model|model_reasoning_effort|profile)[[:space:]]*=/ {gsub(/[[:space:]]+/, " "); print}' "$f"
+}
+
 cmd_test_webhook() {
-  GBB_CTX=test
-  notify "$(build_event test "" '{}')"
-  t=$(cfg_get webhook_timeout_sec); sleep $(( ${t:-5} + 2 ))
-  n=$(( $(cfg_extra_webhooks | grep -c .) + 1 ))
+  GBB_CTX="test"; towner=""
+  while [ $# -gt 0 ]; do case "$1" in --owner) towner="$2"; shift 2 ;; *) die usage "gbb test-webhook [--owner <name>]" ;; esac; done
+  [ -z "$towner" ] || valid_owner "$towner" || die usage "owner must match $OWNER_RE"
+  notify "$(build_event test "" "$(jq -cn --arg o "$towner" 'if $o == "" then {} else {owner:$o} end')")"
+  t=$(cfg_get webhook_timeout_sec); sleep $(( ${t:-5} * 2 + 2 ))
+  n=$(( $(cfg_extra_webhooks | grep -c .) + 2 ))
   jq -cn --arg l "$(tail -n 1 "$LOG")" --arg r "$(grep 'webhook' "$LOG" | tail -n "$n")" \
     '{ok:true, last_log:$l, recent_webhook_logs:($r|split("\n")|map(select(.!="")))}'
 }
@@ -703,14 +1078,18 @@ usage() {
   cat <<'U'
 gbb — Grok Bot bridge for Herdr (JSON output)
   gbb launch --repo <path> --kind grok|codex --task <id> [--worktree <branch>|--no-worktree] [--base <ref>]
-             (--prompt <text> | --prompt-file <f>) [-- <agent args>]
+             (--prompt <text> | --prompt-file <f>) [--owner <name>] [-- <agent args>]
+             (owner defaults to $GBB_OWNER; callbacks go to that owner's webhook, else the primary)
   gbb list
   gbb status <task|pane>          gbb read <task|pane> [--lines N] [--visible]
-  gbb send <task|pane> <text>     gbb keys <task|pane> <key>...
+  gbb send <task|pane> <text>     gbb send <task|pane> --pending   (saved launch prompt)
+  gbb answer <task|pane> <option-number|label>   (Codex question / startup dialog)
+  gbb owner <task|pane> [<name>|--clear]
+  gbb keys <task|pane> <key>...   (herdr key names: enter esc up down shift+left t ...)
   gbb wait <task|pane> [--until S]... [--timeout MS]
   gbb result <task|pane>          gbb stop <task|pane>
-  gbb handover --pane <id> [--note <text>]    gbb reclaim --pane <id>
-  gbb doctor                      gbb test-webhook
+  gbb handover --pane <id> [--note <text>] [--owner <name>]    gbb reclaim --pane <id>
+  gbb doctor                      gbb test-webhook [--owner <name>]
 Internal: gbb hook (plugin event hook), gbb action handover|reclaim (plugin actions)
 U
 }
@@ -725,13 +1104,15 @@ case "$cmd" in
   read) cmd_read "$@" ;;
   send) cmd_send "$@" ;;
   keys) cmd_keys "$@" ;;
+  answer) cmd_answer "$@" ;;
+  owner) cmd_owner "$@" ;;
   wait) cmd_wait "$@" ;;
   result) cmd_result "$@" ;;
   stop) cmd_stop "$@" ;;
   handover) cmd_handover_cli "$@" ;;
   reclaim) cmd_reclaim_cli "$@" ;;
   doctor) cmd_doctor ;;
-  test-webhook) cmd_test_webhook ;;
+  test-webhook) cmd_test_webhook "$@" ;;
   version | --version) jq -cn --arg v "$GBB_VERSION" '{ok:true,version:$v}' ;;
   help | -h | --help) usage ;;
   *) die usage "unknown command $cmd (gbb help)" ;;

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Offline test: primary webhook + [[extra_webhooks]] get the identical payload and their own header.
+# Offline test: primary webhook + [[extra_webhooks]] get the same payload (except the route tag) and their own header.
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P); T=$(mktemp -d)
 trap 'kill $SINK 2>/dev/null || true; wait $SINK 2>/dev/null || true; rm -rf "$T"' EXIT
@@ -53,7 +53,9 @@ printf '%s' "$doc" | grep -q secret && fail "doctor leaked a secret"
 grep -q secret "$T/tw.json" "$T/state/bridge.log" && fail "secret in output/log"
 [ -f "$T/hits/primary.json" ] && [ -f "$T/hits/dots.json" ] || fail "missing deliveries: $(ls "$T/hits")"
 [ ! -f "$T/hits/not-a-webhook.json" ] || fail "[other] table treated as webhook"
-[ "$(jq -r .body "$T/hits/primary.json")" = "$(jq -r .body "$T/hits/dots.json")" ] || fail "payloads differ"
+[ "$(jq -r .body "$T/hits/primary.json" | jq -c 'del(.route)')" = "$(jq -r .body "$T/hits/dots.json" | jq -c 'del(.route)')" ] || fail "payloads differ"
+[ "$(jq -r .body "$T/hits/primary.json" | jq -r .route)" = primary ] || fail "primary route tag"
+[ "$(jq -r .body "$T/hits/dots.json" | jq -r .route)" = extra ] || fail "extra route tag"
 [ "$(jq -r '.headers["x-primary"]' "$T/hits/primary.json")" = primary-secret ] || fail "primary header"
 [ "$(jq -r '.headers["x-dots-herdr-token"] // "none"' "$T/hits/primary.json")" = none ] || fail "dots header leaked to primary"
 [ "$(jq -r '.headers["x-dots-herdr-token"]' "$T/hits/dots.json")" = dots-secret ] || fail "extra header"

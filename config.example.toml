@@ -24,7 +24,8 @@ startup_ready_timeout_sec = 90
 # Optional per-kind default agent args for `gbb launch` (single line, double-quoted strings, JSON-style escapes).
 # Used only when launch is called without `-- <agent args>`; an explicit `--` (even with nothing after it) wins.
 # Each item is passed to the agent as one argument, so values with quotes/spaces are safe.
-# Empty or absent = the agent's own defaults (for codex: ~/.codex/config.toml).
+# Empty or absent = the agent's own defaults (for codex: model / model_reasoning_effort in ~/.codex/config.toml,
+# which `gbb doctor` shows as codex_user_defaults). Pin them here if Grok Bot launches must not follow that file:
 # codex_args = ["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=\"xhigh\""]
 # grok_args = []
 
@@ -38,5 +39,29 @@ startup_ready_timeout_sec = 90
 # header_name = "X-Dots-Herdr-Token"
 # header_value = ""   # contents of ~/.config/dots-bridge/herdr_webhook_token
 
-# Env overrides: GBB_WEBHOOK_URL, GBB_WEBHOOK_HEADER_NAME, GBB_WEBHOOK_HEADER_VALUE, GBB_CONFIG,
+# Optional named callback targets ("owners", docs/decisions/0004). A task launched with `gbb launch --owner <name>`
+# (or GBB_OWNER=<name>) sends its status callbacks to that owner's target INSTEAD of the primary webhook above.
+# The primary webhook is the fallback: used when a task has no owner, the owner has no entry here, or the
+# owner's POST fails (curl error / non-2xx; payload then has route = "fallback", fallback_reason = ...).
+# [[extra_webhooks]] still get every event; an extra whose url equals the owner's url is skipped (no duplicate).
+# Names: letters, digits, . _ - (max 40). Same table rules as [[extra_webhooks]]. Payload carries owner + route.
+#
+# ChatGPT dot via dots-tunnel-bridge (dots-bridge's gbb_launch passes --owner dot):
+# [[owners]]
+# name = "dot"
+# url = "http://127.0.0.1:8765/herdr/webhook"
+# header_name = "X-Dots-Herdr-Token"
+# header_value = ""   # contents of ~/.config/dots-bridge/herdr_webhook_token
+#
+# Another Grok Bot (e.g. 参谋长): create a webhook-triggered routine on THAT bot and copy its URL + header here;
+# that bot then launches with `gbb launch --owner canmouzhang ...` (or exports GBB_OWNER=canmouzhang).
+# [[owners]]
+# name = "canmouzhang"
+# url = ""            # webhook URL from the routine's trigger panel on that bot
+# header_name = ""    # header name shown there (e.g. Authorization)
+# header_value = ""   # key shown there
+#
+# Equivalent table form: [owners.canmouzhang] with url / header_name / header_value.
+
+# Env overrides: GBB_OWNER (default owner for launch/handover), GBB_WEBHOOK_URL, GBB_WEBHOOK_HEADER_NAME, GBB_WEBHOOK_HEADER_VALUE, GBB_CONFIG,
 # GBB_STATE_DIR (default ~/.local/state/grokbot-bridge-herdr), GBB_DATA_DIR (default ~/.local/share/grokbot-bridge-herdr)
