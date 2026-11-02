@@ -341,7 +341,16 @@ codex_model_line() {
 # Codex (OSC 7501, app=codex) and Grok Build (≥ 1.0.52) report natively, and hc answers the
 # `OSC 7501 ; ?` query, so a wrapper that also emits 7501 would clobber those reports.
 # A codex that never reports still gets screen classification (the same rules as the TUI path).
-# `auto` keeps the TUI when `herdr` is installed so machines that already run both do not move.
+# `auto` (the default) launches on hc when `hc server status` can reach or start the core.
+# The Herdr TUI is the fallback when hc is missing or that status call fails.
+# Rows already in the registry stay on the backend they were recorded with (no field = TUI).
+
+# hc_core_up — 0 when `hc server status` returns a running core (it starts one if needed).
+hc_core_up() {
+  have_cmd "$HC" || return 1
+  out=$("$HC" server status --json 2>/dev/null) || return 1
+  printf '%s' "$out" | jq -e '(.pid | type) == "number"' >/dev/null 2>&1
+}
 
 # resolve_launch_backend <explicit> — sets LAUNCH_BACKEND. Flag, else GBB_BACKEND, else config, else auto.
 resolve_launch_backend() {
@@ -351,9 +360,13 @@ resolve_launch_backend() {
   case "$sel" in
     herdr | hc) LAUNCH_BACKEND=$sel; return 0 ;;
     "" | auto)
-      if have_cmd "$HERDR"; then LAUNCH_BACKEND=herdr; return 0; fi
-      if have_cmd "$HC"; then LAUNCH_BACKEND=hc; return 0; fi
-      die missing_dependency "neither herdr nor hc found on PATH" ;;
+      if hc_core_up; then LAUNCH_BACKEND=hc; return 0; fi
+      if have_cmd "$HERDR"; then
+        log "auto: hc is missing or its server did not start; launching on herdr"
+        LAUNCH_BACKEND=herdr
+        return 0
+      fi
+      die missing_dependency "hc server is not reachable and herdr was not found" ;;
     *) die usage "--backend / backend must be auto, herdr, or hc" ;;
   esac
 }
@@ -1665,7 +1678,7 @@ gbb — Grok Bot bridge for Herdr and herdr-core (JSON output)
   gbb launch --repo <path> --kind grok|codex --task <id> [--worktree <branch>|--no-worktree] [--base <ref>]
              (--prompt <text> | --prompt-file <f>) [--owner <name>] [--backend auto|herdr|hc] [-- <agent args>]
              (owner defaults to $GBB_OWNER; callbacks go to that owner's webhook, else the primary)
-             (backend defaults to config backend, else GBB_BACKEND, else auto: herdr if installed, else hc)
+             (backend defaults to config backend, else GBB_BACKEND, else auto: hc when its server is up, else herdr)
   gbb list
   gbb status <task|pane>          gbb read <task|pane> [--lines N] [--visible]
   gbb send <task|pane> <text>     gbb send <task|pane> --pending   (saved launch prompt)

@@ -15,20 +15,21 @@ Checked against hc 0.1.16 on Linux (the release the user's machine runs):
 
 ## Decision
 
-- New tasks can launch on `hc`. Config `backend = "auto"|"herdr"|"hc"`, else `GBB_BACKEND`, else `--backend` on that launch. `auto` uses the TUI when `herdr` is on PATH and `hc` only when `herdr` is not. A machine that has both (live TUI tasks plus the app) does not move until someone sets `hc`.
-- The registry records `backend`. A missing field means the TUI, so rows written before 0.3.0 keep working. Later commands follow the row, not the config.
+- New tasks launch on `hc` by default. Config `backend = "auto"|"herdr"|"hc"`, else `GBB_BACKEND`, else `--backend` on that launch. Unset config is `auto`. `auto` uses hc when `hc server status` returns a core (that call starts one if it is not already up) and uses the Herdr TUI only when `hc` is missing or the status call fails. `backend = "herdr"` and `--backend herdr` force the TUI even when hc is up. `backend = "hc"` does not fall back.
+- The registry records `backend`. A missing field means the TUI, so rows written before 0.3.0 keep using the herdr session server for status, send, read, stop, and handover. The TUI plugin hook and the `hc events` watcher run side by side; each event is delivered only for rows of that backend. Later commands follow the row, not the current config.
 - Launch is `hc run --bg --no-parent --no-notify` of `grok` or `codex` plus the same `grok_args` / `codex_args`, then `hc send` for the prompt. No `--force`. Labels `grokbot=managed` and `gbb_task=<id>` are the marker. `gbb stop` kills and removes only terminals this launch created. Handover labels an existing terminal and never kills it. gbb never runs `hc server stop`.
 - Status callbacks come from one background `hc events --label grokbot=managed` watcher (restarted from launch, handover, and when it dies). The payload stays the 0.2 shape plus `backend`. `working` is not sent. `error` is delivered as `blocked` with `blocked_reason=error` and `herdr_status=error`, so existing consumers still wake. `kind` becomes `blocked_reason` when it is `permission`, `question`, or `auth`. The OSC `msg` is never copied (it can be prompt text). Codex still gets the existing screen correction, including when it has not reported yet (`foreground` events, throttled). Grok is not screen-guessed: current Grok Build reports natively, and a wrapper that also wrote OSC 7501 would replace that root record.
 - `gbb send` / `answer` / `keys` / `read` / `status` / `wait` / `result` use the matching `hc` command. `wait --until` polls the reported word (`error` counts as `blocked`).
 
 ## Alternatives rejected
 
-- Prefer `hc` whenever its server is up. That would move new launches off the TUI on a machine that still has live TUI tasks, with no config change.
+- Keep `auto` on the TUI whenever `herdr` is installed (the first cut of this ADR). Superseded 2026-11-02: new tasks go to hc; tasks already in the registry stay on the herdr session server. The TUI remains the fallback when hc is missing or `hc server status` fails, and `--backend herdr` still forces it.
 - Wrap grok and codex so gbb emits OSC 7501. Current Codex and Grok Build already emit it, and a second writer on the root record would clobber theirs. hc has no inference API to call instead.
 - One `hc events` process per task. A single watcher filtered by `grokbot=managed` covers launch and handover and survives the `gbb` command that started it.
 
 ## Consequences
 
 - The Herdr app shows the terminal (attach with `hc attach <name>`). The TUI plugin is not involved, so handover in the app is `gbb handover --pane <t>` (an id without `:` is tried as an hc address).
-- Dots-tunnel-bridge does not need a new tool. Set `backend` on the machine; the dot's `gbb_launch` is unchanged. Payloads gain `backend`. Receivers that keep a field allow-list ignore it; `status` is still `done`, `idle`, or `blocked`.
+- Dots-tunnel-bridge does not need a new tool. With `backend` unset, a dot's `gbb_launch` now starts on hc when the core is up. Payloads gain `backend`. Receivers that keep a field allow-list ignore it; `status` is still `done`, `idle`, or `blocked`.
+- `auto` runs `hc server status` before a new launch. That starts the core when it is not already running. A failed status call is logged and the launch uses herdr instead.
 - A Grok Build older than 1.0.52, or a Codex that does not speak 7501 and is not showing a screen gbb already classifies, runs visibly but does not invent `working`/`done`. `gbb status` shows `reported` via the raw word (`agent.agent_status` null until it speaks).

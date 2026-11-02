@@ -1,8 +1,9 @@
 #!/bin/sh
 # Offline tests for the herdr-core (hc) backend:
 #   command construction (hc run / send / keys, no --force),
-#   backend selection (auto stays on herdr when both exist; config and --backend override;
-#   auto uses hc when herdr is absent),
+#   backend selection (auto picks hc when its server is up, even if herdr exists;
+#   falls back to herdr when hc is down; --backend herdr still forces the TUI;
+#   a legacy row stays on herdr while the hc watcher runs),
 #   a pre-0.3.0 registry row still talks to herdr even if config says hc,
 #   hc events -> the same webhook payload (owner route, no OSC message text),
 #   working suppressed, done->idle debounced, error mapped to blocked,
@@ -28,7 +29,14 @@ case "$1" in
   get) printf '%s\n' '{"address":"t9","name":"gb","state":"live","status":{"state":"idle","app":"grok"},"reported":true,"cwd":"/tmp","turn":0,"title":"","labels":{}}' ;;
   send) printf '%s\n' '{"started":true,"status":"working","turn":1}' ;;
   read) cat "$STUB_DIR/screen" ;;
-  events) [ -f "$STUB_DIR/events.jsonl" ] && cat "$STUB_DIR/events.jsonl" ;;
+  events)
+    [ -f "$STUB_DIR/events.jsonl" ] && cat "$STUB_DIR/events.jsonl"
+    [ -f "$STUB_DIR/events.hold" ] && sleep 3
+    ;;
+  server)
+    if [ -f "$STUB_DIR/hc-down" ]; then printf '%s\n' '{"error":{"kind":"unavailable"}}'; exit 1; fi
+    printf '%s\n' '{"pid":1,"version":"0.1.16","core":{"id":"stub"}}'
+    ;;
   *) printf '%s\n' '{"ok":true}' ;;
 esac
 H
@@ -59,7 +67,7 @@ reset_calls() { rm -f "$T"/call.* "$T/herdr-calls"/call.*; }
 hc_runs() { cat "$T"/call.* 2>/dev/null | jq -s 'map(select(.[0]=="run"))'; }
 herdr_cmds() { cat "$T/herdr-calls"/call.* 2>/dev/null | jq -s 'map(.[0] + " " + (.[1] // ""))'; }
 
-# --- auto with both binaries stays on the TUI (no hc run) ---
+# --- auto with both binaries, hc server up: new launch is hc ---
 cat >"$T/config.toml" <<'TOML'
 startup_settle_sec = 0
 startup_ready_timeout_sec = 8
@@ -69,10 +77,10 @@ TOML
 chmod 600 "$T/config.toml"
 reset_calls
 out=$("$ROOT/bin/gbb" launch --repo "$T/repo" --kind grok --task auto1 --prompt "hi" --no-worktree)
-printf '%s' "$out" | jq -e '.ok == true and .backend == "herdr" and .pane_id == "w1:p1"' >/dev/null || fail "auto launch: $out"
-[ "$(hc_runs | jq 'length')" = 0 ] || fail "auto called hc run: $(hc_runs)"
-printf '%s' "$(herdr_cmds)" | jq -e 'index("workspace create") != null' >/dev/null || fail "auto did not create a herdr workspace: $(herdr_cmds)"
-[ "$("$ROOT/bin/gbb" list | jq -r '.managed[0].backend')" = herdr ] || fail "auto registry backend"
+printf '%s' "$out" | jq -e '.ok == true and .backend == "hc" and .pane_id == "t9"' >/dev/null || fail "auto launch: $out"
+[ "$(hc_runs | jq 'length')" = 1 ] || fail "auto did not hc run: $(hc_runs)"
+printf '%s' "$(herdr_cmds)" | jq -e 'index("workspace create") == null' >/dev/null || fail "auto created a herdr workspace: $(herdr_cmds)"
+[ "$("$ROOT/bin/gbb" list | jq -r '.managed[0].backend')" = hc ] || fail "auto registry backend"
 
 # --- config backend=hc, and --backend herdr overrides it ---
 cat >"$T/config.toml" <<'TOML'
@@ -100,6 +108,23 @@ reset_calls
 out=$("$ROOT/bin/gbb" launch --repo "$T/repo" --kind grok --task back --prompt "hi" --backend herdr --no-worktree)
 printf '%s' "$out" | jq -e '.backend == "herdr"' >/dev/null || fail "--backend herdr: $out"
 [ "$(hc_runs | jq 'length')" = 0 ] || fail "--backend herdr still ran hc"
+
+# --- auto falls back to herdr when the hc server cannot start; explicit hc does not ---
+printf 'down\n' >"$T/hc-down"
+reset_calls
+out=$("$ROOT/bin/gbb" launch --repo "$T/repo" --kind grok --task down1 --prompt "hi" --backend auto --no-worktree)
+printf '%s' "$out" | jq -e '.ok == true and .backend == "herdr"' >/dev/null || fail "auto fallback: $out"
+[ "$(hc_runs | jq 'length')" = 0 ] || fail "fallback still hc run: $(hc_runs)"
+grep -q 'launching on herdr' "$T/state/bridge.log" || fail "fallback not logged"
+reset_calls
+out=$("$ROOT/bin/gbb" launch --repo "$T/repo" --kind grok --task forcedhc --prompt "hi" --backend hc --no-worktree)
+printf '%s' "$out" | jq -e '.ok == true and .backend == "hc"' >/dev/null || fail "explicit hc while down: $out"
+[ "$(hc_runs | jq 'length')" = 1 ] || fail "explicit hc did not run: $(hc_runs)"
+rm -f "$T/hc-down"
+reset_calls
+out=$("$ROOT/bin/gbb" launch --repo "$T/repo" --kind grok --task nohc --prompt "hi" --backend auto --no-worktree)
+# herdr is still present and hc is up again; this just clears hc-down before the next case
+printf '%s' "$out" | jq -e '.backend == "hc"' >/dev/null || fail "hc restored: $out"
 
 # --- auto with no herdr uses hc ---
 export HERDR_BIN_PATH="$T/bin/no-herdr"
@@ -203,4 +228,29 @@ JSON
 "$ROOT/bin/gbb" hc-watch
 [ -f "$T/hits/primary.jsonl" ] || fail "unreported codex produced no callback"
 jq -c .body "$T/hits/primary.jsonl" | jq -s -e '.[0].status=="blocked" and .[0].blocked_reason=="question" and .[0].route=="primary" and .[0].task_id=="cx"' >/dev/null || fail "screen fallback: $(cat "$T/hits/primary.jsonl")"
+
+# --- legacy herdr hook still delivers while the hc watcher is running ---
+rm -f "$T/hits"/* "$T/state/last"/* "$T/state/hc-watch.pid"
+echo '{"version":1,"panes":{"w1:p1":{"pane_id":"w1:p1","workspace_id":"w1","task_id":"old","agent_name":"gb-old","kind":"grok","origin":"launched","armed":true},"t3":{"pane_id":"t3","task_id":"new","agent_name":"gb-new","kind":"grok","origin":"launched","backend":"hc","armed":true}}}' >"$T/state/managed.json"
+cat >"$T/events.jsonl" <<'JSON'
+{"jsonrpc":"2.0","method":"event","params":{"seq":1,"terminal":"t3","type":"status","data":{"reported":true,"records":{},"status":{"state":"done","app":"grok"}}}}
+JSON
+printf 'hold\n' >"$T/events.hold"
+"$ROOT/bin/gbb" hc-watch &
+WP=$!
+i=0
+while [ ! -f "$T/hits/primary.jsonl" ] && [ "$i" -lt 40 ]; do sleep 0.1; i=$((i + 1)); done
+[ -f "$T/hits/primary.jsonl" ] || fail "hc watcher did not deliver before the hook"
+HERDR_PLUGIN_EVENT=pane.agent_status_changed \
+  HERDR_PLUGIN_EVENT_JSON='{"data":{"pane_id":"w1:p1","workspace_id":"w1","agent_status":"done","agent":"grok"}}' \
+  "$ROOT/bin/gbb" hook
+i=0
+while [ "$(grep -c . "$T/hits/primary.jsonl" 2>/dev/null || echo 0)" -lt 2 ] && [ "$i" -lt 40 ]; do sleep 0.1; i=$((i + 1)); done
+rm -f "$T/events.hold"
+wait "$WP" || true
+[ "$(grep -c . "$T/hits/primary.jsonl")" = 2 ] || fail "expected herdr hook + hc event, got $(cat "$T/hits/primary.jsonl")"
+jq -c .body "$T/hits/primary.jsonl" | jq -s -e '
+  (map(select(.task_id=="new" and .backend=="hc" and .status=="done" and .pane_id=="t3")) | length) == 1
+  and (map(select(.task_id=="old" and .backend=="herdr" and .status=="done" and .pane_id=="w1:p1")) | length) == 1
+' >/dev/null || fail "side by side payloads: $(jq -c .body "$T/hits/primary.jsonl")"
 echo PASS

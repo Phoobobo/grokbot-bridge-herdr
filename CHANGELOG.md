@@ -4,7 +4,7 @@
 
 Launch tasks in herdr-core (`hc`) terminals, which the Herdr app can show and attach, without moving tasks that already run in the Herdr TUI.
 
-- `backend = "auto"|"herdr"|"hc"` in config.toml, or `GBB_BACKEND`, or `gbb launch --backend`. `auto` keeps the TUI when `herdr` is installed. Each registry row records its backend; a row with no field stays on the TUI.
+- `backend = "auto"|"herdr"|"hc"` in config.toml, or `GBB_BACKEND`, or `gbb launch --backend`. `auto` (the default) launches new tasks on hc when `hc server status` can reach or start the core, and uses the Herdr TUI only when hc is missing or that call fails. `backend = "herdr"` and `--backend herdr` still force the TUI. Each registry row records its backend; a row with no field, or `backend = "herdr"`, keeps using the TUI session server for status, send, read, stop, and handover while the hc watcher runs for hc rows.
 - On `hc`, status callbacks come from `hc events` (OSC 7501) and use the same payload and owner / primary / extra routing. `error` is delivered as `blocked` with `blocked_reason=error`. The OSC message text is not sent.
 - Codex and Grok Build report status themselves (Codex's OSC 7501, Grok Build ≥ 1.0.52). gbb does not wrap them. A Codex that has not reported yet still uses the existing screen classification. `hc send` is never called with `--force`.
 - `gbb stop` kills and removes only hc terminals gbb created. Handover terminals are unlabeled, not killed. gbb does not run `hc server stop`.

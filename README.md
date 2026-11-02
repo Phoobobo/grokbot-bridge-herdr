@@ -26,7 +26,7 @@ chmod 600 ~/.config/grokbot-bridge-herdr/config.toml     # 不是 600 就拒绝�
 gbb doctor && gbb test-webhook
 ```
 
-依赖：jq、git、curl，以及 **herdr ≥ 0.9.0（TUI）或 hc ≥ 0.1.16（herdr-core，Herdr app 的运行时）**，有一个即可。两边都装了时，默认仍走 TUI（见下文 [Herdr app](#herdr-app-herdr-core)）。卸载：`./uninstall.sh`（保留配置、登记表、日志和 worktree）。
+依赖：jq、git、curl，以及 **herdr ≥ 0.9.0（TUI）或 hc ≥ 0.1.16（herdr-core，Herdr app 的运行时）**，有一个即可。新任务默认走 hc（`hc server status` 能连上或能拉起 core 时）；hc 不在或 core 起不来才退回 TUI。已经在登记表里的 TUI 任务仍走 herdr（见下文 [Herdr app](#herdr-app-herdr-core)）。卸载：`./uninstall.sh`（保留配置、登记表、日志和 worktree）。
 
 ### 快捷键（可选）
 
@@ -72,7 +72,7 @@ description = "take pane back from Grok Bot"
 - 每个工具都以参数列表调用 `gbb`（不经过 shell），带超时和输入校验；send/keys/stop/reclaim 只作用于托管窗格，默认保护工作区 `wAS`、`wAT`（除非窗格是主动交接的）。
 - 状态推送：在 `config.toml` 末尾加 `[[extra_webhooks]]`，指向 `http://127.0.0.1:8765/herdr/webhook`，header `X-Dots-Herdr-Token`，值为 `~/.config/dots-bridge/herdr_webhook_token` 的内容。gbb 对每个目标各发一份相同的 payload，原 Grok Bot webhook 不受影响；dots-tunnel-bridge 只接受本机请求，并把它变成 `herdr`（没有则 `default`）频道的 `app.message.created` 消息，`metadata.source = "herdr"`。
 - 改了工具后要在 ChatGPT 插件页刷新（Refresh）dot 的工具。设计见 [docs/decisions/0003](docs/decisions/0003-dots-bridge-tools-and-extra-webhooks.md)。
-- **herdr-core：** dot 的 13 个 `gbb_*` 工具不用改。任务跑在 TUI 还是 hc，由这台机器的 `backend` / `GBB_BACKEND` 决定（`gbb_launch` 不传 `--backend`）。回调仍是同一份 JSON，打到同一个 `/herdr/webhook`；多一个 `backend` 字段，旧的接收端可以忽略。已经在登记表里的 TUI 任务不会被改到 hc。
+- **herdr-core：** dot 的 13 个 `gbb_*` 工具不用改。`gbb_launch` 不传 `--backend`，所以新任务跟着这台机器的默认：`auto` 时 hc 可用就进 hc。回调仍是同一份 JSON，打到同一个 `/herdr/webhook`；多一个 `backend` 字段，旧的接收端可以忽略。已经在登记表里的 TUI 任务不会被改到 hc，钩子和 `hc events` 可以同时跑。
 
 ### 多个调用方（owner 回调）
 
@@ -117,11 +117,11 @@ Herdr app（2026-10-29 起）跑在新的运行时 **herdr-core** 上，命令�
 
 ```toml
 # ~/.config/grokbot-bridge-herdr/config.toml
-backend = "auto"   # herdr | hc | auto（默认）
+backend = "auto"   # 默认。hc 优先；herdr | hc 可强制
 ```
 
-- `auto`：PATH 上有 `herdr` 就用 TUI；只有 `hc` 时才用 herdr-core。两边都有时**不会**悄悄改到 app，避免正在跑的 TUI 任务旁边新任务突然换地方。要改用 app：`backend = "hc"`，或单次 `gbb launch --backend hc`（也可用 `GBB_BACKEND`）。
-- 登记表里每条任务记下 `backend`。没有这个字段的旧记录一律当 TUI。之后的 `status` / `send` / `stop` 跟记录走，不跟当前配置走。
+- `auto`（不写也是这个）：`hc server status` 能连上或能启动 core，新任务就进 hc；hc 不在，或这次 status 失败，才退回 TUI。`backend = "herdr"` 或 `gbb launch --backend herdr` 始终走 TUI。`backend = "hc"` 不退回。
+- 登记表里每条任务记下 `backend`。没有这个字段、或写着 `herdr` 的旧记录，status / send / read / stop / handover 仍走 herdr 会话服务。TUI 插件钩子和 `hc events` 一起跑，各管各的记录。
 - `hc` 上的启动是 `hc run --bg`（`grok` 或 `codex`，参数仍是 `grok_args` / `codex_args`），prompt 用 `hc send`（从不加 `--force`，以免替你答对话框）。终端在 `hc ls` 里，Herdr app 能看到、`hc attach` 能接管。
 - 状态由后台的 `hc events --label grokbot=managed` 推送，payload 和 owner / 主 webhook / `[[extra_webhooks]]` 的路由跟 TUI 一样。`working` 不发；`error` 以 `blocked`（`blocked_reason=error`，`herdr_status=error`）发出。OSC 的 `msg` 不进 payload。
 - Codex 和 Grok Build（≥ 1.0.52）自己发 OSC 7501，gbb 不包一层（再写一条会盖掉它们的根记录）。还没上报的 Codex 仍用原来的读屏判断。更老的、既不上报也不是这些画面的 Grok 会在 app 里跑，但不会编造 `done`。
@@ -185,11 +185,11 @@ The Herdr app (since 2026-10-29) runs on **herdr-core** (`hc`). Status there is 
 
 ```toml
 # ~/.config/grokbot-bridge-herdr/config.toml
-backend = "auto"   # herdr | hc | auto (the default)
+backend = "auto"   # default: hc when its server is up; herdr | hc force one
 ```
 
-- `auto` uses the TUI when `herdr` is on PATH, and hc only when it is not. With both installed, new launches stay on the TUI until you set `backend = "hc"` or pass `gbb launch --backend hc` (or `GBB_BACKEND`).
-- Each registry row stores `backend`. A row written before 0.3.0 has no field and stays on the TUI. `status` / `send` / `stop` follow the row, not the current config.
+- `auto` (also what you get when `backend` is unset) launches new tasks on hc when `hc server status` can reach or start the core. It uses the Herdr TUI only when `hc` is missing or that call fails. `backend = "herdr"` or `gbb launch --backend herdr` always uses the TUI. `backend = "hc"` does not fall back.
+- Each registry row stores `backend`. A row with no field, or `backend = "herdr"`, keeps using the herdr session server for status, send, read, stop, and handover. The TUI plugin hook and the `hc events` watcher run side by side, each for its own rows.
 - An hc launch is `hc run --bg` of `grok` or `codex` (same `grok_args` / `codex_args`), then `hc send` for the prompt. gbb never passes `--force` (that flag can answer a dialog). The terminal shows up in `hc ls` and in the Herdr app; `hc attach <name>` takes it over.
 - A background `hc events --label grokbot=managed` posts callbacks through the same owner / primary / `[[extra_webhooks]]` routing. `working` is not posted. `error` is posted as `blocked` with `blocked_reason=error` and `herdr_status=error`. The OSC `msg` is not included.
 - Codex and Grok Build (≥ 1.0.52) emit OSC 7501 themselves, and hc answers the capability query, so gbb does not wrap them (a second writer would replace their root record). A Codex that has not reported yet still uses the existing screen classification. An older Grok that reports nothing still runs in the app; gbb does not invent `done` for it.
@@ -257,7 +257,7 @@ header_value = "<contents of ~/.config/dots-bridge/herdr_webhook_token>"
 
 Each extra target (max 5) gets the identical payload in its own background curl, header via stdin; the primary Grok Bot webhook is unchanged. `gbb doctor` reports `config.extra_webhooks.{count,hosts}` only. The receiver accepts loopback clients with the token only and posts an `app.message.created` message (`metadata.source = "herdr"`) to the dot's `herdr` channel, falling back to `default`. Refresh the dot's tools on the ChatGPT plugin page after changing tools. Rationale: [docs/decisions/0003](docs/decisions/0003-dots-bridge-tools-and-extra-webhooks.md).
 
-**herdr-core:** the 13 `gbb_*` tools stay as they are. Whether a new task runs in the TUI or in hc is the machine's `backend` / `GBB_BACKEND` (`gbb_launch` does not pass `--backend`). Callbacks are the same JSON, posted to the same `/herdr/webhook`, with an extra `backend` field that an older receiver can ignore. Registry rows already on the TUI are not moved.
+**herdr-core:** the 13 `gbb_*` tools stay as they are. `gbb_launch` does not pass `--backend`, so a new task follows this machine's default: with `auto`, that is hc when the core is up. Callbacks are the same JSON, posted to the same `/herdr/webhook`, with an extra `backend` field that an older receiver can ignore. Registry rows already on the TUI are not moved, and their plugin hook keeps working next to the hc watcher.
 
 ### Notes from testing
 
@@ -284,7 +284,7 @@ gbb result e2e && gbb stop e2e
 tail ~/.local/state/grokbot-bridge-herdr/bridge.log
 ```
 
-The same commands with `--backend hc` (or `backend = "hc"` in the config) launch into herdr-core. `hc ls` shows the terminal; the status callback is the payload above with `"backend":"hc"`.
+With `backend` unset, the same launch goes to herdr-core when `hc` is up (`hc ls` shows the terminal; the callback has `"backend":"hc"`). Pass `--backend herdr` to force the TUI for that launch.
 
 Architecture and rationale: [docs/decisions/0001-architecture.md](docs/decisions/0001-architecture.md); ChatGPT dots integration: [0003](docs/decisions/0003-dots-bridge-tools-and-extra-webhooks.md).
 
