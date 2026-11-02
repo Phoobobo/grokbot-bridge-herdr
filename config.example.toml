@@ -14,6 +14,13 @@ webhook_timeout_sec = 5
 # Repeated identical `blocked` events within this window are dropped.
 debounce_sec = 15
 
+# Where new tasks are launched. Entries already in the registry keep their own backend
+# (rows written before 0.3.0 are the Herdr TUI). Override one launch with --backend or GBB_BACKEND.
+#   auto   herdr if `herdr` is on PATH, otherwise hc. When both are installed, auto stays on the TUI.
+#   herdr  Herdr TUI only (plugin hooks on pane.agent_status_changed).
+#   hc     herdr-core / the Herdr app. Status comes from `hc events` (OSC 7501), not the plugin.
+# backend = "auto"
+
 # Seconds to let the agent TUI settle after `herdr agent start` before the first prompt.
 startup_settle_sec = 4
 

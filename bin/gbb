@@ -2,16 +2,17 @@
 # gbb — Grok Bot bridge for Herdr.
 # Grok Bot calls this over remote shell; Herdr calls it from plugin hooks/actions.
 # All user-facing subcommands print one JSON document on stdout.
-# Deps: herdr, jq, git, curl (POSIX sh, macOS + Linux).
+# Deps: jq, git, curl, and at least one of herdr (TUI) or hc (herdr-core). POSIX sh, macOS + Linux.
 set -u
 
-GBB_VERSION="0.2.0"
+GBB_VERSION="0.3.0"
 EMPTY_OBJ='{}'
 PLUGIN_ID="phoobobo.grokbot-bridge"
 META_SOURCE="plugin:phoobobo.grokbot-bridge"
 
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 HERDR="${HERDR_BIN_PATH:-herdr}"
+HC="${HC_BIN_PATH:-hc}"
 
 STATE_DIR="${GBB_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/grokbot-bridge-herdr}"
 DATA_DIR="${GBB_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/grokbot-bridge-herdr}"
@@ -36,7 +37,8 @@ die() { # die <code> <message>
   exit 1
 }
 
-need() { command -v "$1" >/dev/null 2>&1 || die missing_dependency "$1 not found on PATH"; }
+need() { command -v "$1" >/dev/null 2>&1 || [ -x "$1" ] || die missing_dependency "$1 not found on PATH"; }
+have_cmd() { command -v "$1" >/dev/null 2>&1 || [ -x "$1" ]; }
 
 # cfg_get <key>  — tiny TOML reader for `key = "value"` / `key = 123` lines.
 cfg_get() {
@@ -95,6 +97,8 @@ require_entry() {
   [ -n "$ENTRY" ] || die not_managed "no managed pane for '$1' (see gbb list)"
   PANE=$(printf '%s' "$ENTRY" | jq -r .pane_id)
 }
+# entry_backend <entry-json> — missing means a pre-0.3.0 registry row: the Herdr TUI.
+entry_backend() { printf '%s' "${1:-$EMPTY_OBJ}" | jq -r '.backend // "herdr"'; }
 
 sanitize_id() { printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_-' '-' | sed 's/^-*//; s/-*$//' | cut -c1-40; }
 agent_name_for() { n="gb-$(sanitize_id "$1")"; printf '%s' "$n" | cut -c1-32 | sed 's/-*$//'; }
@@ -275,11 +279,16 @@ build_event() { # build_event <event> <status> <entry-json> [extra-json]
     {source:"grokbot-bridge-herdr", version:$v, event:$event, hostname:$host,
      task_id:($e.task_id // null), pane_id:($e.pane_id // null), workspace_id:($e.workspace_id // null),
      agent_kind:($e.kind // null), agent_name:($e.agent_name // null), origin:($e.origin // null), owner:($e.owner // null),
+     backend:($e.backend // "herdr"),
      repo:($e.repo // null), worktree:($e.worktree // null), branch:($e.branch // null),
      status:(if $status == "" then null else $status end), ts:$ts} + $x'
 }
 
 set_marker() { # set_marker <pane> <task>
+  if [ "$(entry_backend "$(entry_for_pane "$1")")" = hc ]; then
+    "$HC" label "$1" grokbot=managed "gbb_task=$2" >/dev/null 2>&1 || log "hc label failed for $1"
+    return
+  fi
   "$HERDR" pane report-metadata "$1" --source "$META_SOURCE" --display-agent "🤖 Grok Bot: $2" \
     --token "grokbot=managed" --token "grokbot_task=$2" >/dev/null 2>&1 || log "marker set failed for $1"
 }
@@ -292,7 +301,14 @@ clear_marker() {
 # Herdr (0.9.5) reports Codex (0.166) startup dialogs and a never-prompted session as idle/done. gbb looks at
 # the bottom of the visible screen to tell those apart from a finished turn (docs/decisions/0004).
 # screen_bottom <pane> [lines] — last non-blank lines of the visible screen.
-screen_bottom() { "$HERDR" pane read "$1" --source visible --lines 60 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n "${2:-16}"; }
+# SCREEN_BACKEND=hc reads via `hc read` (plain text when piped). Unset stays on the Herdr TUI.
+screen_bottom() {
+  if [ "${SCREEN_BACKEND:-}" = hc ]; then
+    "$HC" read "$1" --lines 80 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n "${2:-16}"
+    return
+  fi
+  "$HERDR" pane read "$1" --source visible --lines 60 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n "${2:-16}"
+}
 
 # classify_text — reads screen text on stdin, prints one of:
 #   hooks_review   Codex "Hooks need review" startup dialog / banner (needs a trust decision)
@@ -318,6 +334,369 @@ screen_state() { screen_bottom "$1" 16 | classify_text; }
 # codex_model_line <pane> — e.g. "GPT-6.1-Sol xhigh" from the Codex footer (first segment before " · ").
 codex_model_line() {
   screen_bottom "$1" 6 | grep -E 'Context [0-9]+% used' | tail -n 1 | sed 's/^[[:space:]]*//; s/ · .*$//' | head -c 80
+}
+
+# ---------- herdr-core (hc) backend ----------
+# Status is whatever the program reports with OSC 7501. hc stores it and never infers it.
+# Codex (OSC 7501, app=codex) and Grok Build (≥ 1.0.52) report natively, and hc answers the
+# `OSC 7501 ; ?` query, so a wrapper that also emits 7501 would clobber those reports.
+# A codex that never reports still gets screen classification (the same rules as the TUI path).
+# `auto` keeps the TUI when `herdr` is installed so machines that already run both do not move.
+
+# resolve_launch_backend <explicit> — sets LAUNCH_BACKEND. Flag, else GBB_BACKEND, else config, else auto.
+resolve_launch_backend() {
+  sel="${1:-}"
+  [ -n "$sel" ] || sel="${GBB_BACKEND:-}"
+  [ -n "$sel" ] || sel="$(cfg_get backend)"
+  case "$sel" in
+    herdr | hc) LAUNCH_BACKEND=$sel; return 0 ;;
+    "" | auto)
+      if have_cmd "$HERDR"; then LAUNCH_BACKEND=herdr; return 0; fi
+      if have_cmd "$HC"; then LAUNCH_BACKEND=hc; return 0; fi
+      die missing_dependency "neither herdr nor hc found on PATH" ;;
+    *) die usage "--backend / backend must be auto, herdr, or hc" ;;
+  esac
+}
+
+hc_get_json() { "$HC" get --json "$1" 2>/dev/null; }
+# hc_status_word <terminal> — OSC root state (idle/working/done/blocked/error) or empty.
+hc_status_word() {
+  hc_get_json "$1" | jq -r 'if (.status|type) == "object" then (.status.state // empty) else empty end' 2>/dev/null
+}
+hc_status_kind() {
+  hc_get_json "$1" | jq -r 'if (.status|type) == "object" then (.status.kind // empty) else empty end' 2>/dev/null
+}
+# hc_agent_compat <terminal> — a herdr-shaped agent object so status/result stay readable.
+hc_agent_compat() {
+  js=$(hc_get_json "$1") || { printf 'null'; return; }
+  k=$(printf '%s' "${ENTRY:-$EMPTY_OBJ}" | jq -r '.kind // empty')
+  n=$(printf '%s' "${ENTRY:-$EMPTY_OBJ}" | jq -r '.agent_name // empty')
+  printf '%s' "$js" | jq -c --arg kind "$k" --arg name "$n" '
+    if type != "object" or .error or (.address == null) then null else {
+      agent:(if $kind == "" then null else $kind end), name:(.name // (if $name == "" then null else $name end)),
+      agent_status:(if (.status|type) == "object" then .status.state else null end),
+      pane_id:.address, workspace_id:null, cwd:.cwd, foreground_cwd:(.foreground.cwd // .cwd),
+      completion_seq:.turn, terminal_title_stripped:(.title // "")
+    } end' 2>/dev/null || printf 'null'
+}
+
+# deliver_status <pane> <entry> <raw> <final> <reason> — debounce + webhook. Same pairs as the TUI hook.
+deliver_status() {
+  pane="$1"; entry="$2"; raw="$3"; st="$4"; reason="$5"
+  [ -n "$entry" ] || return 0
+  lastf="$LAST_DIR/$(printf '%s' "$pane" | tr ':' '_')"
+  last=$(cat "$lastf" 2>/dev/null || true); last_st=${last%% *}; last_ts=${last#* }
+  printf '%s %s\n' "$st" "$(now)" >"$lastf"
+  deb=$(cfg_get debounce_sec); deb=${deb:-15}
+  case "$last_st:$st" in
+    done:idle | idle:done | idle:idle | done:done) log "debounced $pane $last_st->$st"; return 0 ;;
+    blocked:blocked)
+      if [ $(($(now) - ${last_ts:-0})) -lt "$deb" ]; then log "debounced $pane blocked"; return 0; fi ;;
+  esac
+  registry_update '.panes[$p].last_status=$s | .panes[$p].last_status_at=$t | .panes[$p].blocked_reason=(if $r == "" then null else $r end)' \
+    --arg p "$pane" --arg s "$st" --arg t "$(iso_now)" --arg r "$reason"
+  notify "$(build_event agent_status "$st" "$entry" "$(jq -cn --arg r "$reason" --arg h "$raw" \
+    '{herdr_status:$h} + (if $r == "" then {} else {blocked_reason:$r} end)')")"
+}
+
+# hc_emit_word <pane> <entry> <word> <status-json> — map one OSC word onto deliver_status.
+# `error` is delivered as blocked (blocked_reason=error) so existing consumers still wake;
+# herdr_status keeps the raw word. The status message is never copied into the payload.
+hc_emit_word() {
+  pane="$1"; entry="$2"; word="$3"; sj="$4"
+  lastf="$LAST_DIR/$(printf '%s' "$pane" | tr ':' '_')"
+  if [ "$(printf '%s' "$entry" | jq -r 'if .armed == false then "no" else "yes" end')" = no ]; then
+    printf '%s %s\n' "$word" "$(now)" >"$lastf"
+    log "not armed yet $pane $word"
+    return 0
+  fi
+  if [ "$word" = working ]; then
+    printf '%s %s\n' "$word" "$(now)" >"$lastf"
+    return 0
+  fi
+  final="$word"; reason=""; kindr=$(printf '%s' "$sj" | jq -r '.kind // empty' 2>/dev/null)
+  if [ "$word" = error ]; then final=blocked; reason=error; fi
+  if [ "$word" = blocked ]; then
+    final=blocked
+    case "$kindr" in permission | question | auth) reason="$kindr" ;; esac
+  fi
+  if [ "$(printf '%s' "$entry" | jq -r '.kind // empty')" = codex ] && [ "$word" != working ]; then
+    ss=$(screen_state "$pane")
+    case "$ss" in
+      hooks_review | question | dialog) final=blocked; reason="$ss" ;;
+      fresh)
+        lu=$(printf '%s' "$entry" | jq -r '.launching_until // 0')
+        if [ "$(now)" -lt "${lu:-0}" ]; then log "fresh $pane while launching: ignored"; return 0; fi
+        if [ "$(printf '%s' "$entry" | jq -r '.origin')" = launched ]; then final=blocked; reason=prompt_not_submitted; else final=idle; reason=""; fi ;;
+    esac
+  fi
+  deliver_status "$pane" "$entry" "$word" "$final" "$reason"
+}
+
+hc_baseline_terminal() { # one Terminal from a snapshot: seed, or catch up a missed change
+  pane=$(printf '%s' "$1" | jq -r '.address // empty' 2>/dev/null)
+  [ -n "$pane" ] || return 0
+  entry=$(entry_for_pane "$pane")
+  [ -n "$entry" ] || return 0
+  word=$(printf '%s' "$1" | jq -r 'if (.status|type) == "object" then (.status.state // empty) elif (.status|type) == "string" then .status else empty end' 2>/dev/null)
+  idf=$(printf '%s' "$pane" | tr ':' '_')
+  [ "$(printf '%s' "$1" | jq -r '.reported // false' 2>/dev/null)" = true ] && touch "$LAST_DIR/$idf.reported"
+  if [ ! -f "$LAST_DIR/$idf" ]; then
+    [ -n "$word" ] && printf '%s %s\n' "$word" "$(now)" >"$LAST_DIR/$idf"
+    return 0
+  fi
+  [ -n "$word" ] || return 0
+  last=$(cat "$LAST_DIR/$idf" 2>/dev/null || true); last_st=${last%% *}
+  [ "$last_st" = "$word" ] && return 0
+  sj=$(printf '%s' "$1" | jq -c 'if (.status|type) == "object" then .status else {state:(.status // "")} end' 2>/dev/null)
+  hc_emit_word "$pane" "$entry" "$word" "${sj:-{\}}"
+}
+
+hc_on_closed() {
+  entry=$(entry_for_pane "$1")
+  [ -n "$entry" ] || return 0
+  registry_update 'del(.panes[$p])' --arg p "$1"
+  printf '%s\n' "$entry" | jq -c --arg ev "$2" --arg t "$(iso_now)" '. + {ended:$ev, ended_at:$t}' >>"$HISTORY"
+  idf=$(printf '%s' "$1" | tr ':' '_')
+  rm -f "$LAST_DIR/$idf" "$LAST_DIR/$idf.reported" "$LAST_DIR/$idf.screenpoll"
+  notify "$(build_event pane_closed "" "$entry")"
+  log "hc $2 $1"
+}
+
+# Codex with no OSC report yet: classify the screen, same rules as the TUI hook. Throttled.
+hc_on_foreground() {
+  pane="$1"
+  entry=$(entry_for_pane "$pane")
+  [ -n "$entry" ] || return 0
+  [ "$(printf '%s' "$entry" | jq -r '.kind // empty')" = codex ] || return 0
+  idf=$(printf '%s' "$pane" | tr ':' '_')
+  [ -f "$LAST_DIR/$idf.reported" ] && return 0
+  if [ -f "$LAST_DIR/$idf.screenpoll" ]; then
+    pt=$(cat "$LAST_DIR/$idf.screenpoll" 2>/dev/null || echo 0)
+    [ $(($(now) - ${pt:-0})) -lt 2 ] && return 0
+  fi
+  printf '%s\n' "$(now)" >"$LAST_DIR/$idf.screenpoll"
+  if screen_busy "$pane"; then
+    printf '%s %s\n' working "$(now)" >"$LAST_DIR/$idf"
+    return 0
+  fi
+  ss=$(screen_state "$pane")
+  case "$ss" in
+    hooks_review | question | dialog) hc_emit_word "$pane" "$entry" blocked "$(jq -cn --arg k "$ss" '{state:"blocked",kind:$k}')" ;;
+    fresh) hc_emit_word "$pane" "$entry" done '{"state":"done"}' ;;
+    ready) hc_emit_word "$pane" "$entry" idle '{"state":"idle"}' ;;
+  esac
+}
+
+apply_hc_event() {
+  printf '%s' "$1" | jq -e . >/dev/null 2>&1 || { log "hc event ignored (not json)"; return 0; }
+  if printf '%s' "$1" | jq -e '(.terminals | type) == "array" and (.method | not)' >/dev/null 2>&1; then
+    tmp="$STATE_DIR/.evterms.$$"
+    printf '%s' "$1" | jq -c '.terminals[]?' >"$tmp" 2>/dev/null || true
+    while IFS= read -r term; do
+      [ -n "$term" ] && hc_baseline_terminal "$term"
+    done <"$tmp"
+    rm -f "$tmp"
+    return 0
+  fi
+  method=$(printf '%s' "$1" | jq -r '.method // empty' 2>/dev/null)
+  case "$method" in
+    heartbeat) return 0 ;;
+    missed)
+      tmp="$STATE_DIR/.evmiss.$$"
+      printf '%s' "$1" | jq -c '.params.terminals[]?' >"$tmp" 2>/dev/null || true
+      while IFS= read -r term; do
+        [ -n "$term" ] && hc_baseline_terminal "$term"
+      done <"$tmp"
+      rm -f "$tmp"
+      return 0 ;;
+    event)
+      type=$(printf '%s' "$1" | jq -r '.params.type // empty' 2>/dev/null)
+      term=$(printf '%s' "$1" | jq -r '.params.terminal // empty' 2>/dev/null)
+      [ -n "$term" ] || return 0
+      case "$type" in
+        status) hc_emit_from_data "$term" "$(printf '%s' "$1" | jq -c '.params.data // {}')" ;;
+        finished | removed) hc_on_closed "$term" "$type" ;;
+        foreground) hc_on_foreground "$term" ;;
+      esac ;;
+  esac
+}
+
+hc_emit_from_data() { # pane, status-event data
+  entry=$(entry_for_pane "$1")
+  [ -n "$entry" ] || return 0
+  idf=$(printf '%s' "$1" | tr ':' '_')
+  [ "$(printf '%s' "$2" | jq -r '.reported // false')" = true ] && touch "$LAST_DIR/$idf.reported"
+  word=$(printf '%s' "$2" | jq -r 'if (.status|type) == "object" then (.status.state // empty) else empty end')
+  if [ -z "$word" ]; then
+    printf '%s %s\n' none "$(now)" >"$LAST_DIR/$idf"
+    return 0
+  fi
+  hc_emit_word "$1" "$entry" "$word" "$(printf '%s' "$2" | jq -c '.status')"
+}
+
+hc_watch_once() {
+  fifo="$STATE_DIR/hc-events.fifo"
+  rm -f "$fifo"
+  mkfifo "$fifo" || return 1
+  "$HC" events --label grokbot=managed --json >"$fifo" 2>>"$LOG" &
+  HC_EV_PID=$!
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    apply_hc_event "$line" || log "hc event apply failed"
+  done <"$fifo"
+  wait "$HC_EV_PID" 2>/dev/null || true
+  HC_EV_PID=""
+  rm -f "$fifo"
+}
+
+cmd_hc_watch() {
+  GBB_CTX=hc-watch
+  SCREEN_BACKEND=hc
+  pidf="$STATE_DIR/hc-watch.pid"
+  if [ -f "$pidf" ]; then
+    old=$(cat "$pidf" 2>/dev/null || true)
+    if [ -n "${old:-}" ] && [ "$old" != "$$" ] && kill -0 "$old" 2>/dev/null; then exit 0; fi
+  fi
+  printf '%s\n' "$$" >"$pidf"
+  trap 'rm -f "$pidf" "$STATE_DIR/hc-events.fifo"; [ -n "${HC_EV_PID:-}" ] && kill "$HC_EV_PID" 2>/dev/null || true' EXIT
+  while :; do
+    hc_watch_once || log "hc watch stream ended"
+    if [ "${GBB_HC_WATCH_ONCE:-}" = 1 ]; then wait; exit 0; fi
+    sleep 2
+  done
+}
+
+ensure_hc_watch() {
+  pidf="$STATE_DIR/hc-watch.pid"
+  if [ -f "$pidf" ]; then
+    old=$(cat "$pidf" 2>/dev/null || true)
+    if [ -n "${old:-}" ] && kill -0 "$old" 2>/dev/null; then return 0; fi
+  fi
+  ( cmd_hc_watch ) </dev/null >/dev/null 2>&1 &
+}
+
+# wait_hc_ready <terminal> <kind> — 0 ready, 1 timeout, 3 dialog (WAIT_STATE).
+# A reported idle/done is enough for grok. Codex still has to show the composer, not a dialog.
+wait_hc_ready() {
+  pane="$1"; k="$2"; WAIT_STATE=""
+  limit=$(cfg_get startup_ready_timeout_sec); limit=${limit:-90}
+  t0=$(now); prev=""; stable=0
+  while [ $(($(now) - t0)) -lt "$limit" ]; do
+    js=$(hc_get_json "$pane" 2>/dev/null || printf '%s' "$EMPTY_OBJ")
+    word=$(printf '%s' "$js" | jq -r 'if (.status|type) == "object" then (.status.state // empty) else empty end' 2>/dev/null)
+    kindr=$(printf '%s' "$js" | jq -r 'if (.status|type) == "object" then (.status.kind // empty) else empty end' 2>/dev/null)
+    reported=$(printf '%s' "$js" | jq -r '.reported // false' 2>/dev/null)
+    if [ "$word" = blocked ] || [ "$word" = error ]; then
+      WAIT_STATE=${kindr:-$word}
+      [ "$word" = error ] && WAIT_STATE=error
+      log "hc startup blocked $pane: $WAIT_STATE"
+      return 3
+    fi
+    cur=""; ok=0
+    if [ "$k" = codex ]; then
+      cur=$(screen_bottom "$pane" 16)
+      cs=$(printf '%s\n' "$cur" | classify_text)
+      case "$cs" in
+        hooks_review | question | dialog) WAIT_STATE=$cs; log "hc startup dialog $pane: $cs"; return 3 ;;
+        fresh | ready) case "$word" in idle | done | "") ok=1 ;; esac ;;
+      esac
+    else
+      case "$word" in idle | done) ok=1 ;; esac
+    fi
+    if [ "$ok" = 1 ] && { [ "$k" != codex ] || [ -n "$cur" ]; } && [ "$cur" = "$prev" ]; then
+      stable=$((stable + 1))
+    else
+      stable=0
+    fi
+    need=2; [ "$reported" = true ] && need=1
+    [ "$stable" -ge "$need" ] && { log "hc input ready $pane after $(($(now) - t0))s"; return 0; }
+    prev="$cur"
+    sleep 1
+  done
+  log "hc input not confirmed ready $pane (status=${word:-})"
+  return 1
+}
+
+# hc_send_text <terminal> <kind> <text> — sets PROMPT_RESULT. Never passes --force (that answers dialogs).
+hc_send_text() {
+  pane="$1"; k="$2"; text="$3"; PROMPT_RESULT=""; attempt=0
+  if [ "$k" = codex ]; then
+    cs=$(screen_state "$pane")
+    case "$cs" in
+      hooks_review | question | dialog)
+        PROMPT_RESULT=$(jq -cn --arg s "$cs" '{error:{code:"agent_blocked", blocked_reason:$s, message:"the agent is waiting on a dialog; the text was NOT sent"}}')
+        return 2 ;;
+    esac
+  fi
+  word=$(hc_status_word "$pane")
+  if [ "$word" = blocked ] || [ "$word" = error ]; then
+    br=$(hc_status_kind "$pane")
+    [ "$word" = error ] && br=error
+    [ -n "$br" ] || br=$word
+    PROMPT_RESULT=$(jq -cn --arg s "$br" '{error:{code:"agent_blocked", blocked_reason:$s, message:"the agent is blocked; the text was NOT sent"}}')
+    return 2
+  fi
+  snippet=$(printf '%s' "$text" | head -n 1 | jq -Rr '.[0:16]' 2>/dev/null || true)
+  while [ "$attempt" -lt 3 ]; do
+    attempt=$((attempt + 1))
+    out=$("$HC" send --json "$pane" -- "$text" 2>>"$LOG") || true
+    errkind=$(printf '%s' "$out" | jq -r '.error.kind // empty' 2>/dev/null || true)
+    if [ "$errkind" = blocked ]; then
+      PROMPT_RESULT=$(jq -cn --arg m "$(printf '%s' "$out" | jq -r '.error.message // "blocked"')" \
+        '{error:{code:"agent_blocked", message:$m}}')
+      return 2
+    fi
+    started=$(printf '%s' "$out" | jq -r '.started // empty' 2>/dev/null || true)
+    if [ "$started" = true ]; then PROMPT_RESULT="$out"; return 0; fi
+    if [ -n "$snippet" ] && screen_bottom "$pane" 40 | grep -Fq "$snippet"; then
+      PROMPT_RESULT=$(jq -cn '{error:{code:"prompt_unconfirmed", message:"prompt text is on screen but the agent did not report a turn; inspect with gbb read"}}')
+      return 1
+    fi
+    log "hc send attempt $attempt started=${started:-} "
+    sleep 1
+  done
+  PROMPT_RESULT=$(jq -cn '{error:{code:"prompt_not_delivered", message:"hc send did not start a turn after 3 attempts"}}')
+  return 1
+}
+
+launch_with_hc() {
+  name=$(agent_name_for "$tid")
+  ws=""
+  out=$("$HC" run --bg --json --name "$name" --cwd "$wt" --no-parent --no-notify \
+    --label grokbot=managed --label "gbb_task=$tid" -- "$kind" "$@" 2>>"$LOG") || true
+  addr=$(printf '%s' "$out" | jq -r '.address // empty' 2>/dev/null || true)
+  if [ -z "$addr" ]; then
+    addr=$(printf '%s\n' "$out" | jq -Rr 'fromjson? | .address // empty' 2>/dev/null | tail -n 1)
+  fi
+  [ -n "$addr" ] || die agent_start_failed "$(printf '%s' "$out" | head -c 400)"
+  registry_update '.panes[$p] = {pane_id:$p, workspace_id:null, task_id:$task, agent_name:$n, kind:$k, repo:$r,
+      worktree:$wt, branch:$b, base_commit:$bc, origin:"launched", created_workspace:false, created_terminal:true,
+      backend:"hc", created_at:$t, last_status:null, armed:false,
+      agent_args:$aa, owner:(if $o == "" then null else $o end), launching_until:$lu}' \
+    --arg o "$owner" --argjson lu "$(($(now) + 600))" --argjson aa "$args_json" \
+    --arg p "$addr" --arg task "$tid" --arg n "$name" --arg k "$kind" --arg r "$repo" --arg wt "$wt" \
+    --arg b "$branch" --arg bc "$base_commit" --arg t "$(iso_now)" || die registry_error "registry write failed"
+  word=$(hc_status_word "$addr")
+  [ -n "$word" ] || word=none
+  printf '%s %s\n' "$word" "$(now)" >"$LAST_DIR/$(printf '%s' "$addr" | tr ':' '_')"
+  set_marker "$addr" "$tid"
+  ensure_hc_watch
+  settle=$(cfg_get startup_settle_sec); sleep "${settle:-4}"
+  wait_hc_ready "$addr" "$kind"; wrc=$?
+  if [ "$wrc" = 3 ]; then
+    launch_blocked "$addr" "$WAIT_STATE"
+    exit 0
+  fi
+  arm_pane "$addr"
+  hc_send_text "$addr" "$kind" "$prompt"; prc=$?
+  if [ "$prc" = 2 ]; then
+    br=$(printf '%s' "${PROMPT_RESULT:-}" | jq -r '.error.blocked_reason // "agent_blocked"' 2>/dev/null)
+    launch_blocked "$addr" "${br:-agent_blocked}"
+    exit 0
+  fi
+  [ "$prc" = 0 ] || save_pending_prompt "$addr" "$prompt"
+  launch_finish "$addr" "$prc"
 }
 
 # ---------- plugin hooks (called by herdr) ----------
@@ -390,9 +769,45 @@ ctx_pane() {
 toast() { "$HERDR" notification show "$1" --body "$2" --sound none >/dev/null 2>&1 || true; }
 
 # ---------- handover / reclaim ----------
+do_handover_hc() { # do_handover_hc <terminal> <note> <owner>
+  pane="$1"; note="$2"; howner="$3"
+  js=$(hc_get_json "$pane") || die pane_not_found "terminal $pane not found"
+  addr=$(printf '%s' "$js" | jq -r '.address // empty' 2>/dev/null)
+  [ -n "$addr" ] || die pane_not_found "terminal $pane not found"
+  existing=$(entry_for_pane "$addr")
+  [ -z "$existing" ] || { printf '%s' "$existing"; return 0; }
+  cwd=$(printf '%s' "$js" | jq -r '.cwd // empty')
+  name=$(printf '%s' "$js" | jq -r '.name // empty')
+  st=$(printf '%s' "$js" | jq -r 'if (.status|type) == "object" then (.status.state // empty) else empty end')
+  task="ho-$(printf '%s' "$addr" | tr -c 'A-Za-z0-9' '-' | sed 's/-*$//')-$(now)"
+  repo=""; [ -n "$cwd" ] && repo=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || true)
+  registry_update '.panes[$p] = {pane_id:$p, workspace_id:null, task_id:$task, agent_name:(if $n=="" then null else $n end),
+      kind:null, repo:(if $r=="" then null else $r end), worktree:(if $r=="" then null else $r end),
+      cwd:$cwd, origin:"handover", note:(if $note=="" then null else $note end), created_at:$t,
+      last_status:(if $s=="" then null else $s end), created_workspace:false, created_terminal:false, backend:"hc",
+      owner:(if $o=="" then null else $o end), armed:true}' \
+    --arg o "$howner" --arg p "$addr" --arg task "$task" --arg n "$name" --arg r "$repo" --arg cwd "$cwd" \
+    --arg note "$note" --arg t "$(iso_now)" --arg s "$st" || die registry_error "could not write registry"
+  [ -n "$st" ] && printf '%s %s\n' "$st" "$(now)" >"$LAST_DIR/$(printf '%s' "$addr" | tr ':' '_')"
+  "$HC" label "$addr" grokbot=managed "gbb_task=$task" >/dev/null 2>&1 || log "hc label failed for $addr"
+  ensure_hc_watch
+  e=$(entry_for_pane "$addr")
+  notify "$(build_event handover "$st" "$e" "$(jq -cn --arg n "$note" '{note:(if $n=="" then null else $n end)}')")"
+  log "handover $addr task=$task backend=hc"
+  printf '%s' "$e"
+}
+
 do_handover() { # do_handover <pane> <note> [owner] -> prints entry
   pane="$1"; note="$2"; howner="${3:-${GBB_OWNER:-}}"
   [ -z "$howner" ] || valid_owner "$howner" || die usage "owner must match $OWNER_RE"
+  be="${HANDOVER_BACKEND:-}"
+  if [ -z "$be" ]; then
+    case "$pane" in
+      *:*) be=herdr ;;
+      *) if have_cmd "$HC" && hc_get_json "$pane" >/dev/null 2>&1; then be=hc; else be=herdr; fi ;;
+    esac
+  fi
+  if [ "$be" = hc ]; then do_handover_hc "$pane" "$note" "$howner"; return; fi
   info=$("$HERDR" pane get "$pane" 2>/dev/null) || die pane_not_found "pane $pane not found"
   existing=$(entry_for_pane "$pane")
   [ -z "$existing" ] || { printf '%s' "$existing"; return 0; }
@@ -411,7 +826,7 @@ do_handover() { # do_handover <pane> <note> [owner] -> prints entry
   registry_update '.panes[$p] = {pane_id:$p, workspace_id:$ws, task_id:$task, agent_name:(if $n=="" then null else $n end),
       kind:(if $k=="" then null else $k end), repo:(if $r=="" then null else $r end), worktree:(if $r=="" then null else $r end),
       cwd:$cwd, origin:"handover", note:(if $note=="" then null else $note end), created_at:$t, last_status:(if $s=="" then null else $s end),
-      created_workspace:false, owner:(if $o=="" then null else $o end)}' \
+      created_workspace:false, backend:"herdr", owner:(if $o=="" then null else $o end)}' \
     --arg o "$howner" --arg p "$pane" --arg ws "$ws" --arg task "$task" --arg n "$name" --arg k "$kind" --arg r "$repo" --arg cwd "$cwd" \
     --arg note "$note" --arg t "$(iso_now)" --arg s "$st" || die registry_error "could not write registry"
   [ -n "$st" ] && printf '%s %s\n' "$st" "$(now)" >"$LAST_DIR/$(printf '%s' "$pane" | tr ':' '_')"
@@ -424,10 +839,17 @@ do_handover() { # do_handover <pane> <note> [owner] -> prints entry
 do_reclaim() { # do_reclaim <pane> <event>
   e=$(entry_for_pane "$1")
   [ -n "$e" ] || return 1
+  be=$(entry_backend "$e")
   registry_update 'del(.panes[$p])' --arg p "$1"
   printf '%s\n' "$e" | jq -c --arg ev "$2" --arg t "$(iso_now)" '. + {ended:$ev, ended_at:$t}' >>"$HISTORY"
-  rm -f "$LAST_DIR/$(printf '%s' "$1" | tr ':' '_')"
-  clear_marker "$1"
+  idf=$(printf '%s' "$1" | tr ':' '_')
+  rm -f "$LAST_DIR/$idf" "$LAST_DIR/$idf.reported" "$LAST_DIR/$idf.screenpoll"
+  # The registry row is already gone, so clear_marker can no longer see backend=hc.
+  if [ "$be" = hc ]; then
+    "$HC" label "$1" grokbot= gbb_task= >/dev/null 2>&1 || true
+  else
+    clear_marker "$1"
+  fi
   notify "$(build_event "$2" "" "$e")"
   log "$2 $1"
   printf '%s' "$e"
@@ -472,7 +894,13 @@ arm_pane() { # arm_pane <pane>: from now on status changes produce webhooks
 }
 
 # screen_tail <pane> [lines] — last non-blank lines of the visible screen.
-screen_tail() { "$HERDR" pane read "$1" --source visible --lines 60 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n "${2:-8}"; }
+screen_tail() {
+  if [ "${SCREEN_BACKEND:-}" = hc ]; then
+    "$HC" read "$1" --lines 40 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n "${2:-8}"
+    return
+  fi
+  "$HERDR" pane read "$1" --source visible --lines 60 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n "${2:-8}"
+}
 agent_status_of() { "$HERDR" agent get "$1" 2>/dev/null | jq -r '.result.agent.agent_status // empty'; }
 # Codex's TUI shows "• Working (Ns • esc to interrupt)" while a turn runs; herdr's status can lag behind it.
 screen_busy() { screen_tail "$1" 12 | grep -E -q 'esc to interrupt|Working \('; }
@@ -615,7 +1043,7 @@ prompt_with_retry() {
 }
 
 cmd_launch() {
-  repo=""; kind="grok"; task=""; wt_branch=""; prompt=""; pfile=""; no_wt=0; base=""; explicit_args=0; owner="${GBB_OWNER:-}"
+  repo=""; kind="grok"; task=""; wt_branch=""; prompt=""; pfile=""; no_wt=0; base=""; explicit_args=0; owner="${GBB_OWNER:-}"; flag_backend=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --repo) repo="$2"; shift 2 ;;
@@ -627,12 +1055,15 @@ cmd_launch() {
       --prompt) prompt="$2"; shift 2 ;;
       --prompt-file) pfile="$2"; shift 2 ;;
       --owner) owner="$2"; shift 2 ;;
+      --backend) flag_backend="$2"; shift 2 ;;
       --) shift; explicit_args=1; break ;; # rest of "$@" = agent args, passed through verbatim
       *) die usage "unknown launch option $1" ;;
     esac
   done
-  need "$HERDR"; need jq; need git
-  [ -n "$repo" ] && [ -n "$task" ] || die usage "gbb launch --repo <path> --kind grok|codex --task <id> [--worktree <branch>|--no-worktree] (--prompt <text>|--prompt-file <f>)"
+  need jq; need git
+  resolve_launch_backend "$flag_backend"
+  if [ "$LAUNCH_BACKEND" = hc ]; then need "$HC"; SCREEN_BACKEND=hc; else need "$HERDR"; fi
+  [ -n "$repo" ] && [ -n "$task" ] || die usage "gbb launch --repo <path> --kind grok|codex --task <id> [--worktree <branch>|--no-worktree] [--backend auto|herdr|hc] (--prompt <text>|--prompt-file <f>)"
   case "$kind" in grok | codex) ;; *) die usage "--kind must be grok or codex" ;; esac
   [ -z "$owner" ] || valid_owner "$owner" || die usage "--owner/GBB_OWNER must match $OWNER_RE"
   [ "$explicit_args" = 1 ] || set -- # drop anything left over; only args after -- are agent args
@@ -670,6 +1101,11 @@ EOF
   fi
   base_commit=$(git -C "$wt" rev-parse HEAD 2>/dev/null)
 
+  if [ "$LAUNCH_BACKEND" = hc ]; then
+    launch_with_hc "$@"
+    return
+  fi
+
   ws_out=$("$HERDR" workspace create --cwd "$wt" --label "🤖 $tid" --no-focus 2>&1)
   pane=$(printf '%s' "$ws_out" | jq -r '.result.root_pane.pane_id // empty' 2>/dev/null)
   ws=$(printf '%s' "$ws_out" | jq -r '.result.workspace.workspace_id // empty' 2>/dev/null)
@@ -678,7 +1114,7 @@ EOF
 
   # Register before start so status hooks for this pane are tracked from the first event.
   registry_update '.panes[$p] = {pane_id:$p, workspace_id:$ws, task_id:$task, agent_name:$n, kind:$k, repo:$r,
-      worktree:$wt, branch:$b, base_commit:$bc, origin:"launched", created_workspace:true, created_at:$t, last_status:null, armed:false,
+      worktree:$wt, branch:$b, base_commit:$bc, origin:"launched", created_workspace:true, backend:"herdr", created_at:$t, last_status:null, armed:false,
       agent_args:$aa, owner:(if $o == "" then null else $o end), launching_until:$lu}' \
     --arg o "$owner" --argjson lu "$(($(now) + 600))" --argjson aa "$args_json" --arg p "$pane" --arg ws "$ws" --arg task "$tid" --arg n "$name" --arg k "$kind" --arg r "$repo" --arg wt "$wt" \
     --arg b "$branch" --arg bc "$base_commit" --arg t "$(iso_now)" || die registry_error "registry write failed"
@@ -730,12 +1166,19 @@ launch_finish() {
   ml=""; [ "$kind" = codex ] && ml=$(codex_model_line "$1")
   registry_update 'if .panes[$p] then (.panes[$p] |= (del(.launching_until) + (if $m == "" then {} else {agent_model:$m} end))) else . end' \
     --arg p "$1" --arg m "$ml"
-  ag=$("$HERDR" agent get "$name" 2>/dev/null | jq -c '.result.agent // {}')
+  if [ "${SCREEN_BACKEND:-}" = hc ]; then
+    ag=$(hc_agent_compat "$1")
+  else
+    ag=$("$HERDR" agent get "$name" 2>/dev/null | jq -c '.result.agent // {}')
+  fi
   pend=false; [ -f "$(pending_file "$1")" ] && pend=true
-  jq -cn --argjson ag "${ag:-$EMPTY_OBJ}" --arg p "$1" --arg ws "$ws" --arg task "$tid" --arg n "$name" --arg wt "$wt" \
+  be=herdr; [ "${SCREEN_BACKEND:-}" = hc ] && be=hc
+  jq -cn --argjson ag "${ag:-$EMPTY_OBJ}" --arg p "$1" --arg ws "${ws:-}" --arg task "$tid" --arg n "$name" --arg wt "$wt" \
     --arg b "$branch" --arg k "$kind" --argjson prc "$2" --arg pr "$(printf '%s' "${PROMPT_RESULT:-}" | head -c 2000)" --argjson aa "$args_json" \
-    --arg o "$owner" --arg ml "$ml" --argjson pend "$pend" '
-    {ok:($prc==0), task_id:$task, pane_id:$p, workspace_id:$ws, agent_name:$n, kind:$k, agent_args:$aa, worktree:$wt, branch:$b,
+    --arg o "$owner" --arg ml "$ml" --argjson pend "$pend" --arg be "$be" '
+    {ok:($prc==0), task_id:$task, pane_id:$p, workspace_id:(if $ws == "" then null else $ws end), agent_name:$n, kind:$k,
+     backend:$be,
+     agent_args:$aa, worktree:$wt, branch:$b,
      owner:(if $o == "" then null else $o end), agent_model:(if $ml == "" then null else $ml end),
      status:$ag.agent_status, session_id:($ag.agent_session.value // null), prompt_pending:$pend,
      prompt_error:(if $prc==0 then null else ($pr | (try (fromjson | .error // .) catch .[0:300])) end)}'
@@ -780,12 +1223,24 @@ resume_cmd() { # kind session
 cmd_list() {
   reg=$(registry_read)
   agents=$("$HERDR" agent list 2>/dev/null | jq -c '[.result.agents[]? | {key:.pane_id, value:{agent_status, name, agent}}] | from_entries' 2>/dev/null)
-  printf '%s' "$reg" | jq -c --argjson a "${agents:-$EMPTY_OBJ}" '{ok:true, managed:[.panes[] | . + {live:($a[.pane_id] // null)}]}'
+  hc_live="$EMPTY_OBJ"
+  if printf '%s' "$reg" | jq -e '[.panes[]? | select(.backend == "hc")] | length > 0' >/dev/null 2>&1 && have_cmd "$HC"; then
+    hc_live=$("$HC" ls --all --json --label grokbot=managed 2>/dev/null | jq -c \
+      '[.terminals[]? | {key:.address, value:{agent_status:(.status // null), name, agent:.agent, state}}] | from_entries' 2>/dev/null)
+  fi
+  [ -n "$hc_live" ] || hc_live=$EMPTY_OBJ
+  printf '%s' "$reg" | jq -c --argjson a "${agents:-$EMPTY_OBJ}" --argjson h "${hc_live:-$EMPTY_OBJ}" \
+    '{ok:true, managed:[.panes[] | . + {live:(if .backend == "hc" then ($h[.pane_id] // null) else ($a[.pane_id] // null) end)}]}'
 }
 
 cmd_status() {
   require_entry "${1:-}"
-  ag=$("$HERDR" agent get "$PANE" 2>/dev/null | jq -c '.result.agent // null')
+  if [ "$(entry_backend "$ENTRY")" = hc ]; then
+    SCREEN_BACKEND=hc
+    ag=$(hc_agent_compat "$PANE")
+  else
+    ag=$("$HERDR" agent get "$PANE" 2>/dev/null | jq -c '.result.agent // null')
+  fi
   [ -n "$ag" ] || ag=null
   wt=$(printf '%s' "$ENTRY" | jq -r '.worktree // .cwd // empty')
   gs=""; gl=""
@@ -812,6 +1267,14 @@ cmd_read() {
   t="${1:-}"; shift 2>/dev/null; lines=80; src=recent-unwrapped
   while [ $# -gt 0 ]; do case "$1" in --lines) lines="$2"; shift 2 ;; --visible) src=visible; shift ;; *) shift ;; esac; done
   require_entry "$t"
+  if [ "$(entry_backend "$ENTRY")" = hc ]; then
+    [ "$src" = visible ] && lines=0
+    txt=$("$HC" read "$PANE" --lines "$lines" 2>/dev/null || true)
+    st=$(hc_status_word "$PANE")
+    [ -n "$st" ] || st=none
+    jq -cn --arg p "$PANE" --arg s "$st" --arg t "$txt" '{ok:true, pane_id:$p, status:$s, text:$t}'
+    return
+  fi
   txt=$("$HERDR" pane read "$PANE" --source "$src" --lines "$lines" 2>&1)
   st=$("$HERDR" agent get "$PANE" 2>/dev/null | jq -r '.result.agent.agent_status // "none"')
   jq -cn --arg p "$PANE" --arg s "$st" --arg t "$txt" '{ok:true, pane_id:$p, status:$s, text:$t}'
@@ -827,6 +1290,7 @@ cmd_send() {
   [ $# -gt 0 ] || [ "$pending" = 1 ] || die usage "gbb send <task> <text> | gbb send <task> --pending"
   require_entry "$t"
   k=$(printf '%s' "$ENTRY" | jq -r '.kind // empty')
+  [ "$(entry_backend "$ENTRY")" = hc ] && SCREEN_BACKEND=hc
   if [ "$pending" = 1 ]; then
     pf=$(pending_file "$PANE"); [ -f "$pf" ] || die no_pending_prompt "no pending launch prompt for $PANE"
     text=$(cat "$pf")
@@ -841,6 +1305,18 @@ cmd_send() {
         '{ok:false, pane_id:$p, status:"blocked", error:{code:"agent_blocked", blocked_reason:$cs, message:"the agent is waiting on a dialog/question; the text was NOT sent", hint:$h}, screen:($scr|split("\n"))}'
       exit 1 ;;
     esac
+  fi
+  if [ "${SCREEN_BACKEND:-}" = hc ]; then
+    arm_pane "$PANE"
+    hc_send_text "$PANE" "$k" "$text"; prc=$?
+    [ "$prc" = 0 ] && [ "$pending" = 1 ] && clear_pending_prompt "$PANE"
+    [ "$prc" = 0 ] && [ "$pending" = 0 ] && [ -f "$(pending_file "$PANE")" ] && clear_pending_prompt "$PANE"
+    st=$(hc_status_word "$PANE")
+    printf '%s' "${PROMPT_RESULT:-null}" | jq -c --argjson prc "$prc" --arg p "$PANE" --arg h "$ANSWER_HINT" --arg st "$st" \
+      '{ok:($prc==0), pane_id:$p, status:(if (.status | type) == "string" then .status else ($st // null) end),
+        error:(if .error then (.error + (if ((.error.code // "") | test("blocked")) then {hint:$h} else {} end)) else null end)}' 2>/dev/null ||
+      jq -cn --argjson prc "$prc" --arg p "$PANE" '{ok:($prc==0), pane_id:$p, status:null, error:{code:"unparsed_result"}}'
+    return
   fi
   arm_pane "$PANE"
   GBB_PROMPT_KIND="$k" prompt_with_retry "$(agent_target)" "$PANE" "$text"; prc=$?
@@ -866,17 +1342,27 @@ options_from_text() {
     END { for (i=1; i<=cnt; i++) printf "%d\t%d\t%s\n", num[i], s[i], l[i] }'
 }
 dialog_open() { printf '%s\n' "$1" | grep -Eq 'enter (submit|confirm)'; }
+# press_keys <target> <key>... — herdr agent send-keys, or hc keys. Keys stay separate words.
+press_keys() {
+  tgt="$1"; shift
+  if [ "${SCREEN_BACKEND:-}" = hc ]; then
+    "$HC" keys "$tgt" "$@" >/dev/null 2>&1 || true
+  else
+    "$HERDR" agent send-keys "$tgt" "$@" >/dev/null 2>&1 || true
+  fi
+}
 
 # gbb answer <task> <option-number|label> — answer a Codex question dialog / queued question / startup dialog.
 cmd_answer() {
   t="${1:-}"; choice="${2:-}"
   [ -n "$t" ] && [ -n "$choice" ] || die usage "gbb answer <task> <option-number|label>"
   require_entry "$t"
+  [ "$(entry_backend "$ENTRY")" = hc ] && SCREEN_BACKEND=hc
   tgt=$(agent_target)
   scr=$(screen_bottom "$PANE" 30)
   if ! dialog_open "$scr"; then
     if printf '%s\n' "$scr" | grep -Eq 'to answer[[:space:]]*$'; then
-      "$HERDR" agent send-keys "$tgt" shift+left >/dev/null 2>&1; log "answer $PANE: opened queued question"
+      press_keys "$tgt" shift+left; log "answer $PANE: opened queued question"
       sleep 1; scr=$(screen_bottom "$PANE" 30)
     fi
   fi
@@ -901,11 +1387,11 @@ cmd_answer() {
     if [ "$want" -gt "$cur" ]; then key=down; d=$((want - cur)); else key=up; d=$((cur - want)); fi
     keys=""; i=0; while [ "$i" -lt "$d" ]; do keys="$keys $key"; i=$((i + 1)); done
     # shellcheck disable=SC2086
-    "$HERDR" agent send-keys "$tgt" $keys >/dev/null 2>&1
+    press_keys "$tgt" $keys
     sleep 1; scr=$(screen_bottom "$PANE" 30); opts=$(printf '%s\n' "$scr" | options_from_text)
   done
   label=$(printf '%s\n' "$opts" | awk -F '\t' -v w="$want" '$1 == w {print $3; exit}')
-  "$HERDR" agent send-keys "$tgt" enter >/dev/null 2>&1
+  press_keys "$tgt" enter
   log "answer $PANE: option $want ($label)"
   sleep 2
   after=$(screen_bottom "$PANE" 30); still=false
@@ -915,15 +1401,20 @@ cmd_answer() {
   pf=$(pending_file "$PANE")
   if [ "$still" = false ] && [ -f "$pf" ]; then
     k=$(printf '%s' "$ENTRY" | jq -r '.kind // empty')
-    WAIT_CWD=$(printf '%s' "$ENTRY" | jq -r '.worktree // .cwd // empty') wait_input_ready "$PANE" "$k"; wrc=$?
+    WAIT_CWD=$(printf '%s' "$ENTRY" | jq -r '.worktree // .cwd // empty')
+    if [ "${SCREEN_BACKEND:-}" = hc ]; then wait_hc_ready "$PANE" "$k"; else wait_input_ready "$PANE" "$k"; fi
+    wrc=$?
     if [ "$wrc" = 0 ]; then
-      GBB_PROMPT_KIND="$k" prompt_with_retry "$tgt" "$PANE" "$(cat "$pf")"; prc=$?
+      if [ "${SCREEN_BACKEND:-}" = hc ]; then hc_send_text "$PANE" "$k" "$(cat "$pf")"; else
+        GBB_PROMPT_KIND="$k" prompt_with_retry "$tgt" "$PANE" "$(cat "$pf")"
+      fi
+      prc=$?
       if [ "$prc" = 0 ]; then clear_pending_prompt "$PANE"; sent=true; else sent=false; fi
     else
       sent=false; log "answer $PANE: pending prompt kept (wait rc=$wrc ${WAIT_STATE:-})"
     fi
   fi
-  st=$(agent_status_of "$PANE")
+  if [ "${SCREEN_BACKEND:-}" = hc ]; then st=$(hc_status_word "$PANE"); else st=$(agent_status_of "$PANE"); fi
   jq -cn --arg p "$PANE" --arg w "$want" --arg l "$label" --argjson still "$still" --argjson sent "$sent" --arg st "$st" \
     --arg ws "${WAIT_STATE:-}" --arg scr "$(screen_bottom "$PANE" 10)" '
     {ok:($still|not), pane_id:$p, answered:{option:($w|tonumber), label:$l}, dialog_still_open:$still,
@@ -952,6 +1443,17 @@ cmd_keys() {
   t="${1:-}"; shift 2>/dev/null
   [ $# -gt 0 ] || die usage "gbb keys <task> <key>..."
   require_entry "$t"
+  if [ "$(entry_backend "$ENTRY")" = hc ]; then
+    out=$("$HC" keys --json "$PANE" "$@" 2>>"$LOG") || true
+    st=$(printf '%s' "$out" | jq -r 'if (.status | type) == "string" then .status else empty end' 2>/dev/null || true)
+    [ -n "$st" ] || st=$(hc_status_word "$PANE")
+    [ -n "$st" ] || st=none
+    log "keys $PANE: $*"
+    err=$(printf '%s' "$out" | jq -r '.error.kind // empty' 2>/dev/null || true)
+    jq -cn --arg o "$out" --arg s "$st" --arg p "$PANE" --arg err "$err" \
+      '{ok:($err == ""), pane_id:$p, status_after:$s, hc:($o|(try fromjson catch .))}'
+    return
+  fi
   out=$("$HERDR" agent send-keys "$(agent_target)" "$@" 2>&1)
   sleep 1
   st=$("$HERDR" agent get "$PANE" 2>/dev/null | jq -r '.result.agent.agent_status // "none"')
@@ -962,8 +1464,50 @@ cmd_keys() {
 cmd_wait() {
   t="${1:-}"; shift 2>/dev/null
   require_entry "$t"
+  if [ "$(entry_backend "$ENTRY")" = hc ]; then
+    hc_cmd_wait "$@"
+    return
+  fi
   out=$("$HERDR" agent wait "$(agent_target)" "$@" 2>&1)
   jq -cn --arg o "$out" '($o|(try fromjson catch {raw:.})) as $j | {ok:($j.result != null), status:($j.result.agent.agent_status // null), error:($j.error // null)}'
+}
+
+# hc wait speaks seconds and ends when the program leaves `working`. --until polls for those words.
+hc_cmd_wait() {
+  untils=""; tmo_ms=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --until) untils="$untils $2"; shift 2 ;;
+      --timeout) tmo_ms="$2"; shift 2 ;;
+      *) die usage "gbb wait (hc): --until <state> and --timeout <ms>" ;;
+    esac
+  done
+  sec=180
+  if [ -n "$tmo_ms" ]; then sec=$((tmo_ms / 1000)); [ "$sec" -lt 1 ] && sec=1; fi
+  if [ -z "$untils" ]; then
+    out=$("$HC" wait --json "$PANE" --timeout "$sec" 2>>"$LOG") || true
+    jq -cn --arg o "$out" '($o|(try fromjson catch {raw:.})) as $j |
+      {ok:(($j.ended // false) == true or (($j.status // "") != "" and ($j.reason // "") != "timeout")),
+       status:($j.status // null), error:(if ($j.reason // "") == "timeout" then {code:"timeout", message:"hc wait checked in"} else ($j.error // null) end)}'
+    return
+  fi
+  t0=$(now)
+  while [ $(($(now) - t0)) -lt "$sec" ]; do
+    w=$(hc_status_word "$PANE")
+    for u in $untils; do
+      if [ "$w" = "$u" ] || { [ "$u" = blocked ] && [ "$w" = error ]; }; then
+        jq -cn --arg s "$w" '{ok:true, status:$s, error:null}'
+        return
+      fi
+    done
+    js=$(hc_get_json "$PANE" 2>/dev/null || true)
+    if [ "$(printf '%s' "$js" | jq -r '.state // empty' 2>/dev/null)" = finished ]; then
+      jq -cn --arg s "$w" '{ok:false, status:(if $s == "" then null else $s end), error:{code:"finished", message:"the terminal program ended"}}'
+      return
+    fi
+    sleep 1
+  done
+  jq -cn --arg s "$(hc_status_word "$PANE")" '{ok:false, status:(if $s == "" then null else $s end), error:{code:"timeout", message:"gbb wait timed out"}}'
 }
 
 cmd_result() {
@@ -971,7 +1515,12 @@ cmd_result() {
   wt=$(printf '%s' "$ENTRY" | jq -r '.worktree // .cwd // empty')
   bc=$(printf '%s' "$ENTRY" | jq -r '.base_commit // empty')
   k=$(printf '%s' "$ENTRY" | jq -r '.kind // empty')
-  ag=$("$HERDR" agent get "$PANE" 2>/dev/null | jq -c '.result.agent // null'); [ -n "$ag" ] || ag=null
+  if [ "$(entry_backend "$ENTRY")" = hc ]; then
+    ag=$(hc_agent_compat "$PANE")
+  else
+    ag=$("$HERDR" agent get "$PANE" 2>/dev/null | jq -c '.result.agent // null')
+  fi
+  [ -n "$ag" ] || ag=null
   sid=$(printf '%s' "$ENTRY" | jq -r '.session_id // empty'); [ -n "$sid" ] || sid=$(session_of "$ag")
   commits=""; stat=""; dirty=""; head=""; br=""
   if [ -n "$wt" ] && [ -d "$wt" ]; then
@@ -995,6 +1544,10 @@ cmd_result() {
 
 cmd_stop() {
   require_entry "${1:-}"
+  if [ "$(entry_backend "$ENTRY")" = hc ]; then
+    hc_cmd_stop
+    return
+  fi
   origin=$(printf '%s' "$ENTRY" | jq -r .origin)
   ws=$(printf '%s' "$ENTRY" | jq -r '.workspace_id // empty')
   created=$(printf '%s' "$ENTRY" | jq -r '.created_workspace // false')
@@ -1019,9 +1572,37 @@ cmd_stop() {
      note:(if $e.origin=="handover" then "handover pane unregistered; user pane left running" else null end)}'
 }
 
+hc_cmd_stop() {
+  origin=$(printf '%s' "$ENTRY" | jq -r .origin)
+  created=$(printf '%s' "$ENTRY" | jq -r '.created_terminal // false')
+  closed=false
+  if [ "$origin" = launched ] && [ "$created" = true ]; then
+    if "$HC" kill --json "$PANE" >/dev/null 2>&1; then
+      closed=true
+      i=0
+      while [ "$i" -lt 15 ]; do
+        js=$(hc_get_json "$PANE" 2>/dev/null || true)
+        [ "$(printf '%s' "$js" | jq -r '.state // empty' 2>/dev/null)" = finished ] && break
+        [ -z "$js" ] && break
+        i=$((i + 1)); sleep 0.2
+      done
+    else
+      log "hc kill failed for $PANE"
+    fi
+    "$HC" rm --json "$PANE" >/dev/null 2>&1 || log "hc rm $PANE did not remove it (left for a later stop)"
+  fi
+  clear_pending_prompt "$PANE"
+  e=$(do_reclaim "$PANE" stopped)
+  jq -cn --argjson e "$e" --argjson c "$closed" '{ok:true, task_id:$e.task_id, origin:$e.origin, workspace_closed:$c,
+     worktree_kept:($e.worktree // null), session_id:null,
+     note:(if $e.origin=="handover" then "handover terminal unregistered; it was left running"
+       elif $c then "hc terminal killed and removed" else "hc terminal left running; unregister only" end)}'
+}
+
 cmd_handover_cli() {
   pane=""; note=""; howner=""
-  while [ $# -gt 0 ]; do case "$1" in --pane) pane="$2"; shift 2 ;; --note) note="$2"; shift 2 ;; --owner) howner="$2"; shift 2 ;; *) pane="$1"; shift ;; esac; done
+  while [ $# -gt 0 ]; do case "$1" in --pane) pane="$2"; shift 2 ;; --note) note="$2"; shift 2 ;; --owner) howner="$2"; shift 2 ;; --backend) HANDOVER_BACKEND="$2"; shift 2 ;; *) pane="$1"; shift ;; esac; done
+  case "${HANDOVER_BACKEND:-}" in "" | herdr | hc) ;; *) die usage "--backend must be herdr or hc" ;; esac
   [ -n "$pane" ] || die usage "gbb handover --pane <id> [--note <text>] [--owner <name>]"
   e=$(do_handover "$pane" "$note" "$howner")
   printf '%s' "$e" | jq -e '.ok == false' >/dev/null 2>&1 && { printf '%s\n' "$e"; exit 1; }
@@ -1038,15 +1619,19 @@ cmd_doctor() {
   url="$(cfg_get webhook_url)"; host=""
   [ -n "$url" ] && host=$(printf '%s' "$url" | sed 's#^[a-z]*://##; s#/.*##')
   mode=""; [ -f "$CONFIG_FILE" ] && mode=$(file_mode "$CONFIG_FILE")
-  linked=$("$HERDR" plugin list 2>/dev/null | grep -c "$PLUGIN_ID")
+  linked=$("$HERDR" plugin list 2>/dev/null | grep -c "$PLUGIN_ID" || true)
+  hcver=""; have_cmd "$HC" && hcver=$("$HC" --version 2>/dev/null | head -n 1)
+  be=$(cfg_get backend); be=${be:-auto}
   jq -cn --arg v "$GBB_VERSION" --arg cfg "$CONFIG_FILE" --arg mode "$mode" --arg host "$host" \
     --arg hn "$(cfg_get webhook_header_name)" --arg hv "$( [ -n "$(cfg_get webhook_header_value)" ] && echo set)" \
-    --arg herdr "$("$HERDR" --version 2>/dev/null)" --arg jq "$(jq --version)" --arg curl "$(command -v curl)" \
+    --arg herdr "$("$HERDR" --version 2>/dev/null)" --arg hcver "$hcver" --arg be "$be" \
+    --arg jq "$(jq --version)" --arg curl "$(command -v curl)" \
     --arg xhosts "$(cfg_extra_webhooks | while IFS="$US" read -r xu _xn _xv; do url_host "$xu"; printf ' '; done)" \
     --arg reg "$REGISTRY" --arg log "$LOG" --argjson linked "${linked:-0}" --arg allow "$(cfg_list allowed_repos | tr '\n' ' ')" \
     --arg owners "$(cfg_owners | while IFS="$US" read -r on ou _hn ohv; do printf '%s\t%s\t%s\n' "$on" "$(url_host "$ou")" "$( [ -n "$ohv" ] && echo set)"; done)" \
     --argjson cargs "$(cfg_array codex_args | jq -R . | jq -sc .)" --arg cdef "$(codex_user_defaults)" '
-    {ok:true, version:$v, herdr:$herdr, jq:$jq, curl:($curl != ""), plugin_linked:($linked > 0),
+    {ok:true, version:$v, herdr:$herdr, hc:(if $hcver == "" then null else $hcver end), backend:$be,
+     jq:$jq, curl:($curl != ""), plugin_linked:($linked > 0),
      config:{path:$cfg, exists:($mode != ""), mode:(if $mode=="" then null else $mode end), mode_ok:($mode=="600" or $mode=="400"),
        webhook_host:(if $host=="" then null else $host end), header_name:(if $hn=="" then null else $hn end), header_value_set:($hv=="set"),
        extra_webhooks:{count:($xhosts|split(" ")|map(select(.!=""))|length), hosts:($xhosts|split(" ")|map(select(.!="")))},
@@ -1076,10 +1661,11 @@ cmd_test_webhook() {
 
 usage() {
   cat <<'U'
-gbb — Grok Bot bridge for Herdr (JSON output)
+gbb — Grok Bot bridge for Herdr and herdr-core (JSON output)
   gbb launch --repo <path> --kind grok|codex --task <id> [--worktree <branch>|--no-worktree] [--base <ref>]
-             (--prompt <text> | --prompt-file <f>) [--owner <name>] [-- <agent args>]
+             (--prompt <text> | --prompt-file <f>) [--owner <name>] [--backend auto|herdr|hc] [-- <agent args>]
              (owner defaults to $GBB_OWNER; callbacks go to that owner's webhook, else the primary)
+             (backend defaults to config backend, else GBB_BACKEND, else auto: herdr if installed, else hc)
   gbb list
   gbb status <task|pane>          gbb read <task|pane> [--lines N] [--visible]
   gbb send <task|pane> <text>     gbb send <task|pane> --pending   (saved launch prompt)
@@ -1088,9 +1674,10 @@ gbb — Grok Bot bridge for Herdr (JSON output)
   gbb keys <task|pane> <key>...   (herdr key names: enter esc up down shift+left t ...)
   gbb wait <task|pane> [--until S]... [--timeout MS]
   gbb result <task|pane>          gbb stop <task|pane>
-  gbb handover --pane <id> [--note <text>] [--owner <name>]    gbb reclaim --pane <id>
+  gbb handover --pane <id> [--note <text>] [--owner <name>] [--backend herdr|hc]    gbb reclaim --pane <id>
   gbb doctor                      gbb test-webhook [--owner <name>]
-Internal: gbb hook (plugin event hook), gbb action handover|reclaim (plugin actions)
+Internal: gbb hook (Herdr TUI plugin event), gbb action handover|reclaim,
+          gbb hc-watch (follow hc events for managed terminals)
 U
 }
 
@@ -1113,6 +1700,7 @@ case "$cmd" in
   reclaim) cmd_reclaim_cli "$@" ;;
   doctor) cmd_doctor ;;
   test-webhook) cmd_test_webhook "$@" ;;
+  hc-watch) cmd_hc_watch "$@" ;;
   version | --version) jq -cn --arg v "$GBB_VERSION" '{ok:true,version:$v}' ;;
   help | -h | --help) usage ;;
   *) die usage "unknown command $cmd (gbb help)" ;;
