@@ -54,9 +54,14 @@ case "$1 $2" in
   *) printf '%s\n' '{"result":{"type":"ok"}}' ;;
 esac
 H
-chmod +x "$T/bin/hc" "$T/bin/herdr"
+cat >"$T/bin/herdr-app" <<'H'
+#!/bin/sh
+echo "no Herdr window" >&2
+exit 2
+H
+chmod +x "$T/bin/hc" "$T/bin/herdr" "$T/bin/herdr-app"
 printf '%s\n' '› Ask Codex to do anything' 'GPT-6.1-Sol xhigh · ~/x · Context 7% used · 12k in · 2k out' >"$T/screen"
-export HERDR_BIN_PATH="$T/bin/herdr" HC_BIN_PATH="$T/bin/hc" STUB_DIR="$T" HERDR_STUB="$T/herdr-calls"
+export HERDR_BIN_PATH="$T/bin/herdr" HC_BIN_PATH="$T/bin/hc" HERDR_APP_BIN_PATH="$T/bin/herdr-app" STUB_DIR="$T" HERDR_STUB="$T/herdr-calls"
 export GBB_STATE_DIR="$T/state" GBB_DATA_DIR="$T/data" GBB_CONFIG="$T/config.toml" GBB_HC_WATCH_ONCE=1
 unset GBB_WEBHOOK_URL GBB_WEBHOOK_HEADER_NAME GBB_WEBHOOK_HEADER_VALUE GBB_OWNER GBB_BACKEND 2>/dev/null || true
 git -C "$T/repo" init -q
@@ -99,10 +104,12 @@ printf '%s' "$out" | jq -e '.ok == true and .backend == "hc" and .pane_id == "t9
 wt=$(printf '%s' "$out" | jq -r .worktree)
 run=$(hc_runs | jq -c '.[0]')
 printf '%s' "$run" | jq -e --arg wt "$wt" '
-  .[0]=="run" and .[1]=="--bg" and .[2]=="--json" and index("--no-parent") and index("--no-notify")
+  .[0]=="run" and .[1]=="--bg" and .[2]=="--json" and index("--no-parent") and index("--no-notify") and index("--keep")
   and index("grokbot=managed") and index("gbb_task=pin") and index("--cwd") and (.[index("--cwd")+1] == $wt)
   and (.[index("--")+1] == "codex") and index("-m") and index("gpt-6.1-sol")
-  and index("model_reasoning_effort=\"xhigh\"")' >/dev/null || fail "hc run argv: $run"
+  and index("model_reasoning_effort=\"xhigh\"")
+  and (map(select(type=="string" and startswith("herdr.space="))) | length) == 1
+  and (map(select(type=="string" and startswith("herdr.tab="))) | length) == 0' >/dev/null || fail "hc run argv: $run"
 printf '%s' "$(herdr_cmds)" | jq -e 'index("workspace create") == null' >/dev/null || fail "hc launch called herdr: $(herdr_cmds)"
 [ "$("$ROOT/bin/gbb" list | jq -r '[.managed[] | select(.task_id=="pin")][0].backend')" = hc ] || fail "pin registry backend"
 reset_calls
@@ -200,7 +207,7 @@ JSON
 [ ! -f "$T/hits/primary.jsonl" ] || fail "primary got an owner task"
 [ "$(grep -c . "$T/hits/boss.jsonl")" = 1 ] || fail "expected 1 done callback, got $(cat "$T/hits/boss.jsonl")"
 body=$(tail -n 1 "$T/hits/boss.jsonl" | jq -c .body)
-printf '%s' "$body" | jq -e '.source=="grokbot-bridge-herdr" and .version=="0.3.1" and .event=="agent_status" and .status=="done" and .task_id=="t1" and .pane_id=="t1" and .backend=="hc" and .owner=="boss" and .route=="owner" and .herdr_status=="done" and .repo=="/r"' >/dev/null || fail "done payload: $body"
+printf '%s' "$body" | jq -e '.source=="grokbot-bridge-herdr" and .version=="0.3.2" and .event=="agent_status" and .status=="done" and .task_id=="t1" and .pane_id=="t1" and .backend=="hc" and .owner=="boss" and .route=="owner" and .herdr_status=="done" and .repo=="/r"' >/dev/null || fail "done payload: $body"
 printf '%s' "$body" | grep -q SECRET_PROMPT_TEXT && fail "payload leaked the OSC message"
 grep -q primary-secret "$T/state/bridge.log" && fail "secret in log"
 rm -f "$T/hits"/*
