@@ -105,7 +105,7 @@ printf '%s' "$rep" | grep -q DOTSSECRETOKEN && fail "report leaked dots secret"
 printf '%s' "$rep" | grep -q OTHERSECRET && fail "report leaked other secret"
 printf '%s' "$rep" | grep -q '/herdr/webhook' && fail "report included a webhook path"
 printf '%s' "$rep" | jq -e --arg p "$P" '
-  .ok and .version == "0.3.2" and .backend_default == "auto" and .backend_effective == "none"
+  .ok and .version == "0.3.3" and .backend_default == "auto" and .backend_effective == "none"
   and .hc_watch.running == false
   and ([.modules[] | {id, probe_ok, enabled}] | sort_by(.id)) == (
     [{"id":"core","probe_ok":true,"enabled":true},

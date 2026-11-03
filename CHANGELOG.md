@@ -1,10 +1,17 @@
 # Changelog
 
+## 0.3.3 — 2026-11-03
+
+Pick the Herdr space from where its terminals were launched, not from the space's folder field.
+
+- A terminal launched in the repo's main checkout wins over a gbb worktree of that repo, which wins over a space that is only named after the repo. Another worktree of the same repo (a Herdr worktree) is not that space. The space `folder` field is ignored; it is often stale. When two spaces tie, the one named after the repo directory wins, then the one the app is showing.
+- A launch opens its own tab, titled `gbb · <task>`. The hc name stays `gb-<task>` (only `a-z 0-9 - _`). A handover that is already in a tab does not rename that tab.
+
 ## 0.3.2 — 2026-11-03
 
 An hc launch shows up in the Herdr app, in the space for that repo, on its own tab.
 
-- `gbb launch` on hc labels the terminal `herdr.space` (and `--keep`). It does not set `herdr.tab`, so the app opens a new tab instead of splitting one that is already there. The space is the local one whose folder or a terminal was started in that git repo (a worktree counts as the main checkout); if none match, the display name equal to the repo directory. With no Herdr window, the same id is read from a terminal already labeled `herdr.space`. Otherwise gbb mints an id and the app creates the space when it next looks; if the window is open, gbb renames that space to the repo directory.
+- `gbb launch` on hc labels the terminal `herdr.space` (and `--keep`). It does not set `herdr.tab`, so the app opens a new tab instead of splitting one that is already there. The space is chosen as in 0.3.3 (0.3.2 treated any worktree of the repo, and the space folder, as a match). With no Herdr window, the same id is read from a terminal already labeled `herdr.space`. Otherwise gbb mints an id and the app creates the space when it next looks; if the window is open, gbb renames that space to the repo directory.
 - Handover of an hc terminal that is not already in a space gets the same label. One that already has `herdr.space` stays where it is.
 - `gbb stop` still only kills and removes terminals gbb created. It does not close Herdr spaces or tabs. Launch JSON gains `herdr_space` and `created_herdr_space`. Webhook fields are unchanged.
 

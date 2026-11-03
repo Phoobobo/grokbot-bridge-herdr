@@ -5,7 +5,7 @@
 # Deps: jq, git, curl, and at least one of herdr (TUI) or hc (herdr-core). POSIX sh, macOS + Linux.
 set -u
 
-GBB_VERSION="0.3.2"
+GBB_VERSION="0.3.3"
 EMPTY_OBJ='{}'
 PLUGIN_ID="phoobobo.grokbot-bridge"
 META_SOURCE="plugin:phoobobo.grokbot-bridge"
@@ -102,7 +102,9 @@ require_entry() {
 entry_backend() { printf '%s' "${1:-$EMPTY_OBJ}" | jq -r '.backend // "herdr"'; }
 
 sanitize_id() { printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_-' '-' | sed 's/^-*//; s/-*$//' | cut -c1-40; }
+# hc --name: 1-32 of a-z 0-9 - _. The app shows gbb_visible_name on a tab gbb created.
 agent_name_for() { n="gb-$(sanitize_id "$1")"; printf '%s' "$n" | cut -c1-32 | sed 's/-*$//'; }
+gbb_visible_name() { printf 'gbb · %s' "$1"; }
 host_name() { hostname -s 2>/dev/null || hostname; }
 herdr_json() { "$HERDR" "$@" 2>&1; } # herdr prints JSON on stdout, JSON errors on stderr
 
@@ -855,10 +857,34 @@ repo_key() {
   if [ -n "$rk_resolved" ]; then printf '%s\n' "$rk_resolved"; else printf '%s\n' "$rk_top"; fi
 }
 
-same_repo() { # same_repo <dir> <key>
-  [ -n "$2" ] && [ -n "$1" ] && [ -d "$1" ] || return 1
-  sr_k=$(repo_key "$1" || true)
-  [ -n "$sr_k" ] && [ "$sr_k" = "$2" ]
+# paths_same <a> <b> — 0 when both exist and are the same directory.
+paths_same() {
+  [ -n "$1" ] && [ -n "$2" ] || return 1
+  [ "$1" = "$2" ] && return 0
+  ps_a=$(cd "$1" 2>/dev/null && pwd -P) || return 1
+  ps_b=$(cd "$2" 2>/dev/null && pwd -P) || return 1
+  [ "$ps_a" = "$ps_b" ]
+}
+
+# cwd_place <dir> <repo> <basename>
+# 3: this launch dir is the repo's main checkout (the root, or a subdir of it).
+# 2: it is one of gbb's worktrees of that repo ($WORKTREE_ROOT/<basename>-<task>).
+# 0: anything else, including another worktree of the same repo (a Herdr worktree)
+#    and a space folder, which is often stale.
+cwd_place() {
+  cp_dir="$1"; cp_repo="$2"; cp_base="$3"
+  [ -n "$cp_dir" ] && [ -d "$cp_dir" ] || { printf '0\n'; return 0; }
+  cp_top=$(git -C "$cp_dir" rev-parse --show-toplevel 2>/dev/null || true)
+  [ -n "$cp_top" ] || cp_top=$cp_dir
+  if paths_same "$cp_top" "$cp_repo"; then printf '3\n'; return 0; fi
+  case "$cp_top" in
+    "$WORKTREE_ROOT/$cp_base"-*)
+      cp_a=$(repo_key "$cp_top" || true)
+      cp_b=$(repo_key "$cp_repo" || true)
+      if [ -n "$cp_a" ] && [ "$cp_a" = "$cp_b" ]; then printf '2\n'; return 0; fi
+      ;;
+  esac
+  printf '0\n'
 }
 
 # Local Herdr space ids are `sp` + hex. Reject anything that is not a single label token.
@@ -869,49 +895,59 @@ valid_space_id() {
   return 0
 }
 
-new_space_id() {
-  ns_hex=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' | tr 'A-F' 'a-f')
-  case "$ns_hex" in
-    *[!0-9a-f]*|"") ns_hex=$(printf '%s%s' "$(date +%s)" "$$" | tr -cd '0-9a-f') ;;
+new_herdr_id() { # new_herdr_id <sp|tb>
+  nh_hex=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' | tr 'A-F' 'a-f')
+  case "$nh_hex" in
+    *[!0-9a-f]*|"") nh_hex=$(printf '%s%s' "$(date +%s)" "$$" | tr -cd '0-9a-f') ;;
   esac
-  ns_hex=$(printf '%.32s' "${ns_hex}00000000000000000000000000000000")
-  printf 'sp%s\n' "$ns_hex"
+  nh_hex=$(printf '%.32s' "${nh_hex}00000000000000000000000000000000")
+  printf '%s%s\n' "$1" "$nh_hex"
 }
+new_space_id() { new_herdr_id sp; }
+new_tab_id() { new_herdr_id tb; }
 
-# pick_space_from_app <app-ls-json> <hc-ls-terminals-json> <repo-key> <basename>
-# Prints the best local space id, or nothing. Score 3: the space folder or one of
-# its terminals was launched in this repo. Score 1: the display name is the repo's
-# directory name (unnamed spaces are called after that). A higher score wins; a tie
-# prefers the space the app is showing.
+# pick_space_from_app <app-ls-json> <hc-ls-terminals-json> <repo> <basename>
+# Prints the best local space id, or nothing. The space's folder field is ignored
+# (Herdr leaves it stale). Score 3: a terminal was launched in the main checkout.
+# Score 2: a terminal was launched in a gbb worktree of this repo. Score 1: the
+# display name is the repo directory and nothing was launched there. A higher
+# score wins. The same score prefers the space named after the repo, then the
+# one the app is showing. Another worktree of the same repo does not score.
 pick_space_from_app() {
-  pa_app="$1"; pa_terms="$2"; pa_key="$3"; pa_base="$4"
-  pa_best=""; pa_score_best=0; pa_active_best=0
+  pa_app="$1"; pa_terms="$2"; pa_repo="$3"; pa_base="$4"
+  pa_best=""; pa_score_best=0; pa_named_best=0; pa_active_best=0
   pa_rows=$(mktemp) || return 0
-  printf '%s' "$pa_app" | jq -c '.spaces[]? | select((.machine // null) == null) | {id,name,folder,active,terminals:[.tabs[]?.terminals[]?.terminal | select(. != null)]}' >"$pa_rows" 2>/dev/null || true
+  printf '%s' "$pa_app" | jq -c '.spaces[]? | select((.machine // null) == null) | {id,name,active,terminals:[.tabs[]?.terminals[]?.terminal | select(. != null)]}' >"$pa_rows" 2>/dev/null || true
   while IFS= read -r pa_row; do
     [ -n "$pa_row" ] || continue
     pa_id=$(printf '%s' "$pa_row" | jq -r '.id // empty' 2>/dev/null || true)
     valid_space_id "$pa_id" || continue
     pa_name=$(printf '%s' "$pa_row" | jq -r '.name // empty' 2>/dev/null || true)
-    pa_folder=$(printf '%s' "$pa_row" | jq -r '.folder // empty' 2>/dev/null || true)
     pa_active=0
     [ "$(printf '%s' "$pa_row" | jq -r '.active // false' 2>/dev/null || true)" = true ] && pa_active=1
+    pa_named=0
+    [ -n "$pa_base" ] && [ "$pa_name" = "$pa_base" ] && pa_named=1
     pa_score=0
-    if same_repo "$pa_folder" "$pa_key"; then pa_score=3; fi
-    if [ "$pa_score" -lt 3 ]; then
-      pa_trows=$(mktemp) || continue
-      printf '%s' "$pa_row" | jq -r '.terminals[]?' >"$pa_trows" 2>/dev/null || true
-      while IFS= read -r pa_addr; do
-        [ -n "$pa_addr" ] || continue
-        pa_cwd=$(printf '%s' "$pa_terms" | jq -r --arg a "$pa_addr" '.[] | select(.address == $a) | .cwd // empty' 2>/dev/null | head -n 1)
-        if same_repo "$pa_cwd" "$pa_key"; then pa_score=3; break; fi
-      done <"$pa_trows"
-      rm -f "$pa_trows"
+    pa_trows=$(mktemp) || continue
+    printf '%s' "$pa_row" | jq -r '.terminals[]?' >"$pa_trows" 2>/dev/null || true
+    while IFS= read -r pa_addr; do
+      [ -n "$pa_addr" ] || continue
+      pa_cwd=$(printf '%s' "$pa_terms" | jq -r --arg a "$pa_addr" '.[] | select(.address == $a) | .cwd // empty' 2>/dev/null | head -n 1)
+      pa_here=$(cwd_place "$pa_cwd" "$pa_repo" "$pa_base")
+      [ "$pa_here" -gt "$pa_score" ] && pa_score=$pa_here
+    done <"$pa_trows"
+    rm -f "$pa_trows"
+    if [ "$pa_score" -eq 0 ] && [ "$pa_named" = 1 ]; then pa_score=1; fi
+    pa_take=0
+    if [ "$pa_score" -gt "$pa_score_best" ]; then pa_take=1; fi
+    if [ "$pa_score" -eq "$pa_score_best" ] && [ "$pa_score" -gt 0 ]; then
+      if [ "$pa_named" = 1 ] && [ "$pa_named_best" -eq 0 ]; then pa_take=1; fi
+      if [ "$pa_named" = "$pa_named_best" ] && [ "$pa_active" = 1 ] && [ "$pa_active_best" -eq 0 ]; then pa_take=1; fi
     fi
-    if [ "$pa_score" -eq 0 ] && [ -n "$pa_base" ] && [ "$pa_name" = "$pa_base" ]; then pa_score=1; fi
-    if [ "$pa_score" -gt "$pa_score_best" ] || { [ "$pa_score" -eq "$pa_score_best" ] && [ "$pa_score" -gt 0 ] && [ "$pa_active" = 1 ] && [ "$pa_active_best" = 0 ]; }; then
+    if [ "$pa_take" = 1 ]; then
       pa_score_best=$pa_score
       pa_best=$pa_id
+      pa_named_best=$pa_named
       pa_active_best=$pa_active
     fi
   done <"$pa_rows"
@@ -919,20 +955,22 @@ pick_space_from_app() {
   [ "$pa_score_best" -gt 0 ] && printf '%s\n' "$pa_best"
 }
 
-# pick_space_from_terminals <hc-ls-terminals-json> <repo-key>
+# pick_space_from_terminals <hc-ls-terminals-json> <repo> <basename>
 # The app window is not answering. A terminal already labeled herdr.space and
-# launched in this repo tells us the space id (hc ls JSON omits labels; hc get has them).
+# launched in the main checkout (or a gbb worktree) tells us the space id.
+# hc ls JSON omits labels; hc get has them. A different worktree is skipped.
 pick_space_from_terminals() {
-  pt_terms="$1"; pt_key="$2"
+  pt_terms="$1"; pt_repo="$2"; pt_base="$3"
   pt_rows=$(mktemp) || return 0
-  pt_found=""
+  pt_found=""; pt_best=0
   printf '%s' "$pt_terms" | jq -r '.[]? | select(.address != null and (.address | contains("/") | not)) | [(.address|tostring), (.cwd // "")] | @tsv' >"$pt_rows" 2>/dev/null || true
   while IFS=$(printf '\t') read -r pt_addr pt_cwd; do
     [ -n "$pt_addr" ] || continue
-    same_repo "$pt_cwd" "$pt_key" || continue
+    pt_here=$(cwd_place "$pt_cwd" "$pt_repo" "$pt_base")
+    [ "$pt_here" -gt "$pt_best" ] || continue
     pt_js=$(hc_get_json "$pt_addr" || true)
     pt_sp=$(printf '%s' "$pt_js" | jq -r '.labels["herdr.space"] // empty' 2>/dev/null || true)
-    if valid_space_id "$pt_sp"; then pt_found=$pt_sp; break; fi
+    if valid_space_id "$pt_sp"; then pt_found=$pt_sp; pt_best=$pt_here; fi
   done <"$pt_rows"
   rm -f "$pt_rows"
   [ -n "$pt_found" ] && printf '%s\n' "$pt_found"
@@ -943,9 +981,8 @@ pick_space_from_terminals() {
 # Omitting herdr.tab is deliberate: the app then creates a tab instead of splitting one that exists.
 place_for_repo() {
   PLACE_SPACE=""; PLACE_CREATED=0; PLACE_APP=0
-  pl_dir="$1"; pl_key=""; pl_base=""
+  pl_dir="$1"; pl_base=""
   if [ -n "$pl_dir" ] && [ -d "$pl_dir" ]; then
-    pl_key=$(repo_key "$pl_dir" || true)
     pl_base=$(basename "$pl_dir")
   fi
   pl_terms=$("$HC" ls --json 2>/dev/null | jq -c '.terminals // []' 2>/dev/null || true)
@@ -959,11 +996,11 @@ place_for_repo() {
       pl_app=""
     fi
   fi
-  if [ -n "$pl_key" ] && [ "$PLACE_APP" = 1 ]; then
-    PLACE_SPACE=$(pick_space_from_app "$pl_app" "$pl_terms" "$pl_key" "$pl_base" || true)
+  if [ -n "$pl_dir" ] && [ -d "$pl_dir" ] && [ "$PLACE_APP" = 1 ]; then
+    PLACE_SPACE=$(pick_space_from_app "$pl_app" "$pl_terms" "$pl_dir" "$pl_base" || true)
   fi
-  if [ -z "$PLACE_SPACE" ] && [ -n "$pl_key" ]; then
-    PLACE_SPACE=$(pick_space_from_terminals "$pl_terms" "$pl_key" || true)
+  if [ -z "$PLACE_SPACE" ] && [ -n "$pl_dir" ] && [ -d "$pl_dir" ]; then
+    PLACE_SPACE=$(pick_space_from_terminals "$pl_terms" "$pl_dir" "$pl_base" || true)
   fi
   if [ -z "$PLACE_SPACE" ] || ! valid_space_id "$PLACE_SPACE"; then
     PLACE_SPACE=$(new_space_id)
@@ -972,27 +1009,46 @@ place_for_repo() {
   log "herdr place space=$PLACE_SPACE created=$PLACE_CREATED app=$PLACE_APP"
 }
 
-# The app names a space it did not know after the terminal's folder (often the worktree).
-# Ask it to use the repo's directory name once that space exists. Failure leaves Herdr's name.
-rename_created_space() {
-  [ "${PLACE_CREATED:-0}" = 1 ] || return 0
+# Names only a space or tab this launch minted. A user's existing tab is left alone;
+# the terminal there keeps its hc name (gb-<task> on a launch, the program's name on handover).
+# Herdr shows the tab title in the tab bar. hc --name cannot hold "gbb · …".
+name_created_place() { # name_created_place <repo-dir> <task-id>
+  [ "${PLACE_CREATED:-0}" = 1 ] || [ "${PLACE_TAB_CREATED:-0}" = 1 ] || return 0
+  if [ "${PLACE_APP:-0}" != 1 ] && have_cmd "$HERDR_APP"; then
+    rn_probe=$("$HERDR_APP" ls 2>/dev/null || true)
+    printf '%s' "$rn_probe" | jq -e '.spaces | type == "array"' >/dev/null 2>&1 && PLACE_APP=1
+  fi
   [ "${PLACE_APP:-0}" = 1 ] || return 0
   have_cmd "$HERDR_APP" || return 0
-  rn_base=$(basename "$1")
-  case "$rn_base" in ""|.|..) return 0 ;; esac
-  # One JSON object, so a repo name like "true" or "1" stays a string (flag parsing would not).
-  rn_args=$(jq -nc --arg id "$PLACE_SPACE" --arg name "$rn_base" '{id:$id,name:$name}')
+  rn_want_space=0; rn_want_tab=0; rn_space_ok=1; rn_tab_ok=1
+  if [ "${PLACE_CREATED:-0}" = 1 ]; then
+    rn_base=$(basename "$1")
+    case "$rn_base" in ""|.|..) ;; *)
+      rn_want_space=1; rn_space_ok=0
+      rn_space_args=$(jq -nc --arg id "$PLACE_SPACE" --arg name "$rn_base" '{id:$id,name:$name}')
+      ;;
+    esac
+  fi
+  if [ "${PLACE_TAB_CREATED:-0}" = 1 ] && valid_space_id "${PLACE_TAB:-}"; then
+    rn_want_tab=1; rn_tab_ok=0
+    rn_tab_args=$(jq -nc --arg id "$PLACE_TAB" --arg name "$(gbb_visible_name "$2")" '{id:$id,name:$name}')
+  fi
+  [ "$rn_want_space" = 1 ] || [ "$rn_want_tab" = 1 ] || return 0
   rn_i=0
   while [ "$rn_i" -lt 10 ]; do
-    rn_out=$("$HERDR_APP" "do" space.rename "$rn_args" 2>>"$LOG") || true
-    if printf '%s' "$rn_out" | jq -e 'type == "object" and (.error | not)' >/dev/null 2>&1; then
-      log "renamed herdr space $PLACE_SPACE to $rn_base"
-      return 0
+    if [ "$rn_space_ok" = 0 ]; then
+      rn_out=$("$HERDR_APP" "do" space.rename "$rn_space_args" 2>>"$LOG") || true
+      printf '%s' "$rn_out" | jq -e 'type == "object" and (.error | not)' >/dev/null 2>&1 && rn_space_ok=1
     fi
+    if [ "$rn_tab_ok" = 0 ]; then
+      rn_out=$("$HERDR_APP" "do" tab.rename "$rn_tab_args" 2>>"$LOG") || true
+      printf '%s' "$rn_out" | jq -e 'type == "object" and (.error | not)' >/dev/null 2>&1 && rn_tab_ok=1
+    fi
+    [ "$rn_space_ok" = 1 ] && [ "$rn_tab_ok" = 1 ] && { log "named herdr space=$PLACE_SPACE tab=$PLACE_TAB"; return 0; }
     rn_i=$((rn_i + 1))
     sleep 0.25
   done
-  log "herdr space rename not applied for $PLACE_SPACE"
+  log "herdr name not applied space_ok=$rn_space_ok tab_ok=$rn_tab_ok"
   return 0
 }
 
@@ -1000,10 +1056,13 @@ launch_with_hc() {
   name=$(agent_name_for "$tid")
   ws=""
   place_for_repo "$repo"
+  # A tab id the app does not know becomes a new tab. An existing tab id would split into it.
+  PLACE_TAB=$(new_tab_id); PLACE_TAB_CREATED=1
   # --keep matches the app's own terminals (adoption turns keep on anyway).
-  # No herdr.tab: an unknown or missing tab id becomes a new tab; an existing one is split.
+  # --name stays gb-<task> (hc allows only a-z 0-9 - _). The tab title is gbb_visible_name.
   out=$("$HC" run --bg --json --name "$name" --cwd "$wt" --no-parent --no-notify --keep \
-    --label grokbot=managed --label "gbb_task=$tid" --label "herdr.space=$PLACE_SPACE" \
+    --label grokbot=managed --label "gbb_task=$tid" \
+    --label "herdr.space=$PLACE_SPACE" --label "herdr.tab=$PLACE_TAB" \
     -- "$kind" "$@" 2>>"$LOG") || true
   addr=$(printf '%s' "$out" | jq -r '.address // empty' 2>/dev/null || true)
   if [ -z "$addr" ]; then
@@ -1011,20 +1070,23 @@ launch_with_hc() {
   fi
   [ -n "$addr" ] || die agent_start_failed "$(printf '%s' "$out" | head -c 400)"
   hsc=false; [ "$PLACE_CREATED" = 1 ] && hsc=true
+  htc=false; [ "$PLACE_TAB_CREATED" = 1 ] && htc=true
   registry_update '.panes[$p] = {pane_id:$p, workspace_id:null, task_id:$task, agent_name:$n, kind:$k, repo:$r,
       worktree:$wt, branch:$b, base_commit:$bc, origin:"launched", created_workspace:false, created_terminal:true,
       backend:"hc", created_at:$t, last_status:null, armed:false,
       herdr_space:(if $hs=="" then null else $hs end), created_herdr_space:$hsc,
+      herdr_tab:(if $ht=="" then null else $ht end), created_herdr_tab:$htc,
       agent_args:$aa, owner:(if $o == "" then null else $o end), launching_until:$lu}' \
     --arg o "$owner" --argjson lu "$(($(now) + 600))" --argjson aa "$args_json" \
     --arg p "$addr" --arg task "$tid" --arg n "$name" --arg k "$kind" --arg r "$repo" --arg wt "$wt" \
     --arg b "$branch" --arg bc "$base_commit" --arg t "$(iso_now)" \
-    --arg hs "$PLACE_SPACE" --argjson hsc "$hsc" || die registry_error "registry write failed"
+    --arg hs "$PLACE_SPACE" --argjson hsc "$hsc" --arg ht "$PLACE_TAB" --argjson htc "$htc" \
+    || die registry_error "registry write failed"
   word=$(hc_status_word "$addr")
   [ -n "$word" ] || word=none
   printf '%s %s\n' "$word" "$(now)" >"$LAST_DIR/$(printf '%s' "$addr" | tr ':' '_')"
   set_marker "$addr" "$tid"
-  rename_created_space "$repo"
+  name_created_place "$repo" "$tid"
   ensure_hc_watch
   settle=$(cfg_get startup_settle_sec); sleep "${settle:-4}"
   wait_hc_ready "$addr" "$kind"; wrc=$?
@@ -1125,31 +1187,44 @@ do_handover_hc() { # do_handover_hc <terminal> <note> <owner>
   st=$(printf '%s' "$js" | jq -r 'if (.status|type) == "object" then (.status.state // empty) else empty end')
   task="ho-$(printf '%s' "$addr" | tr -c 'A-Za-z0-9' '-' | sed 's/-*$//')-$(now)"
   repo=""; [ -n "$cwd" ] && repo=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || true)
-  # Already on a space: leave it there. Otherwise the same placement as launch (new tab, not a split).
+  # Already in a space or tab: leave that one. A missing tab gets a new id (not a split into a user's tab).
   ho_sp=$(printf '%s' "$js" | jq -r '.labels["herdr.space"] // empty' 2>/dev/null || true)
+  ho_tab=$(printf '%s' "$js" | jq -r '.labels["herdr.tab"] // empty' 2>/dev/null || true)
   if valid_space_id "$ho_sp"; then
     PLACE_SPACE=$ho_sp; PLACE_CREATED=0; PLACE_APP=0
   else
     ho_where="$repo"; [ -n "$ho_where" ] || ho_where="$cwd"
     place_for_repo "$ho_where"
   fi
+  if valid_space_id "$ho_tab"; then
+    PLACE_TAB=$ho_tab; PLACE_TAB_CREATED=0
+  else
+    PLACE_TAB=$(new_tab_id); PLACE_TAB_CREATED=1
+  fi
   hsc=false; [ "${PLACE_CREATED:-0}" = 1 ] && hsc=true
+  htc=false; [ "${PLACE_TAB_CREATED:-0}" = 1 ] && htc=true
   registry_update '.panes[$p] = {pane_id:$p, workspace_id:null, task_id:$task, agent_name:(if $n=="" then null else $n end),
       kind:null, repo:(if $r=="" then null else $r end), worktree:(if $r=="" then null else $r end),
       cwd:$cwd, origin:"handover", note:(if $note=="" then null else $note end), created_at:$t,
       last_status:(if $s=="" then null else $s end), created_workspace:false, created_terminal:false, backend:"hc",
       herdr_space:(if $hs=="" then null else $hs end), created_herdr_space:$hsc,
+      herdr_tab:(if $ht=="" then null else $ht end), created_herdr_tab:$htc,
       owner:(if $o=="" then null else $o end), armed:true}' \
     --arg o "$howner" --arg p "$addr" --arg task "$task" --arg n "$name" --arg r "$repo" --arg cwd "$cwd" \
     --arg note "$note" --arg t "$(iso_now)" --arg s "$st" --arg hs "$PLACE_SPACE" --argjson hsc "$hsc" \
+    --arg ht "$PLACE_TAB" --argjson htc "$htc" \
     || die registry_error "could not write registry"
   [ -n "$st" ] && printf '%s %s\n' "$st" "$(now)" >"$LAST_DIR/$(printf '%s' "$addr" | tr ':' '_')"
-  if valid_space_id "$ho_sp"; then
+  if valid_space_id "$ho_sp" && valid_space_id "$ho_tab"; then
     "$HC" label "$addr" grokbot=managed "gbb_task=$task" >/dev/null 2>&1 || log "hc label failed for $addr"
-  else
+  elif valid_space_id "$ho_sp"; then
+    "$HC" label "$addr" grokbot=managed "gbb_task=$task" "herdr.tab=$PLACE_TAB" >/dev/null 2>&1 || log "hc label failed for $addr"
+  elif valid_space_id "$ho_tab"; then
     "$HC" label "$addr" grokbot=managed "gbb_task=$task" "herdr.space=$PLACE_SPACE" >/dev/null 2>&1 || log "hc label failed for $addr"
-    rename_created_space "${repo:-$cwd}"
+  else
+    "$HC" label "$addr" grokbot=managed "gbb_task=$task" "herdr.space=$PLACE_SPACE" "herdr.tab=$PLACE_TAB" >/dev/null 2>&1 || log "hc label failed for $addr"
   fi
+  name_created_place "${repo:-$cwd}" "$task"
   ensure_hc_watch
   e=$(entry_for_pane "$addr")
   notify "$(build_event handover "$st" "$e" "$(jq -cn --arg n "$note" '{note:(if $n=="" then null else $n end)}')")"
@@ -1534,16 +1609,19 @@ launch_finish() {
   pend=false; [ -f "$(pending_file "$1")" ] && pend=true
   be=herdr; [ "${SCREEN_BACKEND:-}" = hc ] && be=hc
   hs="${PLACE_SPACE:-}"; hsc=false; [ "${PLACE_CREATED:-0}" = 1 ] && hsc=true
+  ht="${PLACE_TAB:-}"; htc=false; [ "${PLACE_TAB_CREATED:-0}" = 1 ] && htc=true
   jq -cn --argjson ag "${ag:-$EMPTY_OBJ}" --arg p "$1" --arg ws "${ws:-}" --arg task "$tid" --arg n "$name" --arg wt "$wt" \
     --arg b "$branch" --arg k "$kind" --argjson prc "$2" --arg pr "$(printf '%s' "${PROMPT_RESULT:-}" | head -c 2000)" --argjson aa "$args_json" \
-    --arg o "$owner" --arg ml "$ml" --argjson pend "$pend" --arg be "$be" --arg hs "$hs" --argjson hsc "$hsc" '
+    --arg o "$owner" --arg ml "$ml" --argjson pend "$pend" --arg be "$be" --arg hs "$hs" --argjson hsc "$hsc" \
+    --arg ht "$ht" --argjson htc "$htc" '
     {ok:($prc==0), task_id:$task, pane_id:$p, workspace_id:(if $ws == "" then null else $ws end), agent_name:$n, kind:$k,
      backend:$be,
      agent_args:$aa, worktree:$wt, branch:$b,
      owner:(if $o == "" then null else $o end), agent_model:(if $ml == "" then null else $ml end),
      status:$ag.agent_status, session_id:($ag.agent_session.value // null), prompt_pending:$pend,
      prompt_error:(if $prc==0 then null else ($pr | (try (fromjson | .error // .) catch .[0:300])) end)}
-    + (if $be == "hc" then {herdr_space:(if $hs == "" then null else $hs end), created_herdr_space:$hsc} else {} end)'
+    + (if $be == "hc" then {herdr_space:(if $hs == "" then null else $hs end), created_herdr_space:$hsc,
+        herdr_tab:(if $ht == "" then null else $ht end), created_herdr_tab:$htc} else {} end)'
 }
 
 # launch_blocked <pane> <reason> — the agent opened a startup dialog before the first prompt: keep the
@@ -1556,14 +1634,16 @@ launch_blocked() {
   e=$(entry_for_pane "$1")
   notify "$(build_event agent_status blocked "$e" "$(jq -cn --arg r "$2" '{blocked_reason:$r, prompt_pending:true}')")"
   hs="${PLACE_SPACE:-}"; hsc=false; [ "${PLACE_CREATED:-0}" = 1 ] && hsc=true
+  ht="${PLACE_TAB:-}"; htc=false; [ "${PLACE_TAB_CREATED:-0}" = 1 ] && htc=true
   be=herdr; [ "${SCREEN_BACKEND:-}" = hc ] && be=hc
   jq -cn --arg p "$1" --arg ws "$ws" --arg task "$tid" --arg n "$name" --arg wt "$wt" --arg b "$branch" --arg r "$2" --arg o "$owner" \
-    --arg scr "$(screen_bottom "$1" 12)" --arg hs "$hs" --argjson hsc "$hsc" --arg be "$be" '
+    --arg scr "$(screen_bottom "$1" 12)" --arg hs "$hs" --argjson hsc "$hsc" --arg ht "$ht" --argjson htc "$htc" --arg be "$be" '
     {ok:false, state:"startup_blocked", blocked_reason:$r, prompt_pending:true,
      hint:"the agent shows a startup dialog and the prompt was NOT typed. Read it (gbb read --visible), answer with gbb answer <task> <option> (or gbb keys); the saved prompt is then submitted automatically (or run gbb send <task> --pending)",
      screen:($scr|split("\n")), task_id:$task, pane_id:$p, workspace_id:$ws, agent_name:$n, worktree:$wt, branch:$b,
      owner:(if $o == "" then null else $o end)}
-    + (if $be == "hc" then {herdr_space:(if $hs == "" then null else $hs end), created_herdr_space:$hsc} else {} end)'
+    + (if $be == "hc" then {herdr_space:(if $hs == "" then null else $hs end), created_herdr_space:$hsc,
+        herdr_tab:(if $ht == "" then null else $ht end), created_herdr_tab:$htc} else {} end)'
 }
 
 pending_file() { printf '%s/pending/%s' "$STATE_DIR" "$(printf '%s' "$1" | tr ':' '_')"; }

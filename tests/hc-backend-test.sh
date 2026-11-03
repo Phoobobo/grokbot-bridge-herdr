@@ -109,7 +109,8 @@ printf '%s' "$run" | jq -e --arg wt "$wt" '
   and (.[index("--")+1] == "codex") and index("-m") and index("gpt-6.1-sol")
   and index("model_reasoning_effort=\"xhigh\"")
   and (map(select(type=="string" and startswith("herdr.space="))) | length) == 1
-  and (map(select(type=="string" and startswith("herdr.tab="))) | length) == 0' >/dev/null || fail "hc run argv: $run"
+  and (map(select(type=="string" and startswith("herdr.tab="))) | .[0] | test("^herdr\\.tab=tb[0-9a-f]{32}$"))
+  and (.[index("--name")+1] | test("^[a-z0-9_-]{1,32}$"))' >/dev/null || fail "hc run argv: $run"
 printf '%s' "$(herdr_cmds)" | jq -e 'index("workspace create") == null' >/dev/null || fail "hc launch called herdr: $(herdr_cmds)"
 [ "$("$ROOT/bin/gbb" list | jq -r '[.managed[] | select(.task_id=="pin")][0].backend')" = hc ] || fail "pin registry backend"
 reset_calls
@@ -207,7 +208,7 @@ JSON
 [ ! -f "$T/hits/primary.jsonl" ] || fail "primary got an owner task"
 [ "$(grep -c . "$T/hits/boss.jsonl")" = 1 ] || fail "expected 1 done callback, got $(cat "$T/hits/boss.jsonl")"
 body=$(tail -n 1 "$T/hits/boss.jsonl" | jq -c .body)
-printf '%s' "$body" | jq -e '.source=="grokbot-bridge-herdr" and .version=="0.3.2" and .event=="agent_status" and .status=="done" and .task_id=="t1" and .pane_id=="t1" and .backend=="hc" and .owner=="boss" and .route=="owner" and .herdr_status=="done" and .repo=="/r"' >/dev/null || fail "done payload: $body"
+printf '%s' "$body" | jq -e '.source=="grokbot-bridge-herdr" and .version=="0.3.3" and .event=="agent_status" and .status=="done" and .task_id=="t1" and .pane_id=="t1" and .backend=="hc" and .owner=="boss" and .route=="owner" and .herdr_status=="done" and .repo=="/r"' >/dev/null || fail "done payload: $body"
 printf '%s' "$body" | grep -q SECRET_PROMPT_TEXT && fail "payload leaked the OSC message"
 grep -q primary-secret "$T/state/bridge.log" && fail "secret in log"
 rm -f "$T/hits"/*
