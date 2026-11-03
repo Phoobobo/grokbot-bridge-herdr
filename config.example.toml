@@ -72,4 +72,14 @@ startup_ready_timeout_sec = 90
 # Equivalent table form: [owners.canmouzhang] with url / header_name / header_value.
 
 # Env overrides: GBB_OWNER (default owner for launch/handover), GBB_WEBHOOK_URL, GBB_WEBHOOK_HEADER_NAME, GBB_WEBHOOK_HEADER_VALUE, GBB_CONFIG,
-# GBB_STATE_DIR (default ~/.local/state/grokbot-bridge-herdr), GBB_DATA_DIR (default ~/.local/share/grokbot-bridge-herdr)
+# GBB_STATE_DIR (default ~/.local/state/grokbot-bridge-herdr), GBB_DATA_DIR (default ~/.local/share/grokbot-bridge-herdr),
+# GBB_DOTS_TOKEN_FILE (default ~/.config/dots-bridge/herdr_webhook_token), GBB_DOTS_PROBE_URL (default http://127.0.0.1:8765/).
+
+# Modules (docs/decisions/0006). Omit `enabled` to follow the probe. `false` keeps the module off even when the
+# probe passes. `true` forces it on (dots posts are still only the dots-bridge endpoint, not every extra webhook).
+# [modules.herdr_tui]
+# enabled = true
+# [modules.hc]
+# enabled = true
+# [modules.dots]
+# enabled = false

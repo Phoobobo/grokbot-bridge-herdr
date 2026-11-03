@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1 — 2026-11-03
+
+Split gbb into modules that turn on from a probe, so a machine without dots-bridge does not dial `127.0.0.1:8765` on every event. Config files stay the same; this is 0.3.1 rather than 0.4.0 because the webhook payload, subcommands, and config keys are unchanged. `gbb report` is additive.
+
+- Modules: `core` (always on), `herdr_tui` (`herdr` on PATH and `herdr status server` running), `hc` (`hc server status` returns a pid), `dots` (token file `~/.config/dots-bridge/herdr_webhook_token` mode 600 and `127.0.0.1:8765` accepting connections). `[modules.<id>] enabled = true|false` overrides the probe.
+- Owner and `[[extra_webhooks]]` targets whose host:port is the dots endpoint are skipped, and logged, when the dots module is off. An owner skip still falls back to the primary webhook (`fallback_reason=dots_unavailable`). Other extra webhooks are not gated.
+- `gbb doctor` lists each module with probe result, effective enabled, and reason. `gbb report` prints host, version, modules, webhook targets by name and host only, whether `hc-watch` is running, and each task (id, kind, backend, owner, pane id, status, alive, stale, repo, worktree). No header values or token contents.
+
 ## 0.3.0 — 2026-11-02
 
 Launch tasks in herdr-core (`hc`) terminals, which the Herdr app can show and attach, without moving tasks that already run in the Herdr TUI.

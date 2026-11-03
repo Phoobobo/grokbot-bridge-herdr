@@ -50,6 +50,7 @@ case "$1 $2" in
   "agent get") printf '%s\n' '{"result":{"agent":{"agent_status":"idle"}}}' ;;
   "agent prompt") printf '%s\n' '{"result":{"agent":{"agent_status":"working"}}}' ;;
   "pane read") printf '%s\n' 'ready' ;;
+  "status server") printf '%s\n' '{"running":true,"status":"running"}' ;;
   *) printf '%s\n' '{"result":{"type":"ok"}}' ;;
 esac
 H
@@ -199,7 +200,7 @@ JSON
 [ ! -f "$T/hits/primary.jsonl" ] || fail "primary got an owner task"
 [ "$(grep -c . "$T/hits/boss.jsonl")" = 1 ] || fail "expected 1 done callback, got $(cat "$T/hits/boss.jsonl")"
 body=$(tail -n 1 "$T/hits/boss.jsonl" | jq -c .body)
-printf '%s' "$body" | jq -e '.source=="grokbot-bridge-herdr" and .version=="0.3.0" and .event=="agent_status" and .status=="done" and .task_id=="t1" and .pane_id=="t1" and .backend=="hc" and .owner=="boss" and .route=="owner" and .herdr_status=="done" and .repo=="/r"' >/dev/null || fail "done payload: $body"
+printf '%s' "$body" | jq -e '.source=="grokbot-bridge-herdr" and .version=="0.3.1" and .event=="agent_status" and .status=="done" and .task_id=="t1" and .pane_id=="t1" and .backend=="hc" and .owner=="boss" and .route=="owner" and .herdr_status=="done" and .repo=="/r"' >/dev/null || fail "done payload: $body"
 printf '%s' "$body" | grep -q SECRET_PROMPT_TEXT && fail "payload leaked the OSC message"
 grep -q primary-secret "$T/state/bridge.log" && fail "secret in log"
 rm -f "$T/hits"/*

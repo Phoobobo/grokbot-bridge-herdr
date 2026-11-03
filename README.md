@@ -129,6 +129,41 @@ backend = "auto"   # 默认。hc 优先；herdr | hc 可强制
 
 设计见 [docs/decisions/0005](docs/decisions/0005-herdr-core-backend.md)。
 
+### 模块（按探测开关）
+
+gbb 里有四块。`core` 一直开着。另外三块各自探测，探测过了才用；也可以在配置里强制开或关。没有 dots-bridge 的机器不用改配置：指向 `127.0.0.1:8765` 的 owner / `[[extra_webhooks]]` 会跳过并写日志，不会每次去连。其它 extra webhook 不受影响。已经在登记表里的 TUI 任务仍走 herdr。
+
+```mermaid
+flowchart LR
+  GB["Grok Bot"]
+  DOT["ChatGPT Dot"]
+  CORE["gbb core"]
+  TUI["herdr-tui"]
+  HC["hc / herdr-core"]
+  AG["grok / codex"]
+  GB -->|"remote shell / 主 webhook"| CORE
+  DOT -->|"dots 模块探测通过才转发"| CORE
+  CORE --> TUI
+  CORE --> HC
+  TUI --> AG
+  HC --> AG
+  TUI -->|"插件 hook"| CORE
+  HC -->|"hc events / gbb hc-watch"| CORE
+  CORE -->|"owner 或 primary"| GB
+  CORE -->|"dots 路由，模块开着才发"| DOT
+```
+
+| 模块 | 探测 | 开着时做什么 |
+|---|---|---|
+| `core` | 总是通过 | 登记表、主 webhook、`gbb report` |
+| `herdr_tui` | PATH 上有 `herdr`，且 `herdr status server --json` 的 `running` 为 true | TUI 启动与旧记录的 status/send/stop；插件 hook |
+| `hc` | `hc server status` 返回带数字 `pid` 的 JSON | 新任务默认进 hc；`gbb hc-watch` |
+| `dots` | `~/.config/dots-bridge/herdr_webhook_token` 存在、非空、mode 600 或 400，且 `127.0.0.1:8765` 能连上 | 把该地址上的 owner / extra webhook 发出去 |
+
+`[modules.herdr_tui]` / `[modules.hc]` / `[modules.dots]` 里 `enabled = true|false` 覆盖探测。`gbb doctor` 会写出每一块为什么开或关。`gbb report` 打一份 JSON：主机、版本、各模块、webhook 只含名字和主机、`hc-watch` 是否在跑、每个任务的 id / kind / backend / owner / pane / status / alive / stale / repo / worktree。不含 header、不含 token、不含完整 URL。
+
+设计见 [docs/decisions/0006](docs/decisions/0006-modules-and-report.md)。
+
 ## English
 
 Let Grok Bot drive and watch local coding agents (grok, codex) through [Herdr](https://herdr.dev), and let you hand some of your own panes over to Grok Bot and take them back.
@@ -171,7 +206,8 @@ gbb wait <task|pane> [--until S]  block until a state (fallback when webhooks ar
 gbb result <task|pane>            commits since launch, diff stat, branch, uncommitted, session id, resume
 gbb stop <task|pane>              close only the workspace gbb created; handover panes are just unregistered
 gbb handover --pane <id> [--note] [--owner <name>] / gbb reclaim --pane <id>
-gbb doctor                        incl. owner names/hosts, codex_args, codex_user_defaults (no secrets)
+gbb doctor                        modules (why each is on or off), owner names/hosts, codex_args (no secrets)
+gbb report                        JSON for a status page: modules, webhook hosts, hc-watch, tasks
 gbb test-webhook [--owner <name>] sends a test event through the same routing
 ```
 
@@ -196,6 +232,41 @@ backend = "auto"   # default: hc when its server is up; herdr | hc force one
 - `gbb stop` kills and removes only hc terminals gbb created. A handover is unlabeled and unregistered, not killed. gbb never runs `hc server stop`. The app has no TUI command-palette action; hand a terminal over with `gbb handover --pane <address>` (an id without `:` is tried as hc first).
 
 Rationale: [docs/decisions/0005](docs/decisions/0005-herdr-core-backend.md).
+
+### Modules (on only when the probe passes)
+
+gbb is four modules. `core` is always on. The other three each have a probe and are used only when that probe passes, unless config forces them on or off. A machine without dots-bridge does not need its config edited: owner and `[[extra_webhooks]]` targets on `127.0.0.1:8765` are skipped and logged, not dialed on every event. Other extra webhooks are not gated. Registry rows already on the TUI still use herdr.
+
+```mermaid
+flowchart LR
+  GB["Grok Bot"]
+  DOT["ChatGPT Dot"]
+  CORE["gbb core"]
+  TUI["herdr-tui"]
+  HC["hc / herdr-core"]
+  AG["grok / codex"]
+  GB -->|"remote shell / primary webhook"| CORE
+  DOT -->|"forwarded only when the dots probe passes"| CORE
+  CORE --> TUI
+  CORE --> HC
+  TUI --> AG
+  HC --> AG
+  TUI -->|"plugin hook"| CORE
+  HC -->|"hc events / gbb hc-watch"| CORE
+  CORE -->|"owner or primary"| GB
+  CORE -->|"dots route, only if that module is on"| DOT
+```
+
+| Module | Probe | What it does when on |
+|---|---|---|
+| `core` | always passes | registry, primary webhook, `gbb report` |
+| `herdr_tui` | `herdr` on PATH and `herdr status server --json` has `running: true` | TUI launches and status/send/stop for existing TUI rows; the plugin hook |
+| `hc` | `hc server status` JSON includes a numeric `pid` | default backend for new tasks; `gbb hc-watch` |
+| `dots` | `~/.config/dots-bridge/herdr_webhook_token` exists, is non-empty, mode 600 or 400, and `127.0.0.1:8765` accepts a connection | deliver owner / extra webhooks aimed at that endpoint |
+
+`[modules.herdr_tui]`, `[modules.hc]`, and `[modules.dots]` take `enabled = true|false` to override the probe. `gbb doctor` prints each module and why it is on or off. `gbb report` prints one JSON document: host, version, each module, webhook targets by name and host only, whether `hc-watch` is running, and each task's id, kind, backend, owner, pane id, status, alive, stale, repo, and worktree. No header values, no token contents, no full URLs.
+
+Rationale: [docs/decisions/0006](docs/decisions/0006-modules-and-report.md).
 
 ### Several callers (owner-routed callbacks)
 
@@ -267,7 +338,7 @@ Each extra target (max 5) gets the identical payload in its own background curl,
 ### Webhook payload
 
 ```json
-{"source":"grokbot-bridge-herdr","version":"0.3.0","event":"agent_status","hostname":"mbp",
+{"source":"grokbot-bridge-herdr","version":"0.3.1","event":"agent_status","hostname":"mbp",
  "task_id":"demo","pane_id":"wAX:p1","workspace_id":"wAX","agent_kind":"grok","agent_name":"gb-demo",
  "origin":"launched","owner":"dot","backend":"herdr","repo":"/Users/me/repo","worktree":"/Users/me/.local/share/grokbot-bridge-herdr/worktrees/repo-demo",
  "branch":"gbb/demo","status":"done","ts":"2026-10-28T00:00:00Z","herdr_status":"done","route":"owner"}

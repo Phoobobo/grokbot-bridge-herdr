@@ -5,7 +5,7 @@
 # Deps: jq, git, curl, and at least one of herdr (TUI) or hc (herdr-core). POSIX sh, macOS + Linux.
 set -u
 
-GBB_VERSION="0.3.0"
+GBB_VERSION="0.3.1"
 EMPTY_OBJ='{}'
 PLUGIN_ID="phoobobo.grokbot-bridge"
 META_SOURCE="plugin:phoobobo.grokbot-bridge"
@@ -213,16 +213,22 @@ notify() {
       ourl=$(printf '%s' "$target" | cut -d "$US" -f 1)
       case "$ourl" in
         http://* | https://*)
-          skip_url="$ourl"
-          ohn=$(printf '%s' "$target" | cut -d "$US" -f 2); ohv=$(printf '%s' "$target" | cut -d "$US" -f 3-)
-          opayload=$(with_route "$payload" owner)
-          fpayload=$(with_route "$payload" fallback owner_delivery_failed)
-          (
-            post_sync "owner:$n_owner" "$ourl" "$ohn" "$ohv" "$tmo" "$opayload" || {
-              log "owner $n_owner delivery failed; falling back to primary"
-              notify_primary_sync "$fpayload"
-            }
-          ) </dev/null >/dev/null 2>&1 &
+          if is_dots_target "$ourl"; then dots_eval; fi
+          if is_dots_target "$ourl" && [ "$DOTS_ON" != 1 ]; then
+            log "webhook[owner:$n_owner] skipped: dots module off ($DOTS_WHY)"
+            n_reason=dots_unavailable
+          else
+            skip_url="$ourl"
+            ohn=$(printf '%s' "$target" | cut -d "$US" -f 2); ohv=$(printf '%s' "$target" | cut -d "$US" -f 3-)
+            opayload=$(with_route "$payload" owner)
+            fpayload=$(with_route "$payload" fallback owner_delivery_failed)
+            (
+              post_sync "owner:$n_owner" "$ourl" "$ohn" "$ohv" "$tmo" "$opayload" || {
+                log "owner $n_owner delivery failed; falling back to primary"
+                notify_primary_sync "$fpayload"
+              }
+            ) </dev/null >/dev/null 2>&1 &
+          fi
           ;;
         *) n_reason=owner_url_invalid; log "webhook[owner:$n_owner] skipped: url must start with http:// or https://" ;;
       esac
@@ -264,6 +270,11 @@ notify_extra() {
   while IFS="$US" read -r xurl xhn xhv; do
     i=$((i + 1))
     if [ -n "$skip" ] && [ "$xurl" = "$skip" ]; then log "webhook[x$i] skipped: same target as the owner route"; continue; fi
+    if is_dots_target "$xurl"; then dots_eval; fi
+    if is_dots_target "$xurl" && [ "$DOTS_ON" != 1 ]; then
+      log "webhook[x$i] skipped: dots module off ($DOTS_WHY)"
+      continue
+    fi
     case "$xurl" in
       http://* | https://*) post_webhook "x$i" "$xurl" "$xhn" "$xhv" "$tmo" "$payload" ;;
       *) log "webhook[x$i] skipped: url must start with http:// or https://" ;;
@@ -341,15 +352,160 @@ codex_model_line() {
 # Codex (OSC 7501, app=codex) and Grok Build (≥ 1.0.52) report natively, and hc answers the
 # `OSC 7501 ; ?` query, so a wrapper that also emits 7501 would clobber those reports.
 # A codex that never reports still gets screen classification (the same rules as the TUI path).
-# `auto` (the default) launches on hc when `hc server status` can reach or start the core.
-# The Herdr TUI is the fallback when hc is missing or that status call fails.
+# `auto` (the default) launches on hc when the hc module is on.
+# The Herdr TUI is the fallback when hc is missing, its server does not start, or the module is disabled.
 # Rows already in the registry stay on the backend they were recorded with (no field = TUI).
+# Modules (docs/decisions/0006): core is always on; herdr_tui, hc, and dots turn on from a probe
+# unless [modules.<id>] enabled = true|false overrides it. Dots targets are only the dots-bridge
+# endpoint (default 127.0.0.1:8765). Other extra webhooks are not gated.
 
 # hc_core_up — 0 when `hc server status` returns a running core (it starts one if needed).
 hc_core_up() {
   have_cmd "$HC" || return 1
   out=$("$HC" server status --json 2>/dev/null) || return 1
   printf '%s' "$out" | jq -e '(.pid | type) == "number"' >/dev/null 2>&1
+}
+
+# herdr_server_up — 0 when `herdr status server --json` says the TUI server is running.
+# Verified against herdr 0.9.5: the command exits 0 and prints {"running":true|false,...}; it does not start the server.
+herdr_server_up() {
+  have_cmd "$HERDR" || return 1
+  out=$("$HERDR" status server --json 2>/dev/null) || return 1
+  printf '%s' "$out" | jq -e '.running == true' >/dev/null 2>&1
+}
+
+# module_config_enabled <id> — prints true, false, or nothing. Reads [modules.<id>] enabled = true|false.
+module_config_enabled() {
+  [ -f "$CONFIG_FILE" ] || return 0
+  awk -v name="$1" '
+    $0 ~ "^[[:space:]]*\\[modules\\." name "\\][[:space:]]*(#.*)?$" { in_t = 1; next }
+    /^[[:space:]]*\[/ { in_t = 0 }
+    in_t && /^[[:space:]]*enabled[[:space:]]*=[[:space:]]*(true|false)[[:space:]]*(#.*)?$/ {
+      v = $0
+      sub(/^[[:space:]]*enabled[[:space:]]*=[[:space:]]*/, "", v)
+      sub(/[[:space:]].*$/, "", v)
+      print v
+      exit
+    }
+  ' "$CONFIG_FILE"
+}
+
+dots_token_file() {
+  if [ -n "${GBB_DOTS_TOKEN_FILE:-}" ]; then printf '%s' "$GBB_DOTS_TOKEN_FILE"; return; fi
+  printf '%s' "${XDG_CONFIG_HOME:-$HOME/.config}/dots-bridge/herdr_webhook_token"
+}
+dots_probe_origin() {
+  u="${GBB_DOTS_PROBE_URL:-http://127.0.0.1:8765/}"
+  printf '%s' "$u" | sed 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##; s#/.*##'
+}
+# is_dots_target <url> — the dots-bridge endpoint only, not every extra webhook.
+is_dots_target() {
+  [ "$(url_host "$1")" = "$(dots_probe_origin)" ]
+}
+
+# dots_eval — sets DOTS_ON (0|1) and DOTS_WHY. Cached for this process.
+dots_eval() {
+  [ "${DOTS_EVAL_DONE:-}" = 1 ] && return 0
+  DOTS_EVAL_DONE=1
+  DOTS_PROBE_OK=0
+  f=$(dots_token_file)
+  if [ ! -f "$f" ]; then
+    DOTS_PROBE_REASON="token file missing"
+  elif [ ! -s "$f" ]; then
+    DOTS_PROBE_REASON="token file empty"
+  else
+    dm=$(file_mode "$f")
+    case "$dm" in
+      600 | 400)
+        purl="${GBB_DOTS_PROBE_URL:-http://127.0.0.1:8765/}"
+        if curl -sS -o /dev/null --connect-timeout 1 --max-time 1 "$purl" 2>/dev/null; then
+          DOTS_PROBE_OK=1
+          DOTS_PROBE_REASON="listening at $(dots_probe_origin) and token file present"
+        else
+          DOTS_PROBE_REASON="not accepting connections at $(dots_probe_origin)"
+        fi
+        ;;
+      *) DOTS_PROBE_REASON="token file mode is ${dm:-unknown}, must be 600" ;;
+    esac
+  fi
+  ov=$(module_config_enabled dots)
+  DOTS_CONFIG="$ov"
+  if [ "$ov" = false ]; then
+    DOTS_ON=0
+    DOTS_WHY="disabled in config; $DOTS_PROBE_REASON"
+  elif [ "$ov" = true ]; then
+    DOTS_ON=1
+    if [ "$DOTS_PROBE_OK" = 1 ]; then DOTS_WHY="enabled in config; $DOTS_PROBE_REASON"; else DOTS_WHY="enabled in config; probe failed: $DOTS_PROBE_REASON"; fi
+  elif [ "$DOTS_PROBE_OK" = 1 ]; then
+    DOTS_ON=1
+    DOTS_WHY="$DOTS_PROBE_REASON"
+  else
+    DOTS_ON=0
+    DOTS_WHY="$DOTS_PROBE_REASON"
+  fi
+}
+
+# module_fill <id> — sets MOD_PROBE (0|1), MOD_ENABLED (0|1), MOD_CONFIG, MOD_REASON.
+module_fill() {
+  MOD_CONFIG=$(module_config_enabled "$1")
+  MOD_PROBE=0
+  MOD_REASON=""
+  case "$1" in
+    core)
+      MOD_PROBE=1
+      MOD_REASON="gbb core" ;;
+    herdr_tui)
+      if ! have_cmd "$HERDR"; then
+        MOD_REASON="herdr not on PATH"
+      elif herdr_server_up; then
+        MOD_PROBE=1
+        MOD_REASON="herdr status server running"
+      else
+        MOD_REASON="herdr server not running"
+      fi ;;
+    hc)
+      if ! have_cmd "$HC"; then
+        MOD_REASON="hc not on PATH"
+      elif hc_core_up; then
+        MOD_PROBE=1
+        MOD_REASON="hc server status returned a pid"
+      else
+        MOD_REASON="hc server not reachable"
+      fi ;;
+    dots)
+      dots_eval
+      MOD_PROBE=$DOTS_PROBE_OK
+      MOD_REASON=$DOTS_WHY
+      MOD_ENABLED=$DOTS_ON
+      MOD_CONFIG=$DOTS_CONFIG
+      return 0 ;;
+    *) MOD_REASON="unknown module"; return 0 ;;
+  esac
+  if [ "$MOD_CONFIG" = false ]; then
+    MOD_ENABLED=0
+    MOD_REASON="disabled in config; $MOD_REASON"
+  elif [ "$MOD_CONFIG" = true ]; then
+    MOD_ENABLED=1
+    if [ "$MOD_PROBE" = 1 ]; then MOD_REASON="enabled in config; $MOD_REASON"; else MOD_REASON="enabled in config; probe failed: $MOD_REASON"; fi
+  else
+    MOD_ENABLED=$MOD_PROBE
+  fi
+}
+
+module_json_one() {
+  module_fill "$1"
+  jq -nc --arg id "$1" --argjson probe_ok "$MOD_PROBE" --argjson enabled "$MOD_ENABLED" \
+    --arg cfg "$MOD_CONFIG" --arg reason "$MOD_REASON" \
+    '{id:$id, probe_ok:($probe_ok == 1), enabled:($enabled == 1),
+      config:(if $cfg == "" then null elif $cfg == "true" then true else false end), reason:$reason}'
+}
+modules_json() {
+  {
+    module_json_one core
+    module_json_one herdr_tui
+    module_json_one hc
+    module_json_one dots
+  } | jq -sc .
 }
 
 # resolve_launch_backend <explicit> — sets LAUNCH_BACKEND. Flag, else GBB_BACKEND, else config, else auto.
@@ -360,11 +516,22 @@ resolve_launch_backend() {
   case "$sel" in
     herdr | hc) LAUNCH_BACKEND=$sel; return 0 ;;
     "" | auto)
-      if hc_core_up; then LAUNCH_BACKEND=hc; return 0; fi
-      if have_cmd "$HERDR"; then
-        log "auto: hc is missing or its server did not start; launching on herdr"
+      ov_hc=$(module_config_enabled hc)
+      ov_h=$(module_config_enabled herdr_tui)
+      if [ "$ov_hc" != false ] && { [ "$ov_hc" = true ] || hc_core_up; }; then
+        LAUNCH_BACKEND=hc
+        return 0
+      fi
+      if [ "$ov_h" = false ]; then
+        die herdr_unavailable "hc is unavailable and herdr_tui is disabled in config"
+      fi
+      if [ "$ov_h" = true ] || herdr_server_up; then
+        log "auto: hc is missing, disabled, or its server did not start; launching on herdr"
         LAUNCH_BACKEND=herdr
         return 0
+      fi
+      if have_cmd "$HERDR"; then
+        die herdr_unavailable "herdr is installed but its server is not running (herdr status server)"
       fi
       die missing_dependency "hc server is not reachable and herdr was not found" ;;
     *) die usage "--backend / backend must be auto, herdr, or hc" ;;
@@ -1628,6 +1795,113 @@ cmd_reclaim_cli() {
   jq -cn --argjson e "$e" '{ok:true, entry:$e}'
 }
 
+# webhook_rows_json — name + host only. Dots-endpoint rows are inactive when that module is off.
+webhook_rows_json() {
+  dots_eval
+  {
+    purl="${GBB_WEBHOOK_URL:-$(cfg_get webhook_url)}"
+    if [ -n "$purl" ]; then
+      jq -nc --arg h "$(url_host "$purl")" '{name:"primary", host:$h, active:true, reason:null}'
+    else
+      jq -nc '{name:"primary", host:null, active:false, reason:"webhook_url is not set"}'
+    fi
+    cfg_owners | while IFS="$US" read -r on ou _ohn _ohv; do
+      [ -n "$on" ] || continue
+      act=true; why=""
+      if is_dots_target "$ou" && [ "$DOTS_ON" != 1 ]; then act=false; why="dots module off"; fi
+      jq -nc --arg n "owner:$on" --arg h "$(url_host "$ou")" --argjson a "$act" --arg w "$why" \
+        '{name:$n, host:$h, active:$a, reason:(if $w == "" then null else $w end)}'
+    done
+    i=0
+    cfg_extra_webhooks | while IFS="$US" read -r xu _xhn _xhv; do
+      i=$((i + 1))
+      act=true; why=""
+      if is_dots_target "$xu" && [ "$DOTS_ON" != 1 ]; then act=false; why="dots module off"; fi
+      jq -nc --arg n "extra:$i" --arg h "$(url_host "$xu")" --argjson a "$act" --arg w "$why" \
+        '{name:$n, host:$h, active:$a, reason:(if $w == "" then null else $w end)}'
+    done
+  } | jq -sc .
+}
+
+# One task row for `gbb report`. Live check only when that backend's module is on.
+report_task_row() {
+  e="$1"
+  be=$(entry_backend "$e")
+  pane=$(printf '%s' "$e" | jq -r '.pane_id // empty')
+  st=$(printf '%s' "$e" | jq -r '.last_status // empty')
+  alive=false; stale=true
+  if [ "$be" = hc ]; then
+    module_fill hc
+    if [ "$MOD_ENABLED" = 1 ]; then
+      js=$(hc_get_json "$pane" 2>/dev/null || true)
+      state=$(printf '%s' "$js" | jq -r '.state // empty' 2>/dev/null || true)
+      word=$(printf '%s' "$js" | jq -r 'if (.status|type) == "object" then (.status.state // empty) else empty end' 2>/dev/null || true)
+      if [ "$state" = live ]; then alive=true; stale=false; [ -n "$word" ] && st="$word"
+      elif [ "$state" = finished ]; then alive=false; stale=false
+      fi
+    fi
+  else
+    module_fill herdr_tui
+    if [ "$MOD_ENABLED" = 1 ]; then
+      ag=$("$HERDR" agent get "$pane" 2>/dev/null || true)
+      if printf '%s' "$ag" | jq -e '.result.agent' >/dev/null 2>&1; then
+        alive=true; stale=false
+        word=$(printf '%s' "$ag" | jq -r '.result.agent.agent_status // empty')
+        [ -n "$word" ] && st="$word"
+      else
+        alive=false; stale=false
+      fi
+    fi
+  fi
+  printf '%s' "$e" | jq -nc --argjson e "$e" --arg st "$st" --argjson alive "$alive" --argjson stale "$stale" \
+    '{task_id:($e.task_id // null), kind:($e.kind // null), backend:($e.backend // "herdr"),
+      owner:($e.owner // null), pane_id:($e.pane_id // null), status:(if $st == "" then null else $st end),
+      alive:$alive, stale:$stale, repo:($e.repo // null), worktree:($e.worktree // $e.cwd // null)}'
+}
+
+report_tasks_json() {
+  rows=$(registry_read | jq -c '.panes[]?' 2>/dev/null || true)
+  if [ -z "$rows" ]; then printf '[]'; return 0; fi
+  {
+    printf '%s\n' "$rows" | while IFS= read -r e; do
+      [ -n "$e" ] || continue
+      report_task_row "$e"
+    done
+  } | jq -sc .
+}
+
+hc_watch_running() {
+  pidf="$STATE_DIR/hc-watch.pid"
+  [ -f "$pidf" ] || return 1
+  old=$(cat "$pidf" 2>/dev/null || true)
+  [ -n "$old" ] && kill -0 "$old" 2>/dev/null
+}
+
+backend_effective() {
+  ov_hc=$(module_config_enabled hc)
+  ov_h=$(module_config_enabled herdr_tui)
+  be=$(cfg_get backend); be=${be:-auto}
+  case "$be" in
+    hc | herdr) printf '%s' "$be"; return 0 ;;
+  esac
+  if [ "$ov_hc" != false ] && { [ "$ov_hc" = true ] || hc_core_up; }; then printf 'hc'; return 0; fi
+  if [ "$ov_h" != false ] && { [ "$ov_h" = true ] || herdr_server_up; }; then printf 'herdr'; return 0; fi
+  printf 'none'
+}
+
+cmd_report() {
+  [ $# -eq 0 ] || die usage "gbb report takes no arguments"
+  mods=$(modules_json)
+  hooks=$(webhook_rows_json)
+  tasks=$(report_tasks_json)
+  watch=false; hc_watch_running && watch=true
+  be=$(cfg_get backend); be=${be:-auto}
+  jq -nc --arg host "$(host_name)" --arg v "$GBB_VERSION" --arg be "$be" --arg eff "$(backend_effective)" \
+    --argjson modules "$mods" --argjson webhooks "$hooks" --argjson tasks "$tasks" --argjson watch "$watch" \
+    '{ok:true, host:$host, version:$v, backend_default:$be, backend_effective:$eff,
+      modules:$modules, webhooks:$webhooks, hc_watch:{running:$watch}, tasks:$tasks}'
+}
+
 cmd_doctor() {
   url="$(cfg_get webhook_url)"; host=""
   [ -n "$url" ] && host=$(printf '%s' "$url" | sed 's#^[a-z]*://##; s#/.*##')
@@ -1635,6 +1909,7 @@ cmd_doctor() {
   linked=$("$HERDR" plugin list 2>/dev/null | grep -c "$PLUGIN_ID" || true)
   hcver=""; have_cmd "$HC" && hcver=$("$HC" --version 2>/dev/null | head -n 1)
   be=$(cfg_get backend); be=${be:-auto}
+  mods=$(modules_json)
   jq -cn --arg v "$GBB_VERSION" --arg cfg "$CONFIG_FILE" --arg mode "$mode" --arg host "$host" \
     --arg hn "$(cfg_get webhook_header_name)" --arg hv "$( [ -n "$(cfg_get webhook_header_value)" ] && echo set)" \
     --arg herdr "$("$HERDR" --version 2>/dev/null)" --arg hcver "$hcver" --arg be "$be" \
@@ -1642,8 +1917,10 @@ cmd_doctor() {
     --arg xhosts "$(cfg_extra_webhooks | while IFS="$US" read -r xu _xn _xv; do url_host "$xu"; printf ' '; done)" \
     --arg reg "$REGISTRY" --arg log "$LOG" --argjson linked "${linked:-0}" --arg allow "$(cfg_list allowed_repos | tr '\n' ' ')" \
     --arg owners "$(cfg_owners | while IFS="$US" read -r on ou _hn ohv; do printf '%s\t%s\t%s\n' "$on" "$(url_host "$ou")" "$( [ -n "$ohv" ] && echo set)"; done)" \
-    --argjson cargs "$(cfg_array codex_args | jq -R . | jq -sc .)" --arg cdef "$(codex_user_defaults)" '
+    --argjson cargs "$(cfg_array codex_args | jq -R . | jq -sc .)" --arg cdef "$(codex_user_defaults)" \
+    --argjson modules "$mods" '
     {ok:true, version:$v, herdr:$herdr, hc:(if $hcver == "" then null else $hcver end), backend:$be,
+     modules:$modules,
      jq:$jq, curl:($curl != ""), plugin_linked:($linked > 0),
      config:{path:$cfg, exists:($mode != ""), mode:(if $mode=="" then null else $mode end), mode_ok:($mode=="600" or $mode=="400"),
        webhook_host:(if $host=="" then null else $host end), header_name:(if $hn=="" then null else $hn end), header_value_set:($hv=="set"),
@@ -1688,7 +1965,9 @@ gbb — Grok Bot bridge for Herdr and herdr-core (JSON output)
   gbb wait <task|pane> [--until S]... [--timeout MS]
   gbb result <task|pane>          gbb stop <task|pane>
   gbb handover --pane <id> [--note <text>] [--owner <name>] [--backend herdr|hc]    gbb reclaim --pane <id>
-  gbb doctor                      gbb test-webhook [--owner <name>]
+  gbb doctor                      gbb report
+  gbb test-webhook [--owner <name>]
+  gbb report                      machine-readable module, webhook, and task status (no secrets)
 Internal: gbb hook (Herdr TUI plugin event), gbb action handover|reclaim,
           gbb hc-watch (follow hc events for managed terminals)
 U
@@ -1712,6 +1991,7 @@ case "$cmd" in
   handover) cmd_handover_cli "$@" ;;
   reclaim) cmd_reclaim_cli "$@" ;;
   doctor) cmd_doctor ;;
+  report) cmd_report "$@" ;;
   test-webhook) cmd_test_webhook "$@" ;;
   hc-watch) cmd_hc_watch "$@" ;;
   version | --version) jq -cn --arg v "$GBB_VERSION" '{ok:true,version:$v}' ;;
