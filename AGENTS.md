@@ -22,6 +22,7 @@ Every commit and pull request must leave enough context that later work can trac
 - `tests/webhook-test.sh` — offline primary + `[[extra_webhooks]]` delivery test against a local HTTP sink.
 - `tests/owner-test.sh` — offline owner routing / fallback / extra dedupe test against a local HTTP sink (~25 s).
 - `tests/screen-test.sh` — offline Codex screen handling (hooks review, queued question, fresh session, `gbb answer`, pending launch prompt) with a stubbed `herdr` that draws Codex 0.166 screens.
+- `tests/hc-backend-test.sh` — offline herdr-core backend (command construction, `hc events` → callbacks, backend selection, legacy registry rows).
 - `docs/decisions/` — ADRs.
 
 ## Guardrails (do not weaken without an ADR)
@@ -31,7 +32,7 @@ Every commit and pull request must leave enough context that later work can trac
 - Webhook payloads carry ids and status only: no terminal output, no prompts, no environment, no secrets.
 - The auth header is passed to curl via stdin config so it never appears in `ps`. Logs record the host, never the URL path or header.
 - `gbb stop` closes only workspaces gbb created (and only when they still hold just the managed pane). Handover panes are unregistered, never closed.
-- Never run `herdr server stop`. Never touch panes that are not managed.
+- Never run `herdr server stop` or `hc server stop`. Never touch panes or hc terminals that are not managed. `gbb stop` on the hc backend kills and removes only terminals gbb created; handover terminals are unlabeled and unregistered, never killed.
 - Never answer the Grok "Help improve Grok" banner with Opt in.
 - Never type a prompt into a Codex dialog (digits / letters pick options). Never choose a dialog option (e.g. trust hooks) without an explicit `gbb answer` / `gbb keys` from the caller.
 - Callbacks follow the task owner (docs/decisions/0004): owner target first, the primary webhook as fallback, extras unchanged except URL dedupe. A failed owner delivery must still reach the primary.
