@@ -76,6 +76,10 @@ next_generation() {
   pane="${1:-}"
   [ -n "$pane" ] || pane=__none__
   lock
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>>"$STATE_DIR/.gen.lock"
+    flock 9
+  fi
   seq=$(SEQ_FILE)
   [ -s "$seq" ] || printf '%s\n' '{"version":1,"panes":{}}' >"$seq"
   tmp="$seq.tmp.$$"
@@ -85,8 +89,8 @@ next_generation() {
     return 1
   fi
   n=$(jq -r '.n' "$tmp")
-  jq '.doc' "$tmp" >"$seq" && chmod 600 "$seq"
-  rm -f "$tmp"
+  jq '.doc' "$tmp" >"$tmp.doc" && mv "$tmp.doc" "$seq" && chmod 600 "$seq"
+  rm -f "$tmp" "$tmp.doc"
   unlock
   printf '%s' "$n"
 }

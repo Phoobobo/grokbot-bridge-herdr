@@ -71,13 +71,16 @@ class H(http.server.BaseHTTPRequestHandler):
         rec = {"path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}, "body": json.loads(body)}
         with open(os.path.join(out, self.path.strip("/") + ".jsonl"), "a") as f:
             f.write(json.dumps(rec) + "\n")
+            f.flush()
         if self.path == "/slow":
             time.sleep(3)
         self.send_response(500 if self.path == "/slow" else 202)
         self.end_headers()
     def log_message(self, *a):
         pass
-s = http.server.HTTPServer(("127.0.0.1", 0), H)
+class S(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+s = S(("127.0.0.1", 0), H)
 print(s.server_address[1], flush=True)
 s.serve_forever()
 PY
@@ -257,14 +260,17 @@ after_seq=$(jq -r '[.panes[]] | add' "$T/state/event-seq.json")
 [ "$after_seq" -ge $((before_seq + 2)) ] || fail "restart did not persist generation ($before_seq -> $after_seq)"
 ids=$(jq -r .body.event_id "$T/hits/primary.jsonl" | sort -u | wc -l)
 [ "$ids" -ge 2 ] || fail "two processes produced one event_id"
+seq_before=$(jq -r '.panes.__none__ // 0' "$T/state/event-seq.json")
 rm -f "$T/hits"/*
 "$BAC" test-webhook >/dev/null &
 p1=$!
 "$BAC" test-webhook >/dev/null &
 p2=$!
 wait "$p1" "$p2"
-par=$(jq -r .body.event_id "$T/hits/primary.jsonl" | sort -u | wc -l)
-[ "$par" -ge 2 ] || fail "concurrent stamps collided: $(jq -c .body.event_id "$T/hits/primary.jsonl")"
+seq_after=$(jq -r '.panes.__none__ // 0' "$T/state/event-seq.json")
+[ "$seq_after" -eq $((seq_before + 2)) ] || fail "concurrent generation $seq_before -> $seq_after"
+par=$(jq -r .body.event_id "$T/hits/primary.jsonl" | sort -u | wc -l | tr -d ' ')
+[ "$par" -eq 2 ] || fail "concurrent stamps collided: $(jq -c .body.event_id "$T/hits/primary.jsonl")"
 jq -e '.panes | all(.[]; type=="number")' "$T/state/event-seq.json" >/dev/null || fail "event-seq corrupted"
 
 # --- model config is opt-in and allowlisted; a Codex footer is an observation, not a quota ---
