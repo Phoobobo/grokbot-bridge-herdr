@@ -1,0 +1,13 @@
+{
+  "expect": "owner_mismatch",
+  "mutates": false,
+  "body": {
+    "ok": false,
+    "error": {
+      "code": "owner_mismatch",
+      "message": "pane is owned by another caller",
+      "owner": "dot",
+      "caller_owner": "canmouzhang"
+    }
+  }
+}

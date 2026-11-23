@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased — contract only
+
+BotAsCollie (CLI `bac`) v1 contract, JSON fixtures, and an offline checker. The running CLI, plugin id, webhook `source`, and config paths in this tree stay `gbb` 0.3.3. See `docs/bac/v1/CONTRACT.md`. Nothing here is a release.
+
 ## 0.3.3 — 2026-11-03
 
 Pick the Herdr space from where its terminals were launched, not from the space's folder field.

@@ -1,0 +1,12 @@
+{
+  "expect": "kind_error",
+  "body": {
+    "ok": false,
+    "error": {
+      "code": "kind_unsupported",
+      "message": "kind pi is not implemented",
+      "kind": "pi",
+      "kind_support": "rejected"
+    }
+  }
+}

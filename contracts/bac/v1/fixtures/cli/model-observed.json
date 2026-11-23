@@ -1,0 +1,10 @@
+{
+  "expect": "model",
+  "model": {
+    "id": "GPT-6.1-Sol xhigh",
+    "provenance": "observed",
+    "observed_at": "2026-11-23T00:00:00Z",
+    "freshness": "fresh",
+    "freshness_sec": 12
+  }
+}

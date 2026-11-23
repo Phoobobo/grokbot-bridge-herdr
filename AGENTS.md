@@ -1,6 +1,10 @@
 # AGENTS.md — grokbot-bridge-herdr
 
-Herdr plugin + `gbb` CLI that let Grok Bot drive and watch coding agents (grok, codex) in Herdr panes on the user's machine. ChatGPT dots use the same `gbb` through the companion MCP server [dots-tunnel-bridge](https://github.com/Phoobobo/dots-tunnel-bridge) (fork of uezo/dots-bridge, exposed via OpenAI Secure MCP Tunnel), whose `gbb_*` tools call these subcommands and whose `/herdr/webhook` receives `[[extra_webhooks]]` and the `dot` owner target — keep `gbb`'s JSON output, subcommand flags and webhook payload compatible with it (see `docs/decisions/0003`).
+Herdr plugin + `gbb` CLI that let Grok Bot drive and watch coding agents (grok, codex) in Herdr panes on the user's machine. ChatGPT dots use the same `gbb` through the companion MCP server [dots-tunnel-bridge](https://github.com/Phoobobo/dots-tunnel-bridge) (fork of uezo/dots-bridge, exposed via OpenAI Secure MCP Tunnel), whose `gbb_*` tools call these subcommands and whose `/herdr/webhook` receives `[[extra_webhooks]]` and the `dot` owner target — keep `gbb`'s JSON output, subcommand flags and webhook payload compatible with it (see `docs/decisions/0003`) until the BotAsCollie cutover below.
+
+## BotAsCollie v1 (contract only, not the running CLI)
+
+The program in this tree is still `gbb` 0.3.3. The breaking target is BotAsCollie, CLI `bac`, frozen in `docs/bac/v1/CONTRACT.md`, `docs/bac/v1/MIGRATION.md`, and `contracts/bac/v1/` (`docs/decisions/0008`). It is not implemented. Do not add a tool that drives `hc` except through that future `bac`. Do not keep a `gbb` alias as the end state. The next phase implements `bac` on the same branch; until `contracts/bac/v1/identity.json` says `runtime_implemented` is true, dots-tunnel-bridge still calls `gbb` and still requires webhook `source` `grokbot-bridge-herdr`.
 
 ## Change context (required)
 
@@ -24,6 +28,8 @@ Every commit and pull request must leave enough context that later work can trac
 - `tests/screen-test.sh` — offline Codex screen handling (hooks review, queued question, fresh session, `gbb answer`, pending launch prompt) with a stubbed `herdr` that draws Codex 0.166 screens.
 - `tests/hc-backend-test.sh` — offline herdr-core backend (command construction, `hc events` → callbacks, backend selection, legacy registry rows).
 - `tests/place-test.sh` — offline Herdr-app placement for hc launches and handover (stubbed `hc` and `herdr-app`).
+- `tests/bac-contract-test.sh` — offline BotAsCollie v1 contract check (fixtures, baseline observations, registry migration). Does not run `bac`.
+- `docs/bac/v1/` — BotAsCollie v1 contract and migration checklist. `contracts/bac/v1/` — machine-readable fixtures.
 - `docs/decisions/` — ADRs.
 
 ## Guardrails (do not weaken without an ADR)

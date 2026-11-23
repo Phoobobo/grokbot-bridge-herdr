@@ -1,0 +1,101 @@
+{
+  "contract": "bac.v1",
+  "environment": "fixture",
+  "ran": false,
+  "not_run": [
+    "bac binary",
+    "dots MCP",
+    "ChatGPT refresh",
+    "live Herdr",
+    "live hc",
+    "real webhook",
+    "user config"
+  ],
+  "callers": ["grok-bot", "dots"],
+  "scenarios": [
+    {
+      "id": "grok-bot-primary",
+      "caller": "grok-bot",
+      "environment": "fixture",
+      "ran": false,
+      "steps": [
+        {
+          "op": "launch",
+          "argv": ["bac", "launch", "--repo", "/tmp/fixture-repo", "--kind", "grok", "--task", "demo", "--prompt", "say hi", "--no-worktree"]
+        },
+        {"op": "status", "argv": ["bac", "status", "demo"]},
+        {"op": "result", "argv": ["bac", "result", "demo"]},
+        {"op": "callback", "route": "primary", "event": "agent_status", "source": "bot-as-collie", "version": 1}
+      ]
+    },
+    {
+      "id": "dots-launch-and-handover",
+      "caller": "dots",
+      "environment": "fixture",
+      "ran": false,
+      "steps": [
+        {
+          "op": "launch",
+          "argv": ["bac", "launch", "--repo", "/tmp/fixture-repo", "--kind", "codex", "--task", "fix-login", "--prompt", "draft pr only", "--owner", "dot"]
+        },
+        {
+          "op": "handover",
+          "argv": ["bac", "handover", "--pane", "w1:p1", "--owner", "dot"]
+        },
+        {
+          "op": "handover-hc",
+          "argv": ["bac", "handover", "--pane", "t9", "--owner", "dot"],
+          "note": "hc address has no colon. Today's dots PANE_RE rejects it; bac_handover must accept it."
+        },
+        {"op": "status", "argv": ["bac", "status", "fix-login", "--owner", "dot"]},
+        {"op": "result", "argv": ["bac", "result", "fix-login", "--owner", "dot"]},
+        {"op": "callback", "route": "owner", "owner": "dot", "event": "agent_status", "source": "bot-as-collie", "version": 1}
+      ]
+    },
+    {
+      "id": "cross-owner",
+      "caller": "dots",
+      "environment": "fixture",
+      "ran": false,
+      "mutates": false,
+      "steps": [
+        {
+          "op": "send",
+          "argv": ["bac", "send", "demo", "--owner", "dot", "steal"],
+          "row_owner": "canmouzhang",
+          "expect": {"ok": false, "error": {"code": "owner_mismatch"}},
+          "registry_unchanged": true
+        },
+        {
+          "op": "read",
+          "argv": ["bac", "read", "demo", "--owner", "dot"],
+          "row_owner": "canmouzhang",
+          "expect": {"ok": false, "error": {"code": "owner_mismatch"}},
+          "registry_unchanged": true
+        }
+      ]
+    },
+    {
+      "id": "duplicate-and-timeout",
+      "caller": "dots",
+      "environment": "fixture",
+      "ran": false,
+      "event_id": "5cb0047d8b5de61f00884bcd7272a2330f697d3e91e836002c6a8144d794f0f8",
+      "attempt": 1,
+      "retry_same_target": false,
+      "on_timeout": "one fallback to primary, same event_id, fallback_reason owner_delivery_failed",
+      "http_202_is_success": true,
+      "dots_202_without_subscription_does_not_queue": true,
+      "dedupe_key": "event_id"
+    },
+    {
+      "id": "restart",
+      "caller": "bac",
+      "environment": "fixture",
+      "ran": false,
+      "replay_undelivered": false,
+      "delivery": "at_most_once",
+      "after_restart": "emit a new generation only when the observed status differs from last_status"
+    }
+  ]
+}
