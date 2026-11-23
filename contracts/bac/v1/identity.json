@@ -1,6 +1,6 @@
 {
   "contract": "bac.v1",
-  "runtime_implemented": false,
+  "runtime_implemented": true,
   "git_repo": "Phoobobo/grokbot-bridge-herdr",
   "repo_renamed": false,
   "published": false,

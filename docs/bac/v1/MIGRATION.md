@@ -44,7 +44,13 @@
 - 桥：把 `source` 检查和工具名改回 `gbb`，再 Refresh tools。
 - 不使用 `herdr server stop` 或 `hc server stop` 作为回退。
 
-## 离线迁移工具
+## 离线迁移工具（不是生产切换）
+
+生产切换仍是部署阻塞项：这个工具不改 hc 上已有的标签，不读用户家里的配置，也不覆盖已经存在的目标文件。人在维护窗口用副本确认之后，再自行停掉旧进程。不要把 fixture 跑通当成已经可以改用户机器。
+
+`bac migrate --fixture <src-dir> --dest <dst-dir>` 调用 `contracts/bac/v1/migrate-fixture.sh`。
+
+Dots 侧：`--owner` 必须由桥用已认证主体填上（配置里的 owner，而不是模型或客户端传来的参数）。bac 自己不提供认证服务。
 
 `contracts/bac/v1/migrate-fixture.sh <src-dir> <dst-dir>`
 

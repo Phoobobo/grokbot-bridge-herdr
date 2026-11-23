@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased — contract only
+## Unreleased — bac 1.0.0
 
-BotAsCollie (CLI `bac`) v1 contract, JSON fixtures, and an offline checker. The running CLI, plugin id, webhook `source`, and config paths in this tree stay `gbb` 0.3.3. See `docs/bac/v1/CONTRACT.md`. Nothing here is a release.
+The running command is `bac`. Webhook `source` is `bot-as-collie` and callback `version` is the integer 1. There is no `gbb` binary. See `docs/bac/v1/CONTRACT.md` for the v1 revisions after `ae859908` (durable generation, per-target `attempt`, owner is not authentication). Not a published release.
 
 ## 0.3.3 — 2026-11-03
 

@@ -1,6 +1,7 @@
 #!/bin/sh
-# Offline gbb registry fixture -> bac.registry.v1.
-# Refuses live config/state directories. Does not read config, tokens, or secrets.
+# Offline fixture migration of a gbb registry (and an optional allowlisted config) into bac.registry.v1.
+# This is not a production cutover tool: it refuses live directories and refuses to overwrite
+# an existing destination. A failed run leaves the source byte-for-byte unchanged.
 # Exit 0 written, 1 validation (source untouched, dest not written), 2 refused.
 set -eu
 ROOT=$(cd "$(dirname "$0")" && pwd -P)
@@ -72,9 +73,38 @@ if ! jq -e -f "$FILTER" "$reg" >"$tmp" 2>"$err"; then
   cat "$err" >&2
   exit 1
 fi
+cfg_tmp=""
+if [ -f "$src_real/config.toml" ]; then
+  cfg_tmp=$(mktemp)
+  # Allowlisted keys and the owner/extra/module tables only. Unknown top-level keys fail the run.
+  if ! awk '
+    function flush() { }
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ { print; next }
+    /^[[:space:]]*\[\[(owners|extra_webhooks)\]\]/ { in_t=1; print; next }
+    /^[[:space:]]*\[(owners\.|modules\.)/ { in_t=1; print; next }
+    /^[[:space:]]*\[/ { print "bad table " $0 > "/dev/stderr"; exit 1 }
+    in_t && /^[[:space:]]*(name|url|header_name|header_value|enabled)[[:space:]]*=/ { print; next }
+    in_t { print "bad table key " $0 > "/dev/stderr"; exit 1 }
+    /^[[:space:]]*(webhook_url|webhook_header_name|webhook_header_value|webhook_timeout_sec|debounce_sec|backend|startup_settle_sec|startup_ready_timeout_sec|allowed_repos|codex_args|grok_args)[[:space:]]*=/ { print; next }
+    { print "bad key " $0 > "/dev/stderr"; exit 1 }
+  ' "$src_real/config.toml" >"$cfg_tmp"; then
+    echo "migrate_failed" >&2
+    rm -f "$cfg_tmp"
+    exit 1
+  fi
+fi
+if [ -e "$dst_real/managed.json" ] || [ -e "$dst_real/config.toml" ]; then
+  echo "refuse: destination already exists" >&2
+  rm -f "$cfg_tmp"
+  exit 2
+fi
 mkdir -p "$dst_real"
 out="$dst_real/managed.json"
 mv "$tmp" "$out"
 chmod 600 "$out"
+if [ -n "$cfg_tmp" ]; then
+  mv "$cfg_tmp" "$dst_real/config.toml"
+  chmod 600 "$dst_real/config.toml"
+fi
 trap 'rm -f "$err"' EXIT
 echo "ok $out"

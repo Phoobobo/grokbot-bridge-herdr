@@ -21,6 +21,10 @@ A full rename in the same turn would change the running identity before the brid
 - An offline fixture migrator may mention `gbb`. It refuses live state directories, preserves owner and pane id, and leaves the source untouched on failure.
 - The git repository is not renamed and nothing is published.
 
+## Revision after ae859908
+
+The implementation kept the event_id inputs. Generation is now stored in `event-seq.json` and is not cleared by reclaim or process exit, so a reused pane id does not collide. Delivery is one attempt per target (`attempt` stays 1); owner failure also posts the same `event_id` to the primary, so one logical consumer of both can see two copies and must dedupe. Restart still does not replay an unstamped event. `--owner` is documented as a local label, not authentication. Extras and the primary fallback stay trusted metadata receivers. The Codex `model` key is read only when `BAC_ALLOW_CODEX_CONFIG=1`.
+
 ## Consequences
 
 - Installing this branch still installs `gbb` 0.3.3. Dots keeps working only while it still calls `gbb`.

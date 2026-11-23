@@ -1,29 +1,31 @@
 # grokbot-bridge-herdr
 
+命令行是 `bac`（BotAsCollie）。仓库名不变。契约与迁移见 `docs/bac/v1/CONTRACT.md`。Dots 桥还要按那份清单单独改，改完之前不要当成两端已经可用。
+
 [中文](#中文) · [English](#english)
 
 ## 中文
 
 让 Grok Bot 通过 [Herdr](https://herdr.dev) 驱动和监控你本机的编码 agent（grok、codex），并且可以把你自己的某些窗格交给 Grok Bot 接管、随时收回。
 
-> **也可以给 ChatGPT dots 用。** 除了 Grok Bot，ChatGPT 的 dot 也能用同一套 gbb 驱动本机 agent、接收状态推送。这要借助配套的 MCP 服务 **[dots-tunnel-bridge](https://github.com/Phoobobo/dots-tunnel-bridge)**（基于 [uezo/dots-bridge](https://github.com/uezo/dots-bridge) 的 fork），它跑在本机 `127.0.0.1`，经 **OpenAI Secure MCP Tunnel** 暴露给 ChatGPT（无入站端口）。见下文 [配合 ChatGPT dots 使用](#配合-chatgpt-dots-使用)。
+> **也可以给 ChatGPT dots 用。** 除了 Grok Bot，ChatGPT 的 dot 也能用同一套 bac 驱动本机 agent、接收状态推送。这要借助配套的 MCP 服务 **[dots-tunnel-bridge](https://github.com/Phoobobo/dots-tunnel-bridge)**（基于 [uezo/dots-bridge](https://github.com/uezo/dots-bridge) 的 fork），它跑在本机 `127.0.0.1`，经 **OpenAI Secure MCP Tunnel** 暴露给 ChatGPT（无入站端口）。见下文 [配合 ChatGPT dots 使用](#配合-chatgpt-dots-使用)。
 
 - **状态回调**：Herdr 插件监听 `pane.agent_status_changed`，只对“托管窗格”生效；agent 进入 `done` / `idle` / `blocked` 时向 Grok Bot 的 webhook 发一条很小的 JSON（不含终端输出、不含密钥），带去重，后台 curl 不会卡住 Herdr。
-- **托管窗格登记表**：`~/.local/state/grokbot-bridge-herdr/managed.json`，按 pane id 记录 task、agent 名称、类型、仓库、worktree、来源（launched / handover）。
+- **托管窗格登记表**：`~/.local/state/bot-as-collie/managed.json`，按 pane id 记录 task、agent 名称、类型、仓库、worktree、来源（launched / handover）。
 - **交接 / 收回**：在 Herdr 命令面板对当前窗格执行 “Grok Bot: take over this pane” 或 “Grok Bot: give this pane back to me”。托管窗格会显示 `🤖 Grok Bot: <task>` 标记。
-- **`gbb` 命令行**：Grok Bot 通过远程 shell 调用，全部 JSON 输出：`launch / list / status / read / send / answer / keys / owner / wait / result / stop / handover / reclaim / doctor / test-webhook`。
-- **谁启动、回调给谁（owner）**：`gbb launch --owner <名字>`（或环境变量 `GBB_OWNER`）记录任务的 owner；配置里的 `[[owners]]` 给每个 owner 一个 webhook。状态变化只发给该 owner；没有 owner、owner 没配置或投递失败时回落到主 webhook（payload 带 `owner`、`route`、`fallback_reason`）。见下文 [多个调用方](#多个调用方owner-回调)。
+- **`bac` 命令行**：Grok Bot 通过远程 shell 调用，全部 JSON 输出：`launch / list / status / read / send / answer / keys / owner / wait / result / stop / handover / reclaim / doctor / test-webhook`。
+- **谁启动、回调给谁（owner）**：`bac launch --owner <名字>`（或环境变量 `BAC_OWNER`）记录任务的 owner；配置里的 `[[owners]]` 给每个 owner 一个 webhook。状态变化只发给该 owner；没有 owner、owner 没配置或投递失败时回落到主 webhook（payload 带 `owner`、`route`、`fallback_reason`）。见下文 [多个调用方](#多个调用方owner-回调)。
 
 ### 安装
 
 ```sh
 git clone git@github.com:Phoobobo/grokbot-bridge-herdr.git ~/Workspace/grokbot-bridge-herdr
-cd ~/Workspace/grokbot-bridge-herdr && ./install.sh      # 软链 gbb 到 ~/.local/bin，并 herdr plugin link
-mkdir -p ~/.config/grokbot-bridge-herdr
-cp config.example.toml ~/.config/grokbot-bridge-herdr/config.toml
-chmod 600 ~/.config/grokbot-bridge-herdr/config.toml     # 不是 600 就拒绝发送
+cd ~/Workspace/grokbot-bridge-herdr && ./install.sh      # 软链 bac 到 ~/.local/bin，并 herdr plugin link
+mkdir -p ~/.config/bot-as-collie
+cp config.example.toml ~/.config/bot-as-collie/config.toml
+chmod 600 ~/.config/bot-as-collie/config.toml     # 不是 600 就拒绝发送
 # 编辑 config.toml：填 webhook_url、webhook_header_name、webhook_header_value（从 Grok Bot routine 面板复制）
-gbb doctor && gbb test-webhook
+bac doctor && bac test-webhook
 ```
 
 依赖：jq、git、curl，以及 **herdr ≥ 0.9.0（TUI）或 hc ≥ 0.1.16（herdr-core，Herdr app 的运行时）**，有一个即可。新任务默认走 hc（`hc server status` 能连上或能拉起 core 时）；hc 不在或 core 起不来才退回 TUI。已经在登记表里的 TUI 任务仍走 herdr（见下文 [Herdr app](#herdr-app-herdr-core)）。卸载：`./uninstall.sh`（保留配置、登记表、日志和 worktree）。
@@ -48,38 +50,38 @@ description = "take pane back from Grok Bot"
 
 ### 安全边界
 
-- 只处理登记过的窗格；`gbb stop` 只关闭 gbb 自己创建的工作区，交接来的窗格只注销、不关闭。
+- 只处理登记过的窗格；`bac stop` 只关闭 bac 自己创建的工作区，交接来的窗格只注销、不关闭。
 - 从不执行 `herdr server stop`；从不在 Grok 的 “Help improve Grok” 横幅上选 Opt in。
 - webhook 只含 id 和状态；鉴权 header 通过 stdin 传给 curl，不出现在进程列表；日志只记录主机名。
-- 可选 `allowed_repos` 限制 `gbb launch` 能用的仓库。
+- 可选 `allowed_repos` 限制 `bac launch` 能用的仓库。
 
 ### 配合 ChatGPT dots 使用
 
-配套的 MCP 服务 [dots-tunnel-bridge](https://github.com/Phoobobo/dots-tunnel-bridge)（fork 自 [uezo/dots-bridge](https://github.com/uezo/dots-bridge)，经 OpenAI Secure MCP Tunnel 暴露给 ChatGPT）把 `gbb` 包装成 MCP 工具，让 ChatGPT 的 dot 也能驱动本机 coding agent。工具实现在 dots-tunnel-bridge 的 `src/dots_bridge/herdr_tools.py`，设 `DOTS_BRIDGE_HERDR_TOOLS=1` 才启用；完整说明见它的 [docs/HERDR.md](https://github.com/Phoobobo/dots-tunnel-bridge/blob/main/docs/HERDR.md)。
+配套的 MCP 服务 [dots-tunnel-bridge](https://github.com/Phoobobo/dots-tunnel-bridge)（fork 自 [uezo/dots-bridge](https://github.com/uezo/dots-bridge)，经 OpenAI Secure MCP Tunnel 暴露给 ChatGPT）把 `bac` 包装成 MCP 工具，让 ChatGPT 的 dot 也能驱动本机 coding agent。工具实现在 dots-tunnel-bridge 的 `src/dots_bridge/herdr_tools.py`，设 `DOTS_BRIDGE_HERDR_TOOLS=1` 才启用；完整说明见它的 [docs/HERDR.md](https://github.com/Phoobobo/dots-tunnel-bridge/blob/main/docs/HERDR.md)。
 
 设置步骤：
 
-1. 按本 README 安装 gbb，`gbb doctor` 正常。
+1. 按本 README 安装 gbb，`bac doctor` 正常。
 2. 按 [dots-tunnel-bridge README](https://github.com/Phoobobo/dots-tunnel-bridge#安装人工步骤) 装好 bridge + tunnel-client，并在 ChatGPT 里添加该 MCP server（Connection: Tunnel）。
 3. 生成 token 文件 `~/.config/dots-bridge/herdr_webhook_token`（mode 600），在 bridge 的 plist 里打开 `DOTS_BRIDGE_HERDR_TOOLS=1` 并重启 bridge。
-4. 在 `~/.config/grokbot-bridge-herdr/config.toml` 末尾加 `[[extra_webhooks]]`（见下方 English 部分的示例），`gbb test-webhook` 测试。
+4. 在 `~/.config/bot-as-collie/config.toml` 末尾加 `[[extra_webhooks]]`（见下方 English 部分的示例），`bac test-webhook` 测试。
 5. ChatGPT 插件页 **Refresh** 工具，确认出现 13 个 `gbb_*`；让 dot 订阅 `app.message.created`（channel `herdr`，否则落到 `default`）。
 
 要点：
 
 - 工具：`gbb_list` / `gbb_status` / `gbb_read` / `gbb_result` / `gbb_doctor` / `gbb_wait`（最长 120 秒）只读；`gbb_launch`（自动附加“只开 draft PR”的要求，并带 `--owner dot`）/ `gbb_send` / `gbb_answer` / `gbb_keys` / `gbb_stop` / `gbb_handover` / `gbb_reclaim` 会改动状态。
 - 回调归属：dot 启动的任务 owner 为 `dot`，配好 `[[owners]] name = "dot"` 后只回调给 dot（失败才回落到 Grok Bot 的主 webhook），见上文 [多个调用方](#多个调用方owner-回调)。
-- 每个工具都以参数列表调用 `gbb`（不经过 shell），带超时和输入校验；send/keys/stop/reclaim 只作用于托管窗格，默认保护工作区 `wAS`、`wAT`（除非窗格是主动交接的）。
-- 状态推送：在 `config.toml` 末尾加 `[[extra_webhooks]]`，指向 `http://127.0.0.1:8765/herdr/webhook`，header `X-Dots-Herdr-Token`，值为 `~/.config/dots-bridge/herdr_webhook_token` 的内容。gbb 对每个目标各发一份相同的 payload，原 Grok Bot webhook 不受影响；dots-tunnel-bridge 只接受本机请求，并把它变成 `herdr`（没有则 `default`）频道的 `app.message.created` 消息，`metadata.source = "herdr"`。
+- 每个工具都以参数列表调用 `bac`（不经过 shell），带超时和输入校验；send/keys/stop/reclaim 只作用于托管窗格，默认保护工作区 `wAS`、`wAT`（除非窗格是主动交接的）。
+- 状态推送：在 `config.toml` 末尾加 `[[extra_webhooks]]`，指向 `http://127.0.0.1:8765/herdr/webhook`，header `X-Dots-Herdr-Token`，值为 `~/.config/dots-bridge/herdr_webhook_token` 的内容。bac 对每个目标各发一份相同的 payload，原 Grok Bot webhook 不受影响；dots-tunnel-bridge 只接受本机请求，并把它变成 `herdr`（没有则 `default`）频道的 `app.message.created` 消息，`metadata.source = "herdr"`。
 - 改了工具后要在 ChatGPT 插件页刷新（Refresh）dot 的工具。设计见 [docs/decisions/0003](docs/decisions/0003-dots-bridge-tools-and-extra-webhooks.md)。
-- **herdr-core：** dot 的 13 个 `gbb_*` 工具不用改。`gbb_launch` 不传 `--backend`，所以新任务跟着这台机器的默认：`auto` 时 hc 可用就进 hc。回调仍是同一份 JSON，打到同一个 `/herdr/webhook`；多一个 `backend` 字段，旧的接收端可以忽略。已经在登记表里的 TUI 任务不会被改到 hc，钩子和 `hc events` 可以同时跑。
+- **herdr-core：** 新任务在 `auto` 且 hc 可用时进 hc。已经在登记表里的 TUI 任务不会被改到 hc。Dots 今天的 13 个 `gbb_*` 还要按 `docs/bac/v1/MIGRATION.md` 改成 `bac_*` 并接受 `source` `bot-as-collie`，改完要在 ChatGPT 里 Refresh。在那之前桥仍拒绝新回调。
 
 ### 多个调用方（owner 回调）
 
 同一台机器上可能有几个调用方在用 gbb：你的 Grok Bot、另一个 Grok Bot（比如“参谋长”）、ChatGPT dot。给任务标上 owner，回调就只发给启动它的人：
 
 ```toml
-# ~/.config/grokbot-bridge-herdr/config.toml 末尾（mode 600）
+# ~/.config/bot-as-collie/config.toml 末尾（mode 600）
 [[owners]]
 name = "dot"                                   # dots-tunnel-bridge 的 gbb_launch 自动带 --owner dot
 url = "http://127.0.0.1:8765/herdr/webhook"
@@ -93,22 +95,22 @@ header_name = "<routine 面板上的 header 名>"
 header_value = "<routine 面板上的 key>"
 ```
 
-- 启动：`gbb launch ... --owner canmouzhang`，或先 `export GBB_OWNER=canmouzhang`；`gbb handover --owner`、`gbb owner <task> <名字>|--clear` 可补设/改。
+- 启动：`bac launch ... --owner canmouzhang`，或先 `export BAC_OWNER=canmouzhang`；`bac handover --owner`、`bac owner <task> <名字>|--clear` 可补设/改。
 - 路由：有 owner 且已配置 → 只发 owner（`route: owner`）；投递失败（curl 出错或非 2xx）→ 再发主 webhook（`route: fallback`, `fallback_reason: owner_delivery_failed`）；没有 owner → 主 webhook（`route: primary`）；owner 未配置 → 主 webhook（`fallback_reason: owner_not_configured`）。
 - `[[extra_webhooks]]` 行为不变（每个事件都收），只是 URL 与 owner 目标相同的会跳过，避免同一事件发两遍。想让 dot 只收自己的任务：删掉 extra，只留 `[[owners]] name = "dot"`。
-- 检查：`gbb doctor`（只显示 owner 名和主机）、`gbb test-webhook --owner <名字>`。设计见 [docs/decisions/0004](docs/decisions/0004-owner-routed-callbacks-and-codex-screens.md)。
+- 检查：`bac doctor`（只显示 owner 名和主机）、`bac test-webhook --owner <名字>`。设计见 [docs/decisions/0004](docs/decisions/0004-owner-routed-callbacks-and-codex-screens.md)。
 
 ### Codex
 
-`gbb launch --kind codex` 同样可用（herdr 0.9.3 + codex-cli 0.164.0 起已测；最近一次：herdr 0.9.5 + codex-cli 0.165.0。herdr 0.9.5 起 codex 状态改为读屏判断，不再依赖 codex 的 turn hooks，gbb 无需改动）。注意：
+`bac launch --kind codex` 同样可用（herdr 0.9.3 + codex-cli 0.164.0 起已测；最近一次：herdr 0.9.5 + codex-cli 0.165.0。herdr 0.9.5 起 codex 状态改为读屏判断，不再依赖 codex 的 turn hooks，bac 无需改动）。注意：
 
-- 新目录首次启动会弹 “Trust this folder?”，项目有 hooks 时还会弹 “Hooks need review”。gbb 不会往对话框里打字：返回 `state: startup_blocked`（含 `blocked_reason`、屏幕内容），把 prompt 存起来并发一条 `blocked` 回调。调用方看清后 `gbb answer <task> <选项号|文字>`（例如 hooks 界面 2 = 全部信任，3 = 不信任继续；gbb 从不自己替你信任 hooks），答完后存着的 prompt 会自动发出；也可 `gbb send <task> --pending` 手动发。
-- Codex 提问（屏幕上 “? 1 question / ⇧← to answer”）时 `gbb send` 会拒绝并提示用 `gbb answer <task> <选项>`：它会按 shift+left 打开问题、上下移动到目标选项并核对、回车。手动方式：`gbb keys <task> shift+left`，`gbb keys <task> down`…，`gbb keys <task> enter`。
-- 状态纠正：herdr 0.9.5 把 hooks 对话框报成 `idle`、把从没跑过的新会话（`Context 0% used · 0 in · 0 out`）报成 `done`。gbb 会读屏改成 `blocked`（`blocked_reason`: `hooks_review` / `question` / `dialog` / `prompt_not_submitted`），不再发假的 `done`。
-- 模型没生效？`codex_args` 为空时 codex 用 `~/.codex/config.toml` 顶层的 `model` / `model_reasoning_effort`。`gbb doctor` 会显示 `codex_user_defaults`；`gbb launch`/`gbb status` 显示 Codex 底栏里的实际模型（`agent_model`，如 “GPT-6.1-Sol xhigh”）。要固定就在 gbb 配置里写 `codex_args`。
-- herdr 目前拿不到 codex 的 session id，`gbb result` 给出 `cd <worktree> && codex resume --last`。
-- 模型/推理强度：不带 `-- <agent args>` 时，gbb 使用配置里的 `codex_args` / `grok_args`（单行字符串数组，每项原样作为一个参数传给 agent）；都没有时用 agent 自己的默认值（codex 读 `~/.codex/config.toml`）。例：`codex_args = ["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=\"xhigh\""]`。显式 `--`（哪怕后面为空）会覆盖配置。codex 0.165 可用的 effort：low / medium / high / xhigh（Extra high）/ max / ultra。
-- 首条 prompt：codex 报 ready 后可能还在加载（动画 splash），会吞掉输入。gbb 先等真正的 `›` 输入框和底栏出现、没有对话框、屏幕连续几次轮询不变（`startup_ready_timeout_sec`，默认 90），再发送；发送后若 herdr 报 stalled，先看 agent 是否其实已在工作、文字是否停在输入框（只补一次回车），确认没有送达才重发，不会重复提交；发出后再确认 Codex 确实开始了这一轮。
+- 新目录首次启动会弹 “Trust this folder?”，项目有 hooks 时还会弹 “Hooks need review”。bac 不会往对话框里打字：返回 `state: startup_blocked`（含 `blocked_reason`、屏幕内容），把 prompt 存起来并发一条 `blocked` 回调。调用方看清后 `bac answer <task> <选项号|文字>`（例如 hooks 界面 2 = 全部信任，3 = 不信任继续；bac 从不自己替你信任 hooks），答完后存着的 prompt 会自动发出；也可 `bac send <task> --pending` 手动发。
+- Codex 提问（屏幕上 “? 1 question / ⇧← to answer”）时 `bac send` 会拒绝并提示用 `bac answer <task> <选项>`：它会按 shift+left 打开问题、上下移动到目标选项并核对、回车。手动方式：`bac keys <task> shift+left`，`bac keys <task> down`…，`bac keys <task> enter`。
+- 状态纠正：herdr 0.9.5 把 hooks 对话框报成 `idle`、把从没跑过的新会话（`Context 0% used · 0 in · 0 out`）报成 `done`。bac 会读屏改成 `blocked`（`blocked_reason`: `hooks_review` / `question` / `dialog` / `prompt_not_submitted`），不再发假的 `done`。
+- 模型没生效？`codex_args` 为空时 codex 用 `~/.codex/config.toml` 顶层的 `model` / `model_reasoning_effort`。`bac doctor` 会显示 `codex_user_defaults`；`bac launch`/`bac status` 显示 Codex 底栏里的实际模型（`agent_model`，如 “GPT-6.1-Sol xhigh”）。要固定就在 bac 配置里写 `codex_args`。
+- herdr 目前拿不到 codex 的 session id，`bac result` 给出 `cd <worktree> && codex resume --last`。
+- 模型/推理强度：不带 `-- <agent args>` 时，bac 使用配置里的 `codex_args` / `grok_args`（单行字符串数组，每项原样作为一个参数传给 agent）；都没有时用 agent 自己的默认值（codex 读 `~/.codex/config.toml`）。例：`codex_args = ["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=\"xhigh\""]`。显式 `--`（哪怕后面为空）会覆盖配置。codex 0.165 可用的 effort：low / medium / high / xhigh（Extra high）/ max / ultra。
+- 首条 prompt：codex 报 ready 后可能还在加载（动画 splash），会吞掉输入。bac 先等真正的 `›` 输入框和底栏出现、没有对话框、屏幕连续几次轮询不变（`startup_ready_timeout_sec`，默认 90），再发送；发送后若 herdr 报 stalled，先看 agent 是否其实已在工作、文字是否停在输入框（只补一次回车），确认没有送达才重发，不会重复提交；发出后再确认 Codex 确实开始了这一轮。
 - `codex exec --json` 适合无界面的一次性任务；`codex app-server` 仍是实验性接口。走 herdr 的好处是窗格可见、可接管、状态统一。
 
 ### Herdr app（herdr-core）
@@ -116,28 +118,28 @@ header_value = "<routine 面板上的 key>"
 Herdr app（2026-10-29 起）跑在新的运行时 **herdr-core** 上，命令是 `hc`，状态来自 OSC 7501，不再走 TUI 的 `pane.agent_status_changed`。TUI 仍在更新；已经在 TUI 里的任务继续由原来的插件钩子回调。
 
 ```toml
-# ~/.config/grokbot-bridge-herdr/config.toml
+# ~/.config/bot-as-collie/config.toml
 backend = "auto"   # 默认。hc 优先；herdr | hc 可强制
 ```
 
-- `auto`（不写也是这个）：`hc server status` 能连上或能启动 core，新任务就进 hc；hc 不在，或这次 status 失败，才退回 TUI。`backend = "herdr"` 或 `gbb launch --backend herdr` 始终走 TUI。`backend = "hc"` 不退回。
+- `auto`（不写也是这个）：`hc server status` 能连上或能启动 core，新任务就进 hc；hc 不在，或这次 status 失败，才退回 TUI。`backend = "herdr"` 或 `bac launch --backend herdr` 始终走 TUI。`backend = "hc"` 不退回。
 - 登记表里每条任务记下 `backend`。没有这个字段、或写着 `herdr` 的旧记录，status / send / read / stop / handover 仍走 herdr 会话服务。TUI 插件钩子和 `hc events` 一起跑，各管各的记录。
-- `hc` 上的启动是 `hc run --bg --keep`（`grok` 或 `codex`，参数仍是 `grok_args` / `codex_args`），prompt 用 `hc send`（从不加 `--force`，以免替你答对话框）。终端带 `herdr.space`，出现在该仓库主检出目录所在的 Herdr space 里（看终端的启动目录，不看 space 的 folder；同仓库的另一个 worktree 不算），单独一个新 tab，标题是 `gbb · <任务 id>`（`herdr.tab` 用 gbb 新生成的 id，不占用已有 tab；hc 的 `--name` 仍是 `gb-<任务>`）。没有对应 space 时 app 会建一个，名字是仓库目录名。`hc ls` 的 `where` 是 `空间名 / tab`。`hc attach` 仍能接管，但不再是看到它的办法。
+- `hc` 上的启动是 `hc run --bg --keep`（`grok` 或 `codex`，参数仍是 `grok_args` / `codex_args`），prompt 用 `hc send`（从不加 `--force`，以免替你答对话框）。终端带 `herdr.space`，出现在该仓库主检出目录所在的 Herdr space 里（看终端的启动目录，不看 space 的 folder；同仓库的另一个 worktree 不算），单独一个新 tab，标题是 `bac · <任务 id>`（`herdr.tab` 用 bac 新生成的 id，不占用已有 tab；hc 的 `--name` 仍是 `gb-<任务>`）。没有对应 space 时 app 会建一个，名字是仓库目录名。`hc ls` 的 `where` 是 `空间名 / tab`。`hc attach` 仍能接管，但不再是看到它的办法。
 - 状态由后台的 `hc events --label grokbot=managed` 推送，payload 和 owner / 主 webhook / `[[extra_webhooks]]` 的路由跟 TUI 一样。`working` 不发；`error` 以 `blocked`（`blocked_reason=error`，`herdr_status=error`）发出。OSC 的 `msg` 不进 payload。
-- Codex 和 Grok Build（≥ 1.0.52）自己发 OSC 7501，gbb 不包一层（再写一条会盖掉它们的根记录）。还没上报的 Codex 仍用原来的读屏判断。更老的、既不上报也不是这些画面的 Grok 会在 app 里跑，但不会编造 `done`。
-- `gbb stop` 只杀掉 gbb 创建的 hc 终端，不调用 `space.close` / `tab.close`。交接来的只去掉 gbb 的 label、注销，不杀，也不把它从 space 里拿走。从不执行 `hc server stop`。app 里没有 TUI 的命令面板动作，交接用 `gbb handover --pane <地址>`（不带 `:` 的 id 会先试 hc）。还没进任何 space 的终端，交接时会放进对应仓库的 space。
+- Codex 和 Grok Build（≥ 1.0.52）自己发 OSC 7501，bac 不包一层（再写一条会盖掉它们的根记录）。还没上报的 Codex 仍用原来的读屏判断。更老的、既不上报也不是这些画面的 Grok 会在 app 里跑，但不会编造 `done`。
+- `bac stop` 只杀掉 bac 创建的 hc 终端，不调用 `space.close` / `tab.close`。交接来的只去掉 bac 的 label、注销，不杀，也不把它从 space 里拿走。从不执行 `hc server stop`。app 里没有 TUI 的命令面板动作，交接用 `bac handover --pane <地址>`（不带 `:` 的 id 会先试 hc）。还没进任何 space 的终端，交接时会放进对应仓库的 space。
 
 设计见 [docs/decisions/0005](docs/decisions/0005-herdr-core-backend.md)、[0007](docs/decisions/0007-place-hc-terminals-in-the-app.md)。
 
 ### 模块（按探测开关）
 
-gbb 里有四块。`core` 一直开着。另外三块各自探测，探测过了才用；也可以在配置里强制开或关。没有 dots-bridge 的机器不用改配置：指向 `127.0.0.1:8765` 的 owner / `[[extra_webhooks]]` 会跳过并写日志，不会每次去连。其它 extra webhook 不受影响。已经在登记表里的 TUI 任务仍走 herdr。
+bac 里有四块。`core` 一直开着。另外三块各自探测，探测过了才用；也可以在配置里强制开或关。没有 dots-bridge 的机器不用改配置：指向 `127.0.0.1:8765` 的 owner / `[[extra_webhooks]]` 会跳过并写日志，不会每次去连。其它 extra webhook 不受影响。已经在登记表里的 TUI 任务仍走 herdr。
 
 ```mermaid
 flowchart LR
   GB["Grok Bot"]
   DOT["ChatGPT Dot"]
-  CORE["gbb core"]
+  CORE["bac core"]
   TUI["herdr-tui"]
   HC["hc / herdr-core"]
   AG["grok / codex"]
@@ -148,19 +150,19 @@ flowchart LR
   TUI --> AG
   HC --> AG
   TUI -->|"插件 hook"| CORE
-  HC -->|"hc events / gbb hc-watch"| CORE
+  HC -->|"hc events / bac hc-watch"| CORE
   CORE -->|"owner 或 primary"| GB
   CORE -->|"dots 路由，模块开着才发"| DOT
 ```
 
 | 模块 | 探测 | 开着时做什么 |
 |---|---|---|
-| `core` | 总是通过 | 登记表、主 webhook、`gbb report` |
+| `core` | 总是通过 | 登记表、主 webhook、`bac report` |
 | `herdr_tui` | PATH 上有 `herdr`，且 `herdr status server --json` 的 `running` 为 true | TUI 启动与旧记录的 status/send/stop；插件 hook |
-| `hc` | `hc server status` 返回带数字 `pid` 的 JSON | 新任务默认进 hc；`gbb hc-watch` |
+| `hc` | `hc server status` 返回带数字 `pid` 的 JSON | 新任务默认进 hc；`bac hc-watch` |
 | `dots` | `~/.config/dots-bridge/herdr_webhook_token` 存在、非空、mode 600 或 400，且 `127.0.0.1:8765` 能连上 | 把该地址上的 owner / extra webhook 发出去 |
 
-`[modules.herdr_tui]` / `[modules.hc]` / `[modules.dots]` 里 `enabled = true|false` 覆盖探测。`gbb doctor` 会写出每一块为什么开或关。`gbb report` 打一份 JSON：主机、版本、各模块、webhook 只含名字和主机、`hc-watch` 是否在跑、每个任务的 id / kind / backend / owner / pane / status / alive / stale / repo / worktree。不含 header、不含 token、不含完整 URL。
+`[modules.herdr_tui]` / `[modules.hc]` / `[modules.dots]` 里 `enabled = true|false` 覆盖探测。`bac doctor` 会写出每一块为什么开或关。`bac report` 打一份 JSON：主机、版本、各模块、webhook 只含名字和主机、`hc-watch` 是否在跑、每个任务的 id / kind / backend / owner / pane / status / alive / stale / repo / worktree。不含 header、不含 token、不含完整 URL。
 
 设计见 [docs/decisions/0006](docs/decisions/0006-modules-and-report.md)。
 
@@ -168,24 +170,24 @@ flowchart LR
 
 Let Grok Bot drive and watch local coding agents (grok, codex) through [Herdr](https://herdr.dev), and let you hand some of your own panes over to Grok Bot and take them back.
 
-> **Also works with ChatGPT dots.** Besides Grok Bot, a ChatGPT dot can drive the same agents through gbb and get their status pushed to it. This goes through the companion MCP server **[dots-tunnel-bridge](https://github.com/Phoobobo/dots-tunnel-bridge)** (a fork of [uezo/dots-bridge](https://github.com/uezo/dots-bridge)), which runs on `127.0.0.1` and is exposed to ChatGPT via **OpenAI Secure MCP Tunnel** (no inbound ports). See [Use with ChatGPT dots](#use-with-chatgpt-dots).
+> **Also works with ChatGPT dots.** Besides Grok Bot, a ChatGPT dot can drive the same agents through bac and get their status pushed to it. This goes through the companion MCP server **[dots-tunnel-bridge](https://github.com/Phoobobo/dots-tunnel-bridge)** (a fork of [uezo/dots-bridge](https://github.com/uezo/dots-bridge)), which runs on `127.0.0.1` and is exposed to ChatGPT via **OpenAI Secure MCP Tunnel** (no inbound ports). See [Use with ChatGPT dots](#use-with-chatgpt-dots).
 
 - **Status webhook** — the plugin hooks `pane.agent_status_changed`, acts only on managed panes, and POSTs a small JSON (no terminal output, no secrets) on `done` / `idle` / `blocked`. Debounced; curl runs in the background with a short timeout, so Herdr never blocks.
-- **Managed-pane registry** — `~/.local/state/grokbot-bridge-herdr/managed.json`, keyed by pane id: task id, agent name, kind, repo, worktree, origin (`launched` | `handover`).
+- **Managed-pane registry** — `~/.local/state/bot-as-collie/managed.json`, keyed by pane id: task id, agent name, kind, repo, worktree, origin (`launched` | `handover`).
 - **Handover / reclaim** — pane actions in the Herdr command palette: "Grok Bot: take over this pane" and "Grok Bot: give this pane back to me". Managed panes show a `🤖 Grok Bot: <task>` marker.
-- **`gbb` CLI** — what Grok Bot calls over remote shell; every command prints JSON.
-- **Owner-routed callbacks** — `gbb launch --owner <name>` (or `GBB_OWNER`) records who launched a task; `[[owners]]` in the config gives each owner a webhook. Status callbacks go to that owner; with no owner, an unconfigured owner, or a failed delivery they fall back to the primary webhook. See [Several callers](#several-callers-owner-routed-callbacks).
+- **`bac` CLI** — what Grok Bot calls over remote shell; every command prints JSON.
+- **Owner-routed callbacks** — `bac launch --owner <name>` (or `BAC_OWNER`) records who launched a task; `[[owners]]` in the config gives each owner a webhook. Status callbacks go to that owner; with no owner, an unconfigured owner, or a failed delivery they fall back to the primary webhook. See [Several callers](#several-callers-owner-routed-callbacks).
 
 ### Install
 
-See the Chinese section above for the commands (`./install.sh`, copy `config.example.toml` to `~/.config/grokbot-bridge-herdr/config.toml`, `chmod 600`, fill `webhook_url` + `webhook_header_name` + `webhook_header_value` from the Grok Bot routine panel, then `gbb doctor && gbb test-webhook`). Dependencies are jq, git, curl, and either Herdr ≥ 0.9.0 (TUI) or hc ≥ 0.1.16 (herdr-core). Optional keybindings are shown above.
+See the Chinese section above for the commands (`./install.sh`, copy `config.example.toml` to `~/.config/bot-as-collie/config.toml`, `chmod 600`, fill `webhook_url` + `webhook_header_name` + `webhook_header_value` from the Grok Bot routine panel, then `bac doctor && bac test-webhook`). Dependencies are jq, git, curl, and either Herdr ≥ 0.9.0 (TUI) or hc ≥ 0.1.16 (herdr-core). Optional keybindings are shown above.
 
 ### Commands
 
 ```text
-gbb launch --repo <path> --kind grok|codex --task <id> [--worktree <branch>|--no-worktree] [--base <ref>]
+bac launch --repo <path> --kind grok|codex --task <id> [--worktree <branch>|--no-worktree] [--base <ref>]
            (--prompt <text> | --prompt-file <f>) [--owner <name>] [--backend auto|herdr|hc] [-- <agent args>]
-    git worktree under ~/.local/share/grokbot-bridge-herdr/worktrees/<repo>-<task> (branch gbb/<task>),
+    git worktree under ~/.local/share/bot-as-collie/worktrees/<repo>-<task> (branch bac/<task>),
     new Herdr workspace with --no-focus, `herdr agent start` with retry, settle, prompt with stall retry,
     registers the pane. --backend hc uses `hc run --bg --keep` (herdr-core) instead of a TUI workspace,
     and labels `herdr.space` so the Herdr app shows it (new tab in the repo's space; see docs/decisions/0007).
@@ -194,56 +196,56 @@ gbb launch --repo <path> --kind grok|codex --task <id> [--worktree <branch>|--no
     agent_model (codex footer), status, session_id, prompt_pending, prompt_error, and on hc also
     herdr_space and created_herdr_space — or state:"startup_blocked"
     with blocked_reason + screen when a startup dialog is showing (the prompt is kept, not typed).
-gbb list                          managed panes + live status
-gbb status <task|pane>            herdr agent info + git status/log + session id + resume command,
+bac list                          managed panes + live status
+bac status <task|pane>            herdr agent info + git status/log + session id + resume command,
                                   owner, screen_state (codex), agent_model, prompt_pending
-gbb read <task|pane> [--lines N]  terminal text (use to inspect blocked dialogs)
-gbb send <task|pane> <text>       follow-up prompt (refuses to type into a dialog; error.hint says how to answer)
-gbb send <task|pane> --pending    submit the prompt saved by a startup_blocked launch
-gbb answer <task|pane> <n|label>  answer a Codex question (open or queued "⇧← to answer") or startup dialog:
+bac read <task|pane> [--lines N]  terminal text (use to inspect blocked dialogs)
+bac send <task|pane> <text>       follow-up prompt (refuses to type into a dialog; error.hint says how to answer)
+bac send <task|pane> --pending    submit the prompt saved by a startup_blocked launch
+bac answer <task|pane> <n|label>  answer a Codex question (open or queued "⇧← to answer") or startup dialog:
                                   opens it, moves the › selection, verifies, Enter; then sends a pending prompt
-gbb keys <task|pane> <key>...     raw keys, herdr names (enter, esc, up, down, shift+left, t, y)
-gbb owner <task|pane> [<name>|--clear]   show / change who gets this task's callbacks
-gbb wait <task|pane> [--until S]  block until a state (fallback when webhooks are not configured)
-gbb result <task|pane>            commits since launch, diff stat, branch, uncommitted, session id, resume
-gbb stop <task|pane>              close only the workspace gbb created; handover panes are just unregistered
-gbb handover --pane <id> [--note] [--owner <name>] / gbb reclaim --pane <id>
-gbb doctor                        modules (why each is on or off), owner names/hosts, codex_args (no secrets)
-gbb report                        JSON for a status page: modules, webhook hosts, hc-watch, tasks
-gbb test-webhook [--owner <name>] sends a test event through the same routing
+bac keys <task|pane> <key>...     raw keys, herdr names (enter, esc, up, down, shift+left, t, y)
+bac owner <task|pane> [<name>|--clear]   show / change who gets this task's callbacks
+bac wait <task|pane> [--until S]  block until a state (fallback when webhooks are not configured)
+bac result <task|pane>            commits since launch, diff stat, branch, uncommitted, session id, resume
+bac stop <task|pane>              close only the workspace bac created; handover panes are just unregistered
+bac handover --pane <id> [--note] [--owner <name>] / bac reclaim --pane <id>
+bac doctor                        modules (why each is on or off), owner names/hosts, codex_args (no secrets)
+bac report                        JSON for a status page: modules, webhook hosts, hc-watch, tasks
+bac test-webhook [--owner <name>] sends a test event through the same routing
 ```
 
 ### Codex
 
-`gbb launch --kind codex` works the same way (tested since Herdr 0.9.3 with codex-cli 0.164.0; last verified on Herdr 0.9.5 with codex-cli 0.165.0. From Herdr 0.9.5 codex status comes from screen detection instead of codex turn hooks; gbb needed no change). On first start in a new folder codex shows "Trust this folder?", and projects with hooks show "Hooks need review". gbb never types into such a dialog: launch returns `state: startup_blocked` (with `blocked_reason` and the screen), keeps the prompt and sends a `blocked` callback; the caller answers with `gbb answer <task> <n|label>` (hooks: 2 = trust all, 3 = continue without trusting — gbb never trusts hooks on its own), after which the saved prompt is submitted (or `gbb send <task> --pending`). When Codex asks a question ("? 1 question / ⇧← to answer") `gbb send` refuses with a hint; `gbb answer` opens it with shift+left, moves to the option with up/down, verifies the selection and presses Enter (manual: `gbb keys <task> shift+left`, `down`…, `enter`). Herdr 0.9.5 reports the hooks dialog as `idle` and a never-prompted session ("Context 0% used · 0 in · 0 out") as `done`; gbb reads the screen and reports `blocked` with `blocked_reason` (`hooks_review`, `question`, `dialog`, `prompt_not_submitted`) instead of a false `done`. Herdr does not report codex session ids yet, so `gbb result` suggests `cd <worktree> && codex resume --last`. Model and effort: without `-- <agent args>`, gbb uses `codex_args` / `grok_args` from the config (single-line string array, each item passed as one argv word); with neither, the agent's own defaults apply (codex reads `~/.codex/config.toml`). Example: `codex_args = ["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=\"xhigh\""]`; an explicit `--` (even empty) overrides the config. Codex 0.165 efforts: low, medium, high, xhigh ("Extra high"), max, ultra. With `codex_args` empty, the top-level `model` / `model_reasoning_effort` of `~/.codex/config.toml` win — `gbb doctor` shows them as `codex_user_defaults`, and `launch` / `status` report the model line from the Codex footer (`agent_model`, e.g. "GPT-6.1-Sol xhigh"). First prompt: codex can report ready while its splash is still loading and drops typed input, so gbb waits until the `›` composer is drawn and the screen is stable for two polls (`startup_ready_timeout_sec`, default 90) before typing; on `agent_prompt_stalled` it checks whether the agent is actually working or the text is sitting in the composer (one Enter), and re-types only when nothing reached the screen, so a prompt is never submitted twice. `codex exec --json` suits headless one-shot jobs and `codex app-server` is still experimental; the Herdr route keeps a visible pane you can take over, with the same status signal as grok.
+`bac launch --kind codex` works the same way (tested since Herdr 0.9.3 with codex-cli 0.164.0; last verified on Herdr 0.9.5 with codex-cli 0.165.0. From Herdr 0.9.5 codex status comes from screen detection instead of codex turn hooks; bac needed no change). On first start in a new folder codex shows "Trust this folder?", and projects with hooks show "Hooks need review". bac never types into such a dialog: launch returns `state: startup_blocked` (with `blocked_reason` and the screen), keeps the prompt and sends a `blocked` callback; the caller answers with `bac answer <task> <n|label>` (hooks: 2 = trust all, 3 = continue without trusting — bac never trusts hooks on its own), after which the saved prompt is submitted (or `bac send <task> --pending`). When Codex asks a question ("? 1 question / ⇧← to answer") `bac send` refuses with a hint; `bac answer` opens it with shift+left, moves to the option with up/down, verifies the selection and presses Enter (manual: `bac keys <task> shift+left`, `down`…, `enter`). Herdr 0.9.5 reports the hooks dialog as `idle` and a never-prompted session ("Context 0% used · 0 in · 0 out") as `done`; bac reads the screen and reports `blocked` with `blocked_reason` (`hooks_review`, `question`, `dialog`, `prompt_not_submitted`) instead of a false `done`. Herdr does not report codex session ids yet, so `bac result` suggests `cd <worktree> && codex resume --last`. Model and effort: without `-- <agent args>`, bac uses `codex_args` / `grok_args` from the config (single-line string array, each item passed as one argv word); with neither, the agent's own defaults apply (codex reads `~/.codex/config.toml`). Example: `codex_args = ["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=\"xhigh\""]`; an explicit `--` (even empty) overrides the config. Codex 0.165 efforts: low, medium, high, xhigh ("Extra high"), max, ultra. With `codex_args` empty, the top-level `model` / `model_reasoning_effort` of `~/.codex/config.toml` win — `bac doctor` shows them as `codex_user_defaults`, and `launch` / `status` report the model line from the Codex footer (`agent_model`, e.g. "GPT-6.1-Sol xhigh"). First prompt: codex can report ready while its splash is still loading and drops typed input, so bac waits until the `›` composer is drawn and the screen is stable for two polls (`startup_ready_timeout_sec`, default 90) before typing; on `agent_prompt_stalled` it checks whether the agent is actually working or the text is sitting in the composer (one Enter), and re-types only when nothing reached the screen, so a prompt is never submitted twice. `codex exec --json` suits headless one-shot jobs and `codex app-server` is still experimental; the Herdr route keeps a visible pane you can take over, with the same status signal as grok.
 
 ### Herdr app (herdr-core)
 
 The Herdr app (since 2026-10-29) runs on **herdr-core** (`hc`). Status there is OSC 7501, not the TUI's `pane.agent_status_changed` hook. The TUI is still supported; tasks already in it keep using that hook.
 
 ```toml
-# ~/.config/grokbot-bridge-herdr/config.toml
+# ~/.config/bot-as-collie/config.toml
 backend = "auto"   # default: hc when its server is up; herdr | hc force one
 ```
 
-- `auto` (also what you get when `backend` is unset) launches new tasks on hc when `hc server status` can reach or start the core. It uses the Herdr TUI only when `hc` is missing or that call fails. `backend = "herdr"` or `gbb launch --backend herdr` always uses the TUI. `backend = "hc"` does not fall back.
+- `auto` (also what you get when `backend` is unset) launches new tasks on hc when `hc server status` can reach or start the core. It uses the Herdr TUI only when `hc` is missing or that call fails. `backend = "herdr"` or `bac launch --backend herdr` always uses the TUI. `backend = "hc"` does not fall back.
 - Each registry row stores `backend`. A row with no field, or `backend = "herdr"`, keeps using the herdr session server for status, send, read, stop, and handover. The TUI plugin hook and the `hc events` watcher run side by side, each for its own rows.
-- An hc launch is `hc run --bg --keep` of `grok` or `codex` (same `grok_args` / `codex_args`), then `hc send` for the prompt. gbb never passes `--force` (that flag can answer a dialog). The terminal is labeled `herdr.space` and shows up in the Herdr app: the space whose terminals were launched in that checkout (the space's folder field is ignored; another worktree of the repo does not count), otherwise a new space named after the repo directory, always in a new tab titled `gbb · <task>` (`herdr.tab` is an id gbb minted, so an existing tab is not split or renamed; the hc name stays `gb-<task>`). `hc ls` then reports `where` as `space / tab`. `hc attach <name>` still works; it is not required to see the terminal.
+- An hc launch is `hc run --bg --keep` of `grok` or `codex` (same `grok_args` / `codex_args`), then `hc send` for the prompt. bac never passes `--force` (that flag can answer a dialog). The terminal is labeled `herdr.space` and shows up in the Herdr app: the space whose terminals were launched in that checkout (the space's folder field is ignored; another worktree of the repo does not count), otherwise a new space named after the repo directory, always in a new tab titled `bac · <task>` (`herdr.tab` is an id bac minted, so an existing tab is not split or renamed; the hc name stays `gb-<task>`). `hc ls` then reports `where` as `space / tab`. `hc attach <name>` still works; it is not required to see the terminal.
 - A background `hc events --label grokbot=managed` posts callbacks through the same owner / primary / `[[extra_webhooks]]` routing. `working` is not posted. `error` is posted as `blocked` with `blocked_reason=error` and `herdr_status=error`. The OSC `msg` is not included.
-- Codex and Grok Build (≥ 1.0.52) emit OSC 7501 themselves, and hc answers the capability query, so gbb does not wrap them (a second writer would replace their root record). A Codex that has not reported yet still uses the existing screen classification. An older Grok that reports nothing still runs in the app; gbb does not invent `done` for it.
-- `gbb stop` kills and removes only hc terminals gbb created. It does not call `space.close` or `tab.close`. A handover is unregistered, not killed, and not pulled out of its space; a terminal that was not in one is placed the same way as a launch. gbb never runs `hc server stop`. The app has no TUI command-palette action; hand a terminal over with `gbb handover --pane <address>` (an id without `:` is tried as hc first).
+- Codex and Grok Build (≥ 1.0.52) emit OSC 7501 themselves, and hc answers the capability query, so bac does not wrap them (a second writer would replace their root record). A Codex that has not reported yet still uses the existing screen classification. An older Grok that reports nothing still runs in the app; bac does not invent `done` for it.
+- `bac stop` kills and removes only hc terminals bac created. It does not call `space.close` or `tab.close`. A handover is unregistered, not killed, and not pulled out of its space; a terminal that was not in one is placed the same way as a launch. bac never runs `hc server stop`. The app has no TUI command-palette action; hand a terminal over with `bac handover --pane <address>` (an id without `:` is tried as hc first).
 
 Rationale: [docs/decisions/0005](docs/decisions/0005-herdr-core-backend.md), [0007](docs/decisions/0007-place-hc-terminals-in-the-app.md).
 
 ### Modules (on only when the probe passes)
 
-gbb is four modules. `core` is always on. The other three each have a probe and are used only when that probe passes, unless config forces them on or off. A machine without dots-bridge does not need its config edited: owner and `[[extra_webhooks]]` targets on `127.0.0.1:8765` are skipped and logged, not dialed on every event. Other extra webhooks are not gated. Registry rows already on the TUI still use herdr.
+bac is four modules. `core` is always on. The other three each have a probe and are used only when that probe passes, unless config forces them on or off. A machine without dots-bridge does not need its config edited: owner and `[[extra_webhooks]]` targets on `127.0.0.1:8765` are skipped and logged, not dialed on every event. Other extra webhooks are not gated. Registry rows already on the TUI still use herdr.
 
 ```mermaid
 flowchart LR
   GB["Grok Bot"]
   DOT["ChatGPT Dot"]
-  CORE["gbb core"]
+  CORE["bac core"]
   TUI["herdr-tui"]
   HC["hc / herdr-core"]
   AG["grok / codex"]
@@ -254,19 +256,19 @@ flowchart LR
   TUI --> AG
   HC --> AG
   TUI -->|"plugin hook"| CORE
-  HC -->|"hc events / gbb hc-watch"| CORE
+  HC -->|"hc events / bac hc-watch"| CORE
   CORE -->|"owner or primary"| GB
   CORE -->|"dots route, only if that module is on"| DOT
 ```
 
 | Module | Probe | What it does when on |
 |---|---|---|
-| `core` | always passes | registry, primary webhook, `gbb report` |
+| `core` | always passes | registry, primary webhook, `bac report` |
 | `herdr_tui` | `herdr` on PATH and `herdr status server --json` has `running: true` | TUI launches and status/send/stop for existing TUI rows; the plugin hook |
-| `hc` | `hc server status` JSON includes a numeric `pid` | default backend for new tasks; `gbb hc-watch` |
+| `hc` | `hc server status` JSON includes a numeric `pid` | default backend for new tasks; `bac hc-watch` |
 | `dots` | `~/.config/dots-bridge/herdr_webhook_token` exists, is non-empty, mode 600 or 400, and `127.0.0.1:8765` accepts a connection | deliver owner / extra webhooks aimed at that endpoint |
 
-`[modules.herdr_tui]`, `[modules.hc]`, and `[modules.dots]` take `enabled = true|false` to override the probe. `gbb doctor` prints each module and why it is on or off. `gbb report` prints one JSON document: host, version, each module, webhook targets by name and host only, whether `hc-watch` is running, and each task's id, kind, backend, owner, pane id, status, alive, stale, repo, and worktree. No header values, no token contents, no full URLs.
+`[modules.herdr_tui]`, `[modules.hc]`, and `[modules.dots]` take `enabled = true|false` to override the probe. `bac doctor` prints each module and why it is on or off. `bac report` prints one JSON document: host, version, each module, webhook targets by name and host only, whether `hc-watch` is running, and each task's id, kind, backend, owner, pane id, status, alive, stale, repo, and worktree. No header values, no token contents, no full URLs.
 
 Rationale: [docs/decisions/0006](docs/decisions/0006-modules-and-report.md).
 
@@ -275,7 +277,7 @@ Rationale: [docs/decisions/0006](docs/decisions/0006-modules-and-report.md).
 Several callers may share one gbb: your Grok Bot, a second Grok Bot (e.g. 参谋长), a ChatGPT dot. Tag tasks with an owner so callbacks reach whoever launched them:
 
 ```toml
-# end of ~/.config/grokbot-bridge-herdr/config.toml (mode 600)
+# end of ~/.config/bot-as-collie/config.toml (mode 600)
 [[owners]]
 name = "dot"                                   # dots-tunnel-bridge's gbb_launch passes --owner dot
 url = "http://127.0.0.1:8765/herdr/webhook"
@@ -289,26 +291,26 @@ header_name = "<header name from the routine panel>"
 header_value = "<key from the routine panel>"
 ```
 
-- Launch with `--owner <name>` or `GBB_OWNER=<name>`; `gbb handover --owner` and `gbb owner <task> <name>|--clear` set it later.
+- Launch with `--owner <name>` or `BAC_OWNER=<name>`; `bac handover --owner` and `bac owner <task> <name>|--clear` set it later.
 - Routing: owner configured → owner target only (`route: "owner"`); its POST fails (curl error or non-2xx) → primary (`route: "fallback"`, `fallback_reason: "owner_delivery_failed"`); no owner → primary (`route: "primary"`); owner not configured → primary (`fallback_reason: "owner_not_configured"`).
 - `[[extra_webhooks]]` behave as before (every event), except an extra whose URL equals the owner target is skipped, so nothing is delivered twice. For a dot that should only see its own tasks, drop the extra and keep `[[owners]] name = "dot"`.
-- Check with `gbb doctor` (owner names and hosts only) and `gbb test-webhook --owner <name>`. Rationale: [docs/decisions/0004](docs/decisions/0004-owner-routed-callbacks-and-codex-screens.md).
+- Check with `bac doctor` (owner names and hosts only) and `bac test-webhook --owner <name>`. Rationale: [docs/decisions/0004](docs/decisions/0004-owner-routed-callbacks-and-codex-screens.md).
 
 ### Use with ChatGPT dots
 
-The companion MCP server [dots-tunnel-bridge](https://github.com/Phoobobo/dots-tunnel-bridge) (a fork of [uezo/dots-bridge](https://github.com/uezo/dots-bridge), exposed to ChatGPT through OpenAI Secure MCP Tunnel) wraps `gbb` as MCP tools so a ChatGPT dot can drive local coding agents too. The tools live in dots-tunnel-bridge (`src/dots_bridge/herdr_tools.py`, enabled by `DOTS_BRIDGE_HERDR_TOOLS=1`); full docs: [docs/HERDR.md](https://github.com/Phoobobo/dots-tunnel-bridge/blob/main/docs/HERDR.md#english).
+The companion MCP server [dots-tunnel-bridge](https://github.com/Phoobobo/dots-tunnel-bridge) (a fork of [uezo/dots-bridge](https://github.com/uezo/dots-bridge), exposed to ChatGPT through OpenAI Secure MCP Tunnel) wraps `bac` as MCP tools so a ChatGPT dot can drive local coding agents too. The tools live in dots-tunnel-bridge (`src/dots_bridge/herdr_tools.py`, enabled by `DOTS_BRIDGE_HERDR_TOOLS=1`); full docs: [docs/HERDR.md](https://github.com/Phoobobo/dots-tunnel-bridge/blob/main/docs/HERDR.md#english).
 
 Setup:
 
-1. Install gbb as above; `gbb doctor` is clean.
+1. Install bac as above; `bac doctor` is clean.
 2. Install the bridge and tunnel-client per the [dots-tunnel-bridge README](https://github.com/Phoobobo/dots-tunnel-bridge) and add it in ChatGPT as a custom MCP server (Connection: Tunnel).
 3. Create the token file `~/.config/dots-bridge/herdr_webhook_token` (mode 600), set `DOTS_BRIDGE_HERDR_TOOLS=1` in the bridge plist and restart the bridge.
-4. Append the `[[extra_webhooks]]` table below to `~/.config/grokbot-bridge-herdr/config.toml`; check with `gbb test-webhook`.
+4. Append the `[[extra_webhooks]]` table below to `~/.config/bot-as-collie/config.toml`; check with `bac test-webhook`.
 5. **Refresh** the tools on the ChatGPT plugin page (13 `gbb_*` tools), and have the dot subscribe to `app.message.created` on channel `herdr` (else events land on `default`).
 
 Tools:
 
-| Tool | Kind | gbb call |
+| Tool | Kind | bac call |
 |---|---|---|
 | `gbb_list`, `gbb_status`, `gbb_read`, `gbb_result`, `gbb_doctor` | read-only | `list`, `status`, `read --lines/--visible`, `result`, `doctor` |
 | `gbb_wait` | read-only, max 120 s | `wait --until … --timeout` |
@@ -317,7 +319,7 @@ Tools:
 | `gbb_stop` | destructive, idempotent | `stop` |
 | `gbb_handover`, `gbb_reclaim` | ownership | `handover --pane [--note] --owner dot`, `reclaim --pane` |
 
-Every call is an argv list (no shell) with an explicit PATH, a timeout and validated inputs. send/keys/stop/reclaim re-check `gbb list` and refuse unmanaged panes and the protected workspaces (`DOTS_BRIDGE_HERDR_PROTECTED_WORKSPACES`, default `wAS,wAT`) unless the pane was handed over.
+Every call is an argv list (no shell) with an explicit PATH, a timeout and validated inputs. send/keys/stop/reclaim re-check `bac list` and refuse unmanaged panes and the protected workspaces (`DOTS_BRIDGE_HERDR_PROTECTED_WORKSPACES`, default `wAS,wAT`) unless the pane was handed over.
 
 Status events: add to the end of `config.toml`
 
@@ -328,9 +330,9 @@ header_name = "X-Dots-Herdr-Token"
 header_value = "<contents of ~/.config/dots-bridge/herdr_webhook_token>"
 ```
 
-Each extra target (max 5) gets the identical payload in its own background curl, header via stdin; the primary Grok Bot webhook is unchanged. `gbb doctor` reports `config.extra_webhooks.{count,hosts}` only. The receiver accepts loopback clients with the token only and posts an `app.message.created` message (`metadata.source = "herdr"`) to the dot's `herdr` channel, falling back to `default`. Refresh the dot's tools on the ChatGPT plugin page after changing tools. Rationale: [docs/decisions/0003](docs/decisions/0003-dots-bridge-tools-and-extra-webhooks.md).
+Each extra target (max 5) gets the identical payload in its own background curl, header via stdin; the primary Grok Bot webhook is unchanged. `bac doctor` reports `config.extra_webhooks.{count,hosts}` only. The receiver accepts loopback clients with the token only and posts an `app.message.created` message (`metadata.source = "herdr"`) to the dot's `herdr` channel, falling back to `default`. Refresh the dot's tools on the ChatGPT plugin page after changing tools. Rationale: [docs/decisions/0003](docs/decisions/0003-dots-bridge-tools-and-extra-webhooks.md).
 
-**herdr-core:** the 13 `gbb_*` tools stay as they are. `gbb_launch` does not pass `--backend`, so a new task follows this machine's default: with `auto`, that is hc when the core is up. Callbacks are the same JSON, posted to the same `/herdr/webhook`, with an extra `backend` field that an older receiver can ignore. Registry rows already on the TUI are not moved, and their plugin hook keeps working next to the hc watcher.
+**herdr-core:** with `auto`, a new task uses hc when the core is up. Registry rows already on the TUI stay there. The Dot's current `gbb_*` tools are not the target identity; `docs/bac/v1/MIGRATION.md` is the cutover. Until that bridge change and a ChatGPT Refresh, the bridge still rejects `source` `bot-as-collie`.
 
 ### Notes from testing
 
@@ -340,10 +342,10 @@ Each extra target (max 5) gets the identical payload in its own background curl,
 ### Webhook payload
 
 ```json
-{"source":"grokbot-bridge-herdr","version":"0.3.3","event":"agent_status","hostname":"mbp",
+{"source":"bot-as-collie","version":1,"event":"agent_status","hostname":"mbp",
  "task_id":"demo","pane_id":"wAX:p1","workspace_id":"wAX","agent_kind":"grok","agent_name":"gb-demo",
  "origin":"launched","owner":"dot","backend":"herdr","repo":"/Users/me/repo","worktree":"/Users/me/.local/share/grokbot-bridge-herdr/worktrees/repo-demo",
- "branch":"gbb/demo","status":"done","ts":"2026-10-28T00:00:00Z","herdr_status":"done","route":"owner"}
+ "branch":"bac/demo","status":"done","ts":"2026-10-28T00:00:00Z","herdr_status":"done","route":"owner"}
 ```
 
 `event` is one of `agent_status` (with `status` = `done` | `idle` | `blocked`), `handover`, `reclaim`, `stopped`, `pane_closed`, `test`. `owner` is null for tasks without one; `route` is `owner` | `primary` | `fallback` (+ `fallback_reason`) | `extra`. `backend` is `herdr` or `hc` (`herdr` when an older registry row has no field). Codex `blocked` events may carry `blocked_reason` (`hooks_review`, `question`, `dialog`, `prompt_not_submitted`, and on hc also `permission`, `auth`, `error`) and `prompt_pending`; `herdr_status` is the raw status before gbb's screen check (on hc, the OSC 7501 state, so an `error` is delivered as `status=blocked`, `blocked_reason=error`, `herdr_status=error`). An hc `pane_id` is the terminal address (`t7`). The payload still has no terminal output and no prompt text.
@@ -351,10 +353,10 @@ Each extra target (max 5) gets the identical payload in its own background curl,
 ### End-to-end check
 
 ```sh
-gbb launch --repo ~/scratch-repo --kind grok --task e2e --prompt "Create hello.txt and commit it"
-gbb wait e2e --until done --until idle --until blocked --timeout 300000
-gbb result e2e && gbb stop e2e
-tail ~/.local/state/grokbot-bridge-herdr/bridge.log
+bac launch --repo ~/scratch-repo --kind grok --task e2e --prompt "Create hello.txt and commit it"
+bac wait e2e --until done --until idle --until blocked --timeout 300000
+bac result e2e && bac stop e2e
+tail ~/.local/state/bot-as-collie/bridge.log
 ```
 
 With `backend` unset, the same launch goes to herdr-core when `hc` is up (`hc ls` shows `where: "<space> / <tab>"`, the Herdr app shows a new tab in that repo's space, and the callback has `"backend":"hc"`). Pass `--backend herdr` to force the TUI for that launch.

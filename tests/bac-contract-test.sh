@@ -18,6 +18,9 @@ if [ "$impl" = false ]; then
   grep -q 'id = "phoobobo.grokbot-bridge"' "$ROOT/herdr-plugin.toml" || fail "plugin id changed before cutover"
 else
   [ -x "$ROOT/bin/bac" ] || fail "runtime_implemented is true but bin/bac is missing"
+  [ ! -e "$ROOT/bin/gbb" ] || fail "gbb runtime is still in the tree"
+  grep -q 'source:"bot-as-collie"' "$ROOT/bin/bac" || fail "callback source"
+  grep -q 'id = "phoobobo.bot-as-collie"' "$ROOT/herdr-plugin.toml" || fail "plugin id"
 fi
 jq -e '.names.cli == "bac" and .names.source == "bot-as-collie" and .names.contract_version == 1' "$C/identity.json" >/dev/null || fail "identity names"
 jq -e '.baseline.commit == "bbdfc4bbaece3ddafa3a9363b1d0f43b230aa5a6"' "$C/identity.json" >/dev/null || fail "baseline sha"
@@ -78,7 +81,8 @@ jq -e 'any(.scenarios[]; .id == "grok-bot-primary" and any(.steps[]; .op == "lau
 jq -e 'any(.scenarios[]; .id == "dots-launch-and-handover" and any(.steps[]; .op == "launch") and any(.steps[]; .op == "handover") and any(.steps[]; .route == "owner"))' "$C/acceptance.json" >/dev/null || fail "dots flow"
 jq -e 'any(.scenarios[]; .id == "cross-owner" and .mutates == false and all(.steps[]; .registry_unchanged == true and .expect.error.code == "owner_mismatch"))' "$C/acceptance.json" >/dev/null || fail "cross-owner"
 jq -e '.scenarios[] | select(.id == "duplicate-and-timeout") | .attempt == 1 and .retry_same_target == false and .dedupe_key == "event_id" and .dots_202_without_subscription_does_not_queue == true' "$C/acceptance.json" >/dev/null || fail "timeout semantics"
-jq -e '.scenarios[] | select(.id == "restart") | .replay_undelivered == false and .delivery == "at_most_once"' "$C/acceptance.json" >/dev/null || fail "restart semantics"
+jq -e '.scenarios[] | select(.id == "restart") | .replay_undelivered == false and .delivery == "per_target_one_attempt_cross_target_duplicate_possible_no_restart_replay"' "$C/acceptance.json" >/dev/null || fail "restart semantics"
+jq -e '.scenarios[] | select(.id == "duplicate-and-timeout") | .attempt_meaning == "per target, not the number of targets that receive the event"' "$C/acceptance.json" >/dev/null || fail "attempt meaning"
 
 # --- callbacks -------------------------------------------------------------
 event_id() { # pane event status generation
@@ -208,6 +212,41 @@ jq -e '
   and .panes["t6"].backend == "herdr" and .panes["t6"].owner == null and .panes["t6"].kind == null
   and ([.panes[].pane_id] | index("planned") | not)
 ' "$T/out/managed.json" >/dev/null || fail "migrated registry lost owner/pane or rewrote kind"
+
+dest_before=$(sha "$T/out/managed.json")
+if sh "$MIG" "$T/ok" "$T/out" >/dev/null 2>&1; then
+  fail "second migrate overwrote the destination"
+fi
+[ "$(sha "$T/ok/managed.json")" = "$after" ] || fail "overwrite refusal changed the source"
+[ "$(sha "$T/out/managed.json")" = "$dest_before" ] || fail "overwrite refusal changed the destination"
+
+mkdir -p "$T/cfg-src"
+cp "$T/ok/managed.json" "$T/ok/FIXTURE_OK" "$T/cfg-src/"
+cat >"$T/cfg-src/config.toml" <<'TOML'
+webhook_url = "http://127.0.0.1:9/hook"
+webhook_header_name = "X-Fixture"
+webhook_header_value = "fixture-only"
+webhook_timeout_sec = 1
+
+[[owners]]
+name = "dot"
+url = "http://127.0.0.1:9/dot"
+header_name = "X-Dots-Herdr-Token"
+header_value = "fixture-dot"
+TOML
+sh "$MIG" "$T/cfg-src" "$T/cfg-out" >/dev/null || fail "config fixture migrate"
+grep -q 'fixture-dot' "$T/cfg-out/config.toml" || fail "owner target dropped"
+out_cfg=$(sh "$MIG" "$T/cfg-src" "$T/cfg-out" 2>&1 || true)
+printf '%s' "$out_cfg" | grep -q 'fixture-dot' && fail "migrator printed a header value"
+if sh "$MIG" "$T/cfg-src" "$T/cfg-out" >/dev/null 2>&1; then
+  fail "config destination overwrite was accepted"
+fi
+printf 'token = "nope"\n' >>"$T/cfg-src/config.toml"
+rm -rf "$T/cfg-bad-out"
+if sh "$MIG" "$T/cfg-src" "$T/cfg-bad-out" >/dev/null 2>&1; then
+  fail "unknown config key was accepted"
+fi
+[ ! -e "$T/cfg-bad-out/managed.json" ] || fail "bad config still wrote a registry"
 
 if sh "$MIG" "$T/bad" "$T/bad-out" >/dev/null 2>&1; then
   fail "fake pane id was migrated"

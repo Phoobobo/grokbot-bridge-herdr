@@ -2,9 +2,9 @@
 
 Herdr plugin + `gbb` CLI that let Grok Bot drive and watch coding agents (grok, codex) in Herdr panes on the user's machine. ChatGPT dots use the same `gbb` through the companion MCP server [dots-tunnel-bridge](https://github.com/Phoobobo/dots-tunnel-bridge) (fork of uezo/dots-bridge, exposed via OpenAI Secure MCP Tunnel), whose `gbb_*` tools call these subcommands and whose `/herdr/webhook` receives `[[extra_webhooks]]` and the `dot` owner target — keep `gbb`'s JSON output, subcommand flags and webhook payload compatible with it (see `docs/decisions/0003`) until the BotAsCollie cutover below.
 
-## BotAsCollie v1 (contract only, not the running CLI)
+## BotAsCollie
 
-The program in this tree is still `gbb` 0.3.3. The breaking target is BotAsCollie, CLI `bac`, frozen in `docs/bac/v1/CONTRACT.md`, `docs/bac/v1/MIGRATION.md`, and `contracts/bac/v1/` (`docs/decisions/0008`). It is not implemented. Do not add a tool that drives `hc` except through that future `bac`. Do not keep a `gbb` alias as the end state. The next phase implements `bac` on the same branch; until `contracts/bac/v1/identity.json` says `runtime_implemented` is true, dots-tunnel-bridge still calls `gbb` and still requires webhook `source` `grokbot-bridge-herdr`.
+The running CLI is `bac` (`bin/bac`). Webhook `source` is `bot-as-collie`, callback `version` is the integer 1. There is no `gbb` command. Contract: `docs/bac/v1/CONTRACT.md`. Dots still has to be updated before both ends work; do not describe this tree as already accepted by the bridge. Do not add a tool that drives `hc` except through `bac`.
 
 ## Change context (required)
 
@@ -17,8 +17,8 @@ Every commit and pull request must leave enough context that later work can trac
 
 ## Layout
 
-- `herdr-plugin.toml` — Herdr plugin manifest v1 (`phoobobo.grokbot-bridge`): event hooks and pane actions. All entrypoints run `bin/gbb`.
-- `bin/gbb` — the whole implementation, POSIX sh + jq + git + curl. User-facing subcommands print one JSON document.
+- `herdr-plugin.toml` — Herdr plugin manifest v1 (`phoobobo.bot-as-collie`): event hooks and pane actions. All entrypoints run `bin/bac`.
+- `bin/bac` — the whole implementation, POSIX sh + jq + git + curl. User-facing subcommands print one JSON document.
 - `config.example.toml` — webhook config template. Real config lives in `~/.config/grokbot-bridge-herdr/config.toml` (mode 600) and is never committed.
 - `install.sh` / `uninstall.sh` — symlink `gbb` into `~/.local/bin` and link/unlink the plugin.
 - `tests/hook-test.sh` — offline hook/debounce test with a stubbed `herdr`.
@@ -46,5 +46,5 @@ Every commit and pull request must leave enough context that later work can trac
 
 ## Verify
 
-- `for t in tests/*.sh; do sh "$t" || break; done` (offline, ~2 min) and `shellcheck -s sh -S warning bin/gbb` (only the known SC2088/SC1010 false positives).
-- On a machine with Herdr: `gbb doctor`, then a launch in a scratch repo (see README "End-to-end check").
+- `sh tests/run.sh` (offline, fail-fast, ~2 min) and `shellcheck -s sh -S warning bin/bac contracts/bac/v1/migrate-fixture.sh tests/bac-contract-test.sh tests/bac-callers-test.sh tests/run.sh install.sh uninstall.sh`.
+- On a machine with Herdr: `bac doctor`, then a launch in a scratch repo. That live check is not what the offline suite replaces.

@@ -43,8 +43,8 @@ case "$1 $2" in
 esac
 H
 chmod +x "$T/herdr"
-export HERDR_BIN_PATH="$T/herdr" GBB_STATE_DIR="$T/state" GBB_CONFIG="$T/none.toml" STUB_DIR="$T"
-unset GBB_OWNER 2>/dev/null || true
+export HERDR_BIN_PATH="$T/herdr" BAC_STATE_DIR="$T/state" BAC_CONFIG="$T/none.toml" STUB_DIR="$T"
+unset BAC_OWNER 2>/dev/null || true
 mkdir -p "$T/state"
 fail() { echo "FAIL: $*"; cat "$T/calls" 2>/dev/null; cat "$T/state/bridge.log" 2>/dev/null; exit 1; }
 reset() { # reset <mode> [extra registry json]
@@ -53,7 +53,7 @@ reset() { # reset <mode> [extra registry json]
     '{pane_id:"w1:p1",workspace_id:"w1",task_id:"t1",agent_name:"gb-t1",kind:"codex",origin:"launched",armed:true} + $x')" >"$T/state/managed.json"
   echo "$1" >"$T/mode"; echo 1 >"$T/sel"; : >"$T/calls"; rm -rf "$T/state/last" "$T/state/pending"; mkdir -p "$T/state/last"
 }
-ev() { HERDR_PLUGIN_EVENT=pane.agent_status_changed HERDR_PLUGIN_EVENT_JSON="{\"data\":{\"pane_id\":\"w1:p1\",\"agent_status\":\"$1\"}}" "$ROOT/bin/gbb" hook; }
+ev() { HERDR_PLUGIN_EVENT=pane.agent_status_changed HERDR_PLUGIN_EVENT_JSON="{\"data\":{\"pane_id\":\"w1:p1\",\"agent_status\":\"$1\"}}" "$ROOT/bin/bac" hook; }
 reg() { jq -r ".panes[\"w1:p1\"] | $1" "$T/state/managed.json"; }
 
 # --- hook classification
@@ -72,26 +72,26 @@ reset queued; ev "done"
 
 # --- send refuses to type into a dialog, with an actionable hint
 reset queued
-out=$("$ROOT/bin/gbb" send t1 "hello" || true)
-printf '%s' "$out" | jq -e '.ok == false and .error.code == "agent_blocked" and (.error.hint | test("gbb answer"))' >/dev/null || fail "send hint: $out"
+out=$("$ROOT/bin/bac" send t1 "hello" || true)
+printf '%s' "$out" | jq -e '.ok == false and .error.code == "agent_blocked" and (.error.hint | test("bac answer"))' >/dev/null || fail "send hint: $out"
 grep -q prompt "$T/calls" && fail "send typed into a dialog"
-"$ROOT/bin/gbb" send t1 --pending >/dev/null 2>&1 && fail "--pending without a saved prompt"
+"$ROOT/bin/bac" send t1 --pending >/dev/null 2>&1 && fail "--pending without a saved prompt"
 
 # --- answer a queued question by label (opens it, moves down, enters)
 reset queued
-out=$("$ROOT/bin/gbb" answer t1 beta)
+out=$("$ROOT/bin/bac" answer t1 beta)
 printf '%s' "$out" | jq -e '.ok and .answered.option == 2 and .answered.label == "Beta"' >/dev/null || fail "answer label: $out"
 [ "$(tr '\n' ' ' <"$T/calls")" = "key shift+left key down key enter answered 2 " ] || fail "answer keys: $(tr '\n' ' ' <"$T/calls")"
 reset dialog
-"$ROOT/bin/gbb" answer t1 7 >/dev/null 2>&1 && fail "bad option accepted"
-"$ROOT/bin/gbb" answer t1 a >/dev/null 2>&1 && fail "ambiguous label accepted"
+"$ROOT/bin/bac" answer t1 7 >/dev/null 2>&1 && fail "bad option accepted"
+"$ROOT/bin/bac" answer t1 a >/dev/null 2>&1 && fail "ambiguous label accepted"
 reset ready
-"$ROOT/bin/gbb" answer t1 1 >/dev/null 2>&1 && fail "answer without dialog"
+"$ROOT/bin/bac" answer t1 1 >/dev/null 2>&1 && fail "answer without dialog"
 
 # --- startup hooks dialog answered -> saved launch prompt is submitted
 reset hooks
 mkdir -p "$T/state/pending"; printf 'do the task' >"$T/state/pending/w1_p1"
-out=$("$ROOT/bin/gbb" answer t1 3)
+out=$("$ROOT/bin/bac" answer t1 3)
 printf '%s' "$out" | jq -e '.ok and .pending_prompt_sent == true' >/dev/null || fail "pending prompt: $out"
 { grep -q 'answered 3' "$T/calls" && grep -q 'prompt do the task' "$T/calls"; } || fail "pending calls: $(tr '\n' ' ' <"$T/calls")"
 [ ! -f "$T/state/pending/w1_p1" ] || fail "pending prompt not cleared"

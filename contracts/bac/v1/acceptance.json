@@ -83,6 +83,7 @@
       "event_id": "5cb0047d8b5de61f00884bcd7272a2330f697d3e91e836002c6a8144d794f0f8",
       "attempt": 1,
       "retry_same_target": false,
+      "attempt_meaning": "per target, not the number of targets that receive the event",
       "on_timeout": "one fallback to primary, same event_id, fallback_reason owner_delivery_failed",
       "http_202_is_success": true,
       "dots_202_without_subscription_does_not_queue": true,
@@ -94,7 +95,7 @@
       "environment": "fixture",
       "ran": false,
       "replay_undelivered": false,
-      "delivery": "at_most_once",
+      "delivery": "per_target_one_attempt_cross_target_duplicate_possible_no_restart_replay",
       "after_restart": "emit a new generation only when the observed status differs from last_status"
     }
   ]

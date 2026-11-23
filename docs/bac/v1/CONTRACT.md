@@ -1,6 +1,16 @@
 # BotAsCollie v1 契约
 
-状态：已冻结，供协调方同步 super-bot。本树的可执行程序仍是 `gbb` 0.3.3，**没有**实现 `bac`。
+状态：v1 已实现。相对 `ae859908` 的修订列在下面，字段名没有另起一套。
+
+## v1 修订（相对 ae859908，供参谋长同步）
+
+哈希输入没有变，仍是 `bac.callback.v1`、pane、event、status、generation。变的是 generation 的寿命和投递保证的说法。
+
+1. **generation 持久化。** 计数写在状态目录的 `event-seq.json`，进程退出、`reclaim`、同一 pane id 再次 handover 都不清零。下一次逻辑事件用下一个整数，因此 `event_id` 不会和旧事件相撞。去抖丢掉的重复状态仍然不加。并发更新走同一把目录锁，写临时文件再改名。
+2. **投递保证。** 每个目标最多一次 HTTP 尝试，所以每份 JSON 里的 `attempt` 恒为 1。这是「该目标的尝试次数」，不是「这个逻辑事件一共送出几次」。owner 超时或非 2xx 时，同一 `event_id` 还会再送给 primary。一个同时看着两边的消费者可能收到两份。重启不重放尚未盖章的事件，因此也会丢。这不是端到端的至多一次，也不是至少一次。消费者用 `event_id` 去重。
+3. **`--owner` 不是认证。** 能在这台机器上执行 `bac` 的人就是受信操作者，可以自己填 owner 字符串。bac 不另做登录服务。Dots 适配器必须用桥自己已经认证的主体写入 `--owner`（今天的 `DOTS_BRIDGE_GBB_OWNER`，切换后由桥配置绑定），不能把工具参数里的 owner 当成调用方身份。
+4. **extras 和 primary fallback 是有意的受信元数据接收者。** 它们收到 id 和状态，不收到终端正文。文档不把这条路径叫做硬隔离。
+5. **模型配置。** 默认不读 `~/.codex/config.toml`。只有 `BAC_ALLOW_CODEX_CONFIG=1` 时才读该文件顶层的 `model` 这一个键。回调和日志仍然不放 header、token 或这个文件里的其他行。这和「不读凭据」是两件事。
 
 ## 给协调方
 
@@ -70,10 +80,13 @@ Dots 桥在切换后必须按 `contracts/bac/v1/dots-argv.json` 的 argv 列表�
 
 ### owner
 
-- 登记行的 `owner` 非空时，`read` / `send` / `answer` / `keys` / `stop` / `reclaim` / `handover` / `owner` 必须带匹配的 `--owner`（或 `BAC_OWNER`）。没带是 `owner_required`。不一致是 `owner_mismatch`。两种都不读终端正文，也不改登记表。
-- `owner` 为空的行是主 webhook 任务，本地调用方可以不带 `--owner`。
-- `status` / `list` / `result` / `wait` / `doctor` / `report` / `capabilities` 不返回终端正文。带了 `--owner` 时，别的 owner 的行返回 `owner_mismatch`。不带 `--owner` 的 `list` 仍返回全部元数据，这是本机操作者路径。
-- 只有当前 owner 可以 `bac owner` 移交或清空。Dot 没有这个工具。
+`--owner` 和 `BAC_OWNER` 是本机调用者自己填写的标签，不是认证结果。bac 不校验这个字符串属于哪个已登录主体。
+
+- 行上已有 owner 时，`read`、`send`、`answer`、`keys`、`stop`、`reclaim`、`handover`、`owner` 必须带同一个 owner。没带是 `owner_required`。不一致是 `owner_mismatch`。两条路径都不读终端，也不改登记表。
+- 行上没有 owner 时，这些命令允许本机调用者不带 `--owner`。这是主 webhook 任务。
+- `status`、`result`、`wait` 不返回终端正文。带了不匹配的 `--owner` 时返回 `owner_mismatch`，并且不先读屏幕。不带 `--owner` 时本机操作者可以看元数据。
+- `list` 和 `report` 不带 `--owner` 时返回全部行的元数据。带了 `--owner` 时只留下这个 owner 的行，不把别人的行报成错误，也不附带终端正文。`doctor` 和 `capabilities` 是机器级的，没有任务 owner。
+- `bac owner` 移交或 `--clear` 同样要求当前 owner。错误的调用方不会改登记表。Dot 没有这个工具，桥也不能把客户端传入的 owner 当成已认证主体。
 
 ### 错误码
 
@@ -171,7 +184,7 @@ bac.callback.v1
 <generation 的十进制>
 ```
 
-四行之间各一个 `\n`，末尾没有额外的 `\n`。同一逻辑事件的 owner 投递和 primary 回退共用一个 `event_id`。`route`、`attempt`、`ts` 不参与计算。generation 只在真正发出一条新通知时加一；被 15 秒去抖丢掉的重复状态不加、也不发送。
+四行之间各一个 `\n`，末尾没有额外的 `\n`。同一逻辑事件的 owner 投递和 primary 回退共用一个 `event_id`。`route`、`attempt`、`ts` 不参与计算。generation 只在真正发出一条新通知时加一；被 15 秒去抖丢掉的重复状态不加、也不发送。计数保存在 `event-seq.json`，`reclaim` 和进程重启都不把它清掉。同一后端 pane id 再次接管时，generation 从上次的下一个整数继续，所以新的 `event_id` 和旧的不同。去重范围是这个状态目录里的 pane id，不是进程内存。
 
 示例：pane `t9`、`agent_status`、`done`、generation `3` → `5cb0047d8b5de61f00884bcd7272a2330f697d3e91e836002c6a8144d794f0f8`。
 
@@ -188,9 +201,9 @@ bac.callback.v1
 | dots 模块关闭且目标是 dots 端口 | 主 webhook | `fallback_reason=dots_unavailable` |
 | 每个事件 | 每个 `[[extra_webhooks]]`，与 owner URL 相同的跳过 | `extra` |
 
-超时是 `webhook_timeout_sec`，默认 5 秒，`curl --max-time`。同一目标不自动重试，所以 `attempt` 恒为 1。HTTP 2xx 算成功，**包括 Dots 在无订阅时返回的 202**。该 202 不会触发 fallback，桥也不排队。进程重启不重放未送达事件（至多一次）。重启后只有观测状态与 `last_status` 不同时才用新的 generation 发一条。钩子仍然马上返回，POST 在后台，不阻塞 Herdr。
+超时是 `webhook_timeout_sec`，默认 5 秒，`curl --max-time`。同一个 URL 不自动再试，所以每一份回调里的 `attempt` 都是 1，表示这个目标的尝试次数。owner 失败后还会把同一 `event_id` 送给 primary，那是第二个目标，不是同一次尝试的第二次。一个逻辑消费者如果同时接收 owner 和 primary，会看到两份，必须用 `event_id` 去重。HTTP 2xx 算成功，包括 Dots 在无订阅时返回的 202。该 202 不会触发 fallback，桥也不排队。进程重启不重放还没盖章的事件，所以可能丢失；重启后只有观测状态与 `last_status` 不同时才用新的 generation 发一条。钩子仍然马上返回，POST 在后台，不阻塞 Herdr。
 
-### 认证与隔离
+### 本机操作者与受信接收者
 
 - 每个目标自己的 header，经 curl 的 stdin 配置传入，不进 argv，不进日志，不进 JSON。日志只有主机名。
 - 配置文件模式不是 600 或 400 则不发。
@@ -246,6 +259,6 @@ Mock/fixture 与真机的差别：fixture 检查 JSON、argv、迁移和基线�
 
 ## 本轮实际检查
 
-`sh tests/bac-contract-test.sh`。它做的是：身份文件与本树一致（还没有 `bin/bac`）、基线 `bin/gbb` 仍是上述观测、用法字符串与 `commands.json` 一致、回调 `event_id` 可重算、终端正文字段被拒绝、kind/模型/额度示例符合规则、隔离 fixture 上的登记表迁移保留 owner 与 pane 且失败不改源文件、活状态目录被拒绝。
+`sh tests/run.sh` 会跑契约检查和 `tests/bac-callers-test.sh`。后者用临时 HOME、假 header 和 stub `hc` 真正执行 `bin/bac`：stub 分配 pane id，本地 HTTP 接收回调。这不是真实 Herdr、hc、Dots 或 ChatGPT。
 
-它不做的是：运行 `bac`、连真实 Dots、刷新 ChatGPT、对用户机器上的 Herdr/hc 发命令、读取真实配置或 token。
+契约检查仍然核对用法字符串、`event_id` 算法、终端正文字段、kind/模型/额度示例，以及隔离 fixture 上的登记表迁移：保留 owner 与 pane，失败不改源文件，已有目标拒绝覆盖，活状态目录拒绝。
