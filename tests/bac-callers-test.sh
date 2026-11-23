@@ -62,7 +62,7 @@ git -C "$T/repo" config user.email t@example.com
 git -C "$T/repo" config user.name t
 echo x >"$T/repo/f" && git -C "$T/repo" add f && git -C "$T/repo" commit -qm init
 cat >"$T/sink.py" <<'PY'
-import http.server, json, os, sys, time
+import http.server, json, os, sys
 out = sys.argv[1]
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
@@ -72,8 +72,6 @@ class H(http.server.BaseHTTPRequestHandler):
         with open(os.path.join(out, self.path.strip("/") + ".jsonl"), "a") as f:
             f.write(json.dumps(rec) + "\n")
             f.flush()
-        if self.path == "/slow":
-            time.sleep(3)
         self.send_response(500 if self.path == "/slow" else 202)
         self.end_headers()
     def log_message(self, *a):
@@ -213,6 +211,10 @@ nowhash=$(jq -c --arg p "$dpane" '.panes[$p]' "$T/state/managed.json" | sha256su
 # transfer then clear, only as the current owner
 "$BAC" owner "$dpane" --owner dot canmouzhang >/dev/null || fail "transfer"
 [ "$("$BAC" list | jq -r --arg p "$dpane" '.managed[] | select(.pane_id==$p) | .owner')" = canmouzhang ] || fail "transfer did not stick"
+qhash=$(jq -c --arg p "$dpane" '.panes[$p]' "$T/state/managed.json" | sha256sum | awk '{print $1}')
+q=$("$BAC" owner "$dpane" --owner canmouzhang)
+printf '%s' "$q" | jq -e '.ok==true and .owner=="canmouzhang"' >/dev/null || fail "owner query: $q"
+[ "$(jq -c --arg p "$dpane" '.panes[$p]' "$T/state/managed.json" | sha256sum | awk '{print $1}')" = "$qhash" ] || fail "owner query wrote the row"
 "$BAC" owner "$dpane" --owner dot --clear >/dev/null 2>&1 && fail "old owner cleared after transfer"
 "$BAC" owner "$dpane" --owner canmouzhang --clear >/dev/null || fail "clear"
 [ "$("$BAC" list | jq -r --arg p "$dpane" '.managed[] | select(.pane_id==$p) | .owner')" = null ] || fail "clear did not stick"
@@ -239,6 +241,9 @@ g2=$(tail -n 1 "$T/hits/dot.jsonl" | jq -r .body.generation)
 [ "$h2" != "$h1" ] || fail "reused pane collided event_id"
 [ "$g2" -gt "$g1" ] || fail "generation did not advance ($g1 -> $g2)"
 
+# --- non-2xx owner delivery falls back once. The sink returns 500 immediately.
+# curl --max-time is the same failure branch. This harness does not sleep inside the sink,
+# so a slow body cannot be mistaken for a generation race.
 # --- timeout: one attempt per target, same event_id on fallback ---
 rm -f "$T/hits"/*
 "$BAC" test-webhook --owner slow >/dev/null
@@ -251,27 +256,102 @@ p_id=$(jq -r .body.event_id "$T/hits/primary.jsonl")
 jq -e '.body.attempt==1 and .body.route=="owner"' "$T/hits/slow.jsonl" >/dev/null || fail "slow attempt"
 jq -e '.body.attempt==1 and .body.route=="fallback" and .body.fallback_reason=="owner_delivery_failed"' "$T/hits/primary.jsonl" >/dev/null || fail "fallback shape"
 
-# --- restart keeps the counter; two processes do not share one generation ---
-before_seq=$(jq -r '[.panes[]] | add' "$T/state/event-seq.json")
+# --- restart keeps the counter; parallel stamps get distinct ids ---
+# Owner matching above is a local label check, not authentication.
+before_seq=$(jq -r '.panes.__none__ // 0' "$T/state/event-seq.json")
 rm -f "$T/hits"/*
 "$BAC" test-webhook >/dev/null
 "$BAC" test-webhook >/dev/null
-after_seq=$(jq -r '[.panes[]] | add' "$T/state/event-seq.json")
-[ "$after_seq" -ge $((before_seq + 2)) ] || fail "restart did not persist generation ($before_seq -> $after_seq)"
-ids=$(jq -r .body.event_id "$T/hits/primary.jsonl" | sort -u | wc -l)
-[ "$ids" -ge 2 ] || fail "two processes produced one event_id"
+after_seq=$(jq -r '.panes.__none__ // 0' "$T/state/event-seq.json")
+[ "$after_seq" -eq $((before_seq + 2)) ] || fail "restart did not persist generation ($before_seq -> $after_seq)"
+ids=$(jq -r .body.event_id "$T/hits/primary.jsonl" | sort -u | wc -l | tr -d ' ')
+[ "$ids" -eq 2 ] || fail "two processes produced one event_id"
+wait_pids() { # seconds pid [pid]
+  limit=$1
+  a=$2
+  b=${3:-}
+  i=0
+  while [ "$i" -lt "$limit" ]; do
+    alive=0
+    kill -0 "$a" 2>/dev/null && alive=1
+    if [ -n "$b" ] && kill -0 "$b" 2>/dev/null; then alive=1; fi
+    [ "$alive" = 0 ] && return 0
+    sleep 0.5
+    i=$((i + 1))
+  done
+  kill "$a" ${b:+"$b"} 2>/dev/null || true
+  return 1
+}
+round=0
+while [ "$round" -lt 3 ]; do
+  seq_before=$(jq -r '.panes.__none__ // 0' "$T/state/event-seq.json")
+  rm -f "$T/hits"/*
+  "$BAC" test-webhook >/dev/null &
+  p1=$!
+  "$BAC" test-webhook >/dev/null &
+  p2=$!
+  if ! wait_pids 40 "$p1" "$p2"; then fail "concurrent round $round exceeded 20s"; fi
+  seq_after=$(jq -r '.panes.__none__ // 0' "$T/state/event-seq.json")
+  [ "$seq_after" -eq $((seq_before + 2)) ] || fail "round $round generation $seq_before -> $seq_after"
+  par=$(jq -r .body.event_id "$T/hits/primary.jsonl" | sort -u | wc -l | tr -d ' ')
+  [ "$par" -eq 2 ] || fail "round $round ids: $(jq -c .body.event_id "$T/hits/primary.jsonl")"
+  round=$((round + 1))
+done
+jq -e '.panes | all(.[]; type=="number")' "$T/state/event-seq.json" >/dev/null || fail "event-seq corrupted"
+
+# PATH without flock. macOS does not ship flock; this Linux VM hides that one name
+# and keeps every other command from PATH.
+nof=$(mktemp -d)
+oldifs=$IFS
+IFS=:
+for d in $PATH; do
+  [ -d "$d" ] || continue
+  for f in "$d"/*; do
+    [ -e "$f" ] || continue
+    base=$(basename "$f")
+    [ "$base" = flock ] && continue
+    [ -e "$nof/$base" ] && continue
+    ln -s "$f" "$nof/$base" 2>/dev/null || true
+  done
+done
+IFS=$oldifs
+if PATH="$nof" command -v flock >/dev/null 2>&1; then fail "flock still visible"; fi
 seq_before=$(jq -r '.panes.__none__ // 0' "$T/state/event-seq.json")
 rm -f "$T/hits"/*
-"$BAC" test-webhook >/dev/null &
+PATH="$nof" "$BAC" test-webhook >/dev/null &
 p1=$!
-"$BAC" test-webhook >/dev/null &
+PATH="$nof" "$BAC" test-webhook >/dev/null &
 p2=$!
-wait "$p1" "$p2"
+if ! wait_pids 40 "$p1" "$p2"; then fail "no-flock round exceeded 20s"; fi
 seq_after=$(jq -r '.panes.__none__ // 0' "$T/state/event-seq.json")
-[ "$seq_after" -eq $((seq_before + 2)) ] || fail "concurrent generation $seq_before -> $seq_after"
-par=$(jq -r .body.event_id "$T/hits/primary.jsonl" | sort -u | wc -l | tr -d ' ')
-[ "$par" -eq 2 ] || fail "concurrent stamps collided: $(jq -c .body.event_id "$T/hits/primary.jsonl")"
-jq -e '.panes | all(.[]; type=="number")' "$T/state/event-seq.json" >/dev/null || fail "event-seq corrupted"
+[ "$seq_after" -eq $((seq_before + 2)) ] || fail "no-flock generation $seq_before -> $seq_after"
+par=$(PATH="$nof" jq -r .body.event_id "$T/hits/primary.jsonl" | sort -u | wc -l | tr -d ' ')
+[ "$par" -eq 2 ] || fail "no-flock ids collided"
+doc=$(PATH="$nof" "$BAC" doctor)
+printf '%s' "$doc" | jq -e '.generation_lock=="mkdir" and .flock_required==false and .flock_present==false and .sha256==true' >/dev/null || fail "doctor without flock: $doc"
+
+# A live holder is not evicted, and a failed jq does not roll the counter backwards.
+mkdir -p "$T/state/.lock"
+printf '%s\n' "$$" >"$T/state/.lock/pid"
+held=$(jq -c . "$T/state/event-seq.json")
+PATH="$nof" "$BAC" test-webhook >/dev/null &
+p1=$!
+if ! wait_pids 50 "$p1"; then kill "$p1" 2>/dev/null || true; fail "held-lock webhook exceeded 25s"; fi
+[ "$(cat "$T/state/.lock/pid")" = "$$" ] || fail "live lock was stolen"
+[ "$(jq -c . "$T/state/event-seq.json")" = "$held" ] || fail "live lock still advanced generation"
+rm -rf "$T/state/.lock"
+badjq=$(mktemp -d)
+printf '%s\n' '#!/bin/sh' 'exit 1' >"$badjq/jq"
+chmod +x "$badjq/jq"
+for c in git curl python3 sha256sum sh; do
+  src=$(command -v "$c" 2>/dev/null || true)
+  [ -n "$src" ] && ln -s "$src" "$badjq/$c"
+done
+held=$(sha256sum "$T/state/event-seq.json" | awk '{print $1}')
+if PATH="$badjq:$PATH" "$BAC" test-webhook >/dev/null 2>"$T/jqfail.err"; then
+  fail "broken jq still stamped"
+fi
+[ "$(sha256sum "$T/state/event-seq.json" | awk '{print $1}')" = "$held" ] || fail "failed jq rewrote event-seq"
 
 # --- model config is opt-in and allowlisted; a Codex footer is an observation, not a quota ---
 st=$("$BAC" status g1)

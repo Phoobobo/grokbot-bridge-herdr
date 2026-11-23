@@ -184,7 +184,7 @@ bac.callback.v1
 <generation 的十进制>
 ```
 
-四行之间各一个 `\n`，末尾没有额外的 `\n`。同一逻辑事件的 owner 投递和 primary 回退共用一个 `event_id`。`route`、`attempt`、`ts` 不参与计算。generation 只在真正发出一条新通知时加一；被 15 秒去抖丢掉的重复状态不加、也不发送。计数保存在 `event-seq.json`，`reclaim` 和进程重启都不把它清掉。同一后端 pane id 再次接管时，generation 从上次的下一个整数继续，所以新的 `event_id` 和旧的不同。去重范围是这个状态目录里的 pane id，不是进程内存。
+四行之间各一个 `\n`，末尾没有额外的 `\n`。同一逻辑事件的 owner 投递和 primary 回退共用一个 `event_id`。`route`、`attempt`、`ts` 不参与计算。generation 只在真正发出一条新通知时加一；被 15 秒去抖丢掉的重复状态不加、也不发送。计数保存在 `event-seq.json`，`reclaim` 和进程重启都不把它清掉。同一后端 pane id 再次接管时，generation 从上次的下一个整数继续，所以新的 `event_id` 和旧的不同。去重范围是这个状态目录里的 pane id，不是进程内存。写入是临时文件再 `mv` 到 `event-seq.json`；jq 或 `mv` 失败时不改已有文件，也不把计数退回旧值。互斥用带 pid 的 mkdir 锁。活着的持有者不会被删掉。`flock` 不是依赖，macOS 默认没有它。`bac doctor` 的 `generation_lock` 是 `mkdir`，`flock_required` 是 false。
 
 示例：pane `t9`、`agent_status`、`done`、generation `3` → `5cb0047d8b5de61f00884bcd7272a2330f697d3e91e836002c6a8144d794f0f8`。
 

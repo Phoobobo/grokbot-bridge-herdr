@@ -1,6 +1,6 @@
 # AGENTS.md — grokbot-bridge-herdr
 
-Herdr plugin + `gbb` CLI that let Grok Bot drive and watch coding agents (grok, codex) in Herdr panes on the user's machine. ChatGPT dots use the same `gbb` through the companion MCP server [dots-tunnel-bridge](https://github.com/Phoobobo/dots-tunnel-bridge) (fork of uezo/dots-bridge, exposed via OpenAI Secure MCP Tunnel), whose `gbb_*` tools call these subcommands and whose `/herdr/webhook` receives `[[extra_webhooks]]` and the `dot` owner target — keep `gbb`'s JSON output, subcommand flags and webhook payload compatible with it (see `docs/decisions/0003`) until the BotAsCollie cutover below.
+Herdr plugin + `bac` CLI (BotAsCollie) that let a caller drive and watch coding agents (grok, codex) in Herdr panes on the user's machine. ChatGPT dots still reach this through [dots-tunnel-bridge](https://github.com/Phoobobo/dots-tunnel-bridge) (fork of uezo/dots-bridge, exposed via OpenAI Secure MCP Tunnel). That bridge's current `gbb_*` tools and `source` check are not updated in this repository; see `docs/bac/v1/MIGRATION.md`. Do not describe both ends as working until that cutover and a ChatGPT tool refresh.
 
 ## BotAsCollie
 
@@ -19,16 +19,18 @@ Every commit and pull request must leave enough context that later work can trac
 
 - `herdr-plugin.toml` — Herdr plugin manifest v1 (`phoobobo.bot-as-collie`): event hooks and pane actions. All entrypoints run `bin/bac`.
 - `bin/bac` — the whole implementation, POSIX sh + jq + git + curl. User-facing subcommands print one JSON document.
-- `config.example.toml` — webhook config template. Real config lives in `~/.config/grokbot-bridge-herdr/config.toml` (mode 600) and is never committed.
-- `install.sh` / `uninstall.sh` — symlink `gbb` into `~/.local/bin` and link/unlink the plugin.
+- `config.example.toml` — webhook config template. Real config lives in `~/.config/bot-as-collie/config.toml` (mode 600) and is never committed.
+- `install.sh` / `uninstall.sh` — symlink `bac` into `~/.local/bin` and link/unlink the plugin. `flock` is not required. `sha256sum` or macOS `shasum` is.
 - `tests/hook-test.sh` — offline hook/debounce test with a stubbed `herdr`.
 - `tests/prompt-test.sh` — offline prompt delivery/retry test with a stubbed `herdr` (~45 s).
 - `tests/webhook-test.sh` — offline primary + `[[extra_webhooks]]` delivery test against a local HTTP sink.
 - `tests/owner-test.sh` — offline owner routing / fallback / extra dedupe test against a local HTTP sink (~25 s).
-- `tests/screen-test.sh` — offline Codex screen handling (hooks review, queued question, fresh session, `gbb answer`, pending launch prompt) with a stubbed `herdr` that draws Codex 0.166 screens.
+- `tests/screen-test.sh` — offline Codex screen handling (hooks review, queued question, fresh session, `bac answer`, pending launch prompt) with a stubbed `herdr` that draws Codex 0.166 screens.
 - `tests/hc-backend-test.sh` — offline herdr-core backend (command construction, `hc events` → callbacks, backend selection, legacy registry rows).
 - `tests/place-test.sh` — offline Herdr-app placement for hc launches and handover (stubbed `hc` and `herdr-app`).
-- `tests/bac-contract-test.sh` — offline BotAsCollie v1 contract check (fixtures, baseline observations, registry migration). Does not run `bac`.
+- `tests/bac-contract-test.sh` — offline contract and fixture-migration check.
+- `tests/bac-callers-test.sh` — stub `hc` plus a loopback sink. Not a live Herdr, hc, or Dots run.
+- `tests/run.sh` — fail-fast runner for `tests/*.sh` except itself.
 - `docs/bac/v1/` — BotAsCollie v1 contract and migration checklist. `contracts/bac/v1/` — machine-readable fixtures.
 - `docs/decisions/` — ADRs.
 
@@ -38,10 +40,10 @@ Every commit and pull request must leave enough context that later work can trac
 - Only managed panes (in `managed.json`) produce webhooks. Ignore `working`; send `done`, `idle`, `blocked`, plus `handover`, `reclaim`, `stopped`, `pane_closed`.
 - Webhook payloads carry ids and status only: no terminal output, no prompts, no environment, no secrets.
 - The auth header is passed to curl via stdin config so it never appears in `ps`. Logs record the host, never the URL path or header.
-- `gbb stop` closes only workspaces gbb created (and only when they still hold just the managed pane). Handover panes are unregistered, never closed.
-- Never run `herdr server stop` or `hc server stop`. Never touch panes or hc terminals that are not managed. `gbb stop` on the hc backend kills and removes only terminals gbb created. Handover terminals are unregistered, never killed; reclaim removes the `grokbot` / `gbb_task` labels and leaves `herdr.space` in place. Do not `space.close` or `tab.close`: the app drops the pane when that terminal ends, and closes a space only when its last tab goes.
+- `bac stop` closes only workspaces bac created (and only when they still hold just the managed pane). Handover panes are unregistered, never closed.
+- Never run `herdr server stop` or `hc server stop`. Never touch panes or hc terminals that are not managed. `bac stop` on the hc backend kills and removes only terminals bac created. Handover terminals are unregistered, never killed; reclaim removes the `bac` / `bac_task` labels and also the legacy `grokbot` / `gbb_task` labels, and leaves `herdr.space` in place. Do not `space.close` or `tab.close`: the app drops the pane when that terminal ends, and closes a space only when its last tab goes.
 - Never answer the Grok "Help improve Grok" banner with Opt in.
-- Never type a prompt into a Codex dialog (digits / letters pick options). Never choose a dialog option (e.g. trust hooks) without an explicit `gbb answer` / `gbb keys` from the caller.
+- Never type a prompt into a Codex dialog (digits / letters pick options). Never choose a dialog option (e.g. trust hooks) without an explicit `bac answer` / `bac keys` from the caller.
 - Callbacks follow the task owner (docs/decisions/0004): owner target first, the primary webhook as fallback, extras unchanged except URL dedupe. A failed owner delivery must still reach the primary.
 
 ## Verify

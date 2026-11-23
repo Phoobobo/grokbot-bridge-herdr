@@ -1,6 +1,6 @@
 # 0008 — Freeze a BotAsCollie v1 contract before implementing it
 
-Date: 2026-11-23 · Status: accepted (contract only; the `gbb` 0.3.3 runtime in this tree is unchanged)
+Date: 2026-11-23 · Status: accepted. The runtime in this tree is `bac` 1.0.0 (`runtime_implemented: true`). The paragraphs below that say the contract was not implemented describe the `ae859908` decision, not the current tree.
 
 ## Context
 
@@ -27,9 +27,11 @@ The implementation kept the event_id inputs. Generation is now stored in `event-
 
 ## Consequences
 
-- Installing this branch still installs `gbb` 0.3.3. Dots keeps working only while it still calls `gbb`.
-- The next phase implements `bac` on this same branch and opens a draft PR. It must set `runtime_implemented` true and keep `sh tests/bac-contract-test.sh` passing.
+- `install.sh` on this branch installs `bac` and removes a `~/.local/bin/gbb` symlink. It does not install a `gbb` compatibility command. `runtime_implemented` is true.
+- Draft PR #3 exists. Its remote head at the time of this note is `2b8d03475b6ef893fc9cdd16d712fe062f41c3ef`. Later local commits are not on that remote until a push. This session does not push.
 - Dots must change source check, tool names, argv, the handover pane check, and dedupe in the same cutover, then the operator refreshes tools in ChatGPT. Until both sides are deployed, neither side should be described as working with the other.
+- Generation is published by renaming a temporary file onto `event-seq.json`. The mutual exclusion is a mkdir lock with the holder's pid. `flock` is not required and is not part of stock macOS. A live holder's lock is not deleted. `bac doctor` reports `generation_lock: mkdir`, `flock_required: false`, and `flock_present`.
+- `bac migrate` still refuses live directories and an existing destination. It does not relabel live hc terminals. That production cutover is still a human step, not something this tool has finished.
 - Super-bot's owner name and webhook were not found in a public repository. The coordinator fills those in. Super-bot does not get a private hc client.
 - ADR 0004 fallback to the primary webhook remains. That is a trusted-operator path, not a second product identity.
 
@@ -38,5 +40,5 @@ The implementation kept the event_id inputs. Generation is now stored in `event-
 - Keep emitting `source=grokbot-bridge-herdr` so today's bridge keeps working. Rejected: the target is a breaking identity, and a shim would become the compatibility layer this change is not allowed to keep.
 - Default omitted kind to grok (baseline) or codex (Dots). Rejected: an omitted kind would be presented as a real agent.
 - Put model and quota on the callback. Rejected: extras mirror every callback, and v1 has no quota observation to send.
-- Replay webhooks after restart. Rejected: the baseline is at-most-once and a queue would be new behavior sold as compatibility. `event_id` makes the at-most-once delivery deduplicable when a fallback posts the same logical event.
+- Replay webhooks after restart. Rejected: there is no queue. A later revision states the actual guarantee: one attempt per target, a possible second copy on the primary after owner failure, and loss if the process exits before the stamp. Consumers dedupe on `event_id`. That is not an end-to-end at-most-once promise.
 - Migrate by rewriting live hc labels inside the fixture tool. Rejected: that touches real sessions. Legacy labels stay on the row so a later watcher can still find them.

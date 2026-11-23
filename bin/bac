@@ -66,20 +66,15 @@ enforce_owner() {
     die_owner owner_mismatch "pane is owned by another caller" "$row" "$call"
   fi
 }
-take_owner_flag() { # shifts --owner off the front of "$@"; echoes remaining via globals is hard. Not used.
-  :
-}
-
 # Durable per-pane generation. Survives process exit and reclaim. Never reset when a pane id is reused.
+# The lock is mkdir plus a pid file. flock is not required: stock macOS does not ship it.
+# A live holder's directory is never removed. A dead pid, or a pid-less directory older than 5s, is residue.
 SEQ_FILE() { printf '%s/event-seq.json' "$STATE_DIR"; }
+dir_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
 next_generation() {
   pane="${1:-}"
   [ -n "$pane" ] || pane=__none__
-  lock
-  if command -v flock >/dev/null 2>&1; then
-    exec 9>>"$STATE_DIR/.gen.lock"
-    flock 9
-  fi
+  lock || return 1
   seq=$(SEQ_FILE)
   [ -s "$seq" ] || printf '%s\n' '{"version":1,"panes":{}}' >"$seq"
   tmp="$seq.tmp.$$"
@@ -88,9 +83,21 @@ next_generation() {
     unlock
     return 1
   fi
-  n=$(jq -r '.n' "$tmp")
-  jq '.doc' "$tmp" >"$tmp.doc" && mv "$tmp.doc" "$seq" && chmod 600 "$seq"
-  rm -f "$tmp" "$tmp.doc"
+  n=$(jq -r '.n' "$tmp" 2>/dev/null || true)
+  case "$n" in
+    ''|*[!0-9]*)
+      rm -f "$tmp"
+      unlock
+      return 1 ;;
+  esac
+  # Rename onto the live file. A failed jq or mv leaves the previous event-seq.json in place.
+  if ! jq '.doc' "$tmp" >"$tmp.doc" || ! mv "$tmp.doc" "$seq"; then
+    rm -f "$tmp" "$tmp.doc"
+    unlock
+    return 1
+  fi
+  chmod 600 "$seq" || true
+  rm -f "$tmp"
   unlock
   printf '%s' "$n"
 }
@@ -157,20 +164,41 @@ expand_home() { case "$1" in "~") printf '%s' "$HOME" ;; "~/"*) printf '%s/%s' "
 abspath() { (cd "$1" 2>/dev/null && pwd -P); }
 
 lock() {
+  dir="$STATE_DIR/.lock"
   i=0
-  while ! mkdir "$STATE_DIR/.lock" 2>/dev/null; do
+  while ! mkdir "$dir" 2>/dev/null; do
+    pid=$(cat "$dir/pid" 2>/dev/null || true)
+    if [ -n "$pid" ]; then
+      if ! kill -0 "$pid" 2>/dev/null; then
+        if [ "$(cat "$dir/pid" 2>/dev/null || true)" = "$pid" ]; then
+          rm -f "$dir/pid"
+          rmdir "$dir" 2>/dev/null || true
+        fi
+      fi
+    else
+      age=$(( $(date +%s) - $(dir_mtime "$dir") ))
+      if [ "$age" -gt 5 ]; then rm -rf "$dir"; fi
+    fi
     i=$((i + 1))
-    if [ "$i" -gt 50 ]; then rm -rf "$STATE_DIR/.lock"; fi # stale (>5s)
-    sleep 0.1
+    if [ "$i" -gt 80 ]; then
+      log "lock busy pid=${pid:-none}; not removing a live holder"
+      return 1
+    fi
+    sleep 0.05
   done
+  printf '%s\n' "$$" >"$dir/pid" || { rmdir "$dir" 2>/dev/null || true; return 1; }
 }
-unlock() { rmdir "$STATE_DIR/.lock" 2>/dev/null; }
+unlock() {
+  dir="$STATE_DIR/.lock"
+  rm -f "$dir/pid"
+  rmdir "$dir" 2>/dev/null || rm -rf "$dir"
+}
 
 registry_read() { if [ -s "$REGISTRY" ]; then cat "$REGISTRY"; else printf '{"version":1,"panes":{}}'; fi; }
 # registry_update <jq-filter> [jq args...]
 registry_update() {
   f="$1"; shift
-  lock
+  lock || return 1
   tmp="$REGISTRY.tmp.$$"
   if registry_read | jq "$@" "$f" >"$tmp" 2>>"$LOG"; then mv "$tmp" "$REGISTRY"; chmod 600 "$REGISTRY"; rc=0; else rm -f "$tmp"; rc=1; fi
   unlock
@@ -2406,8 +2434,14 @@ cmd_doctor() {
     --arg reg "$REGISTRY" --arg log "$LOG" --argjson linked "${linked:-0}" --arg allow "$(cfg_list allowed_repos | tr '\n' ' ')" \
     --arg owners "$(cfg_owners | while IFS="$US" read -r on ou _hn ohv; do printf '%s\t%s\t%s\n' "$on" "$(url_host "$ou")" "$( [ -n "$ohv" ] && echo set)"; done)" \
     --argjson cargs "$(cfg_array codex_args | jq -R . | jq -sc .)" --arg cdef "$(codex_user_defaults)" \
+    --arg fl "$(command -v flock >/dev/null 2>&1 && echo yes || echo no)" \
+    --arg sha "$(command -v sha256sum >/dev/null 2>&1 && echo sha256sum || { command -v shasum >/dev/null 2>&1 && echo shasum || echo; })" \
     --argjson modules "$mods" '
-    {ok:true, version:$v, herdr:$herdr, hc:(if $hcver == "" then null else $hcver end), backend:$be,
+    {ok:true, version:$v, contract:"bac.v1", source:"bot-as-collie",
+     generation_lock:"mkdir", flock_required:false,
+     flock_present:(if $fl == "yes" then true else false end),
+     sha256:($sha != ""),
+     herdr:$herdr, hc:(if $hcver == "" then null else $hcver end), backend:$be,
      modules:$modules,
      jq:$jq, curl:($curl != ""), plugin_linked:($linked > 0),
      config:{path:$cfg, exists:($mode != ""), mode:(if $mode=="" then null else $mode end), mode_ok:($mode=="600" or $mode=="400"),
