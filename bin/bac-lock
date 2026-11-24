@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # Isolated lock helper for bac. Not installed globally.
-# Holds an fcntl exclusive lock on a regular file and commits one file
-# replace before exiting. The kernel drops the lock when this process
-# exits. This program never renames or removes the lock file.
+# Holds an fcntl exclusive lock on a regular file. A clean failure
+# returns before any state file is replaced. `paired` commits the
+# registry and the generation under that same lock. The kernel drops
+# the lock when this process exits. This program never renames or
+# removes the lock file.
 import errno
 import fcntl
 import json
@@ -112,13 +114,94 @@ def run_jq(cmd, src, orig):
     return proc.returncode, out
 
 
-def generation(lockfile, seqfile, pane, orig):
+def read_bytes(path, default):
+    if os.path.isfile(path) and os.path.getsize(path) > 0:
+        with open(path, "rb") as handle:
+            return handle.read()
+    return default
+
+
+def lock_dir(lockfile):
+    return os.path.dirname(os.path.abspath(lockfile))
+
+
+def pending_path(lockfile):
+    return os.path.join(lock_dir(lockfile), "commit-pending.json")
+
+
+def same_dir(lockfile, path, name):
+    directory = lock_dir(lockfile)
+    full = os.path.abspath(path)
+    return os.path.dirname(full) == directory and os.path.basename(full) == name
+
+
+def apply_pending(lockfile, orig):
+    path = pending_path(lockfile)
+    if not os.path.isfile(path):
+        return
+    with open(path, "rb") as handle:
+        doc = json.loads(handle.read().decode("utf-8"))
+    if not isinstance(doc, dict) or doc.get("v") != 1:
+        sys.exit(1)
+    if doc.get("registry_name") != "managed.json" or doc.get("seq_name") != "event-seq.json":
+        sys.exit(1)
+    registry = doc.get("registry")
+    seq = doc.get("seq")
+    if not isinstance(registry, str) or not isinstance(seq, str) or registry == "" or seq == "":
+        sys.exit(1)
+    directory = lock_dir(lockfile)
+    replace(os.path.join(directory, "managed.json"), registry.encode("utf-8"), orig)
+    replace(os.path.join(directory, "event-seq.json"), seq.encode("utf-8"), orig)
+    if not parent_alive(orig):
+        sys.exit(3)
+    os.remove(path)
+
+
+def open_locked(lockfile, orig):
     fd = os.open(lockfile, os.O_CREAT | os.O_RDWR, 0o600)
     os.set_inheritable(fd, False)
     acquire(fd, orig)
     wait_step("held", orig)
     if not parent_alive(orig):
         sys.exit(3)
+    apply_pending(lockfile, orig)
+    if not parent_alive(orig):
+        sys.exit(3)
+    return fd
+
+
+def load_doc(src):
+    try:
+        data = json.loads(src.decode("utf-8") or "null")
+    except (UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def pane_in(doc, pane):
+    panes = doc.get("panes") if isinstance(doc, dict) else None
+    return isinstance(panes, dict) and pane in panes
+
+
+def seq_payload(src, pane, prev):
+    doc = load_doc(src)
+    if doc is None:
+        doc = {"version": 1, "panes": {}}
+    panes = doc.get("panes")
+    if not isinstance(panes, dict):
+        panes = {}
+        doc["panes"] = panes
+    if "version" not in doc:
+        doc["version"] = 1
+    doc["panes"][pane] = prev + 1
+    text = json.dumps(doc, separators=(",", ":")) + "\n"
+    return text.encode("utf-8")
+
+
+def generation(lockfile, seqfile, pane, orig):
+    open_locked(lockfile, orig)
     if os.path.isfile(seqfile) and os.path.getsize(seqfile) > 0:
         with open(seqfile, "rb") as handle:
             src = handle.read()
@@ -156,13 +239,75 @@ def generation(lockfile, seqfile, pane, orig):
     sys.stdout.flush()
 
 
-def jq_apply(lockfile, dest, jq_filter, jq_args, orig):
-    fd = os.open(lockfile, os.O_CREAT | os.O_RDWR, 0o600)
-    os.set_inheritable(fd, False)
-    acquire(fd, orig)
-    wait_step("held", orig)
+def paired(lockfile, registry, seqfile, pane, mode, jq_filter, jq_args, orig):
+    if mode not in ("end", "require", "insert"):
+        sys.exit(1)
+    if not same_dir(lockfile, registry, "managed.json") or not same_dir(lockfile, seqfile, "event-seq.json"):
+        sys.exit(1)
+    open_locked(lockfile, orig)
+    reg_src = read_bytes(registry, b'{"version":1,"panes":{}}\n')
+    seq_src = read_bytes(seqfile, b'{"version":1,"panes":{}}\n')
+    before = load_doc(reg_src)
+    if before is None:
+        sys.exit(1)
+    prev = previous_generation(seq_src, pane)
+    if prev is None or prev >= 9007199254740992:
+        sys.exit(1)
+    code, out = run_jq(["jq", *jq_args, jq_filter], reg_src, orig)
+    if code != 0:
+        sys.exit(1)
+    try:
+        after = json.loads(out.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        sys.exit(1)
+    if not isinstance(after, dict):
+        sys.exit(1)
+    had = pane_in(before, pane)
+    has = pane_in(after, pane)
+    if mode == "end":
+        if not had:
+            sys.exit(4)
+        if has:
+            sys.exit(1)
+    elif mode == "require":
+        if not had:
+            sys.exit(4)
+        if not has:
+            sys.exit(1)
+    elif not has:
+        sys.exit(1)
+    reg_payload = out if out.endswith(b"\n") else out + b"\n"
+    seq_out = seq_payload(seq_src, pane, prev)
+    if previous_generation(seq_out, pane) != prev + 1:
+        sys.exit(1)
     if not parent_alive(orig):
         sys.exit(3)
+    journal = {
+        "v": 1,
+        "registry_name": "managed.json",
+        "seq_name": "event-seq.json",
+        "registry": reg_payload.decode("utf-8"),
+        "seq": seq_out.decode("utf-8"),
+    }
+    replace(
+        pending_path(lockfile),
+        (json.dumps(journal, separators=(",", ":")) + "\n").encode("utf-8"),
+        orig,
+    )
+    replace(seqfile, seq_out, orig)
+    replace(registry, reg_payload, orig)
+    if not parent_alive(orig):
+        sys.exit(3)
+    try:
+        os.remove(pending_path(lockfile))
+    except OSError:
+        pass
+    sys.stdout.write("%d\n" % (prev + 1))
+    sys.stdout.flush()
+
+
+def jq_apply(lockfile, dest, jq_filter, jq_args, orig):
+    open_locked(lockfile, orig)
     if os.path.isfile(dest) and os.path.getsize(dest) > 0:
         with open(dest, "rb") as handle:
             src = handle.read()
@@ -186,12 +331,17 @@ def main(argv):
         if op == "jq-apply" and len(argv) >= 5:
             jq_apply(argv[2], argv[3], argv[4], argv[5:], orig)
             return 0
+        if op == "paired" and len(argv) >= 8:
+            paired(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8:], orig)
+            return 0
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         if getattr(exc, "errno", None) == errno.EAGAIN:
             return 2
         sys.stderr.write("bac-lock: %s\n" % exc)
         return 1
-    sys.stderr.write("usage: bac-lock generation LOCK SEQ PANE | jq-apply LOCK DEST FILTER [jq-args]\n")
+    sys.stderr.write(
+        "usage: bac-lock generation LOCK SEQ PANE | jq-apply LOCK DEST FILTER [jq-args] | paired LOCK REG SEQ PANE end|require|insert FILTER [jq-args]\n"
+    )
     return 1
 
 
