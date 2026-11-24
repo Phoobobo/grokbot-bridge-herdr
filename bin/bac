@@ -114,8 +114,9 @@ bac_lock() {
   python3 "$helper" "$@"
 }
 # paired_generation <pane> <end|require|insert> <jq-filter> [jq args...]
-# Prints the generation. A non-zero status means this call did not replace
-# managed.json or event-seq.json. Exit 4 means the pane was already absent.
+# Prints the generation on success. Non-zero means this call did not replace
+# managed.json or event-seq.json and did not publish a generation.
+# 4: pane already absent. 6: insert saw another owner. 7: insert saw the same row.
 paired_generation() {
   pane="$1"; mode="$2"; filter="$3"; shift 3
   n=$(bac_lock paired "$(LOCK_FILE)" "$REGISTRY" "$(SEQ_FILE)" "$pane" "$mode" "$filter" "$@" 2>>"$LOG")
@@ -780,6 +781,10 @@ deliver_status() {
     --arg p "$pane" --arg s "$st" --arg t "$(iso_now)" --arg r "$reason" \
     --argjson now "$(now)" --argjson deb "$deb" 2>>"$LOG")
   rc=$?
+  if [ "$rc" = 4 ]; then
+    log "status $pane ignored: pane is not registered; no row was created and no webhook was sent"
+    return 0
+  fi
   if [ "$rc" != 0 ]; then
     log "status $pane stopped before commit rc=$rc"
     return "$rc"
@@ -845,7 +850,10 @@ hc_baseline_terminal() { # one Terminal from a snapshot: seed, or catch up a mis
   idf=$(printf '%s' "$pane" | tr ':' '_')
   [ "$(printf '%s' "$1" | jq -r '.reported // false' 2>/dev/null)" = true ] && touch "$LAST_DIR/$idf.reported"
   if [ ! -f "$LAST_DIR/$idf" ]; then
-    [ -n "$word" ] && printf '%s %s\n' "$word" "$(now)" >"$LAST_DIR/$idf"
+    if [ -n "$word" ]; then
+      note_seen "$pane" "$word" || log "baseline $pane: seen-status was not recorded"
+      printf '%s %s\n' "$word" "$(now)" >"$LAST_DIR/$idf"
+    fi
     return 0
   fi
   [ -n "$word" ] || return 0
@@ -876,6 +884,7 @@ hc_on_foreground() {
   fi
   printf '%s\n' "$(now)" >"$LAST_DIR/$idf.screenpoll"
   if screen_busy "$pane"; then
+    note_seen "$pane" working || log "foreground $pane: seen-status was not recorded"
     printf '%s %s\n' working "$(now)" >"$LAST_DIR/$idf"
     return 0
   fi
@@ -928,6 +937,7 @@ hc_emit_from_data() { # pane, status-event data
   [ "$(printf '%s' "$2" | jq -r '.reported // false')" = true ] && touch "$LAST_DIR/$idf.reported"
   word=$(printf '%s' "$2" | jq -r 'if (.status|type) == "object" then (.status.state // empty) else empty end')
   if [ -z "$word" ]; then
+    note_seen "$1" none || log "status $1: seen-status was not recorded"
     printf '%s %s\n' none "$(now)" >"$LAST_DIR/$idf"
     return 0
   fi
@@ -951,9 +961,11 @@ hc_watch_once() {
 }
 
 cmd_hc_watch() {
-  # Inherited from the launcher: ignored SIGHUP survives exec, and this
-  # process is not a job of the launch shell. $$ is this process.
+  # Inherited SIGHUP ignore survives exec. $$ here is this process, not launch.
+  # Rebind the lock owner even if a parent exported its own pid.
   trap '' HUP
+  BAC_LOCK_OWNER_PID=$$
+  export BAC_LOCK_OWNER_PID
   BAC_CTX=hc-watch
   SCREEN_BACKEND=hc
   pidf="$STATE_DIR/hc-watch.pid"
@@ -976,11 +988,13 @@ ensure_hc_watch() {
     old=$(cat "$pidf" 2>/dev/null || true)
     if [ -n "${old:-}" ] && kill -0 "$old" 2>/dev/null; then return 0; fi
   fi
-  # A new process, not a subshell of launch. Its pid file stores its own
-  # $$, and it keeps running after launch exits so a later done can be delivered.
+  # New process. Drop the launcher's BAC_LOCK_OWNER_PID before exec: the
+  # script sets that variable only when it is empty, and the helper trusts it
+  # rather than the process that actually called it. cmd_hc_watch binds it to
+  # this process again. A live pid is not a delivered callback.
   export BAC_STATE_DIR="$STATE_DIR" BAC_DATA_DIR="$DATA_DIR" BAC_CONFIG="$CONFIG_FILE"
   self=$(bac_resolved)
-  (trap '' HUP; exec "$self" hc-watch) </dev/null >/dev/null 2>&1 &
+  (trap '' HUP; unset BAC_LOCK_OWNER_PID; exec "$self" hc-watch) </dev/null >/dev/null 2>&1 &
 }
 
 # wait_hc_ready <terminal> <kind> — 0 ready, 1 timeout, 3 dialog (WAIT_STATE).
@@ -1394,7 +1408,7 @@ cmd_hook() {
           hooks_review | question | dialog) st=blocked; reason="$ss" ;;
           fresh)
             lu=$(printf '%s' "$entry" | jq -r '.launching_until // 0')
-            if [ "$(now)" -lt "${lu:-0}" ]; then remember_status "$lastf" "$raw"; log "fresh $pane while launching: ignored"; exit 0; fi
+            if [ "$(now)" -lt "${lu:-0}" ]; then note_seen "$pane" "$raw" || log "fresh $pane: seen-status was not recorded"; remember_status "$lastf" "$raw"; log "fresh $pane while launching: ignored"; exit 0; fi
             if [ "$(printf '%s' "$entry" | jq -r '.origin')" = launched ]; then st=blocked; reason=prompt_not_submitted; else st=idle; fi ;;
         esac
         [ -n "$reason" ] && log "reclassified $pane herdr=$(printf '%s' "$js" | jq -r '.data.agent_status') -> $st ($reason)"
@@ -1419,6 +1433,21 @@ ctx_pane() {
 toast() { "$HERDR" notification show "$1" --body "$2" --sound none >/dev/null 2>&1 || true; }
 
 # ---------- handover / reclaim ----------
+# handover_insert_rc <rc> <pane>
+# 0 continues into labels and the handover webhook.
+# 6 and 7 do not stamp and do not replace the row.
+handover_insert_rc() {
+  case "$1" in
+    0) return 0 ;;
+    6) die_owner owner_mismatch "handover did not replace the existing row; the registry was not changed and no webhook was sent" "" "$howner" ;;
+    7)
+      e=$(entry_for_pane "$2")
+      [ -n "$e" ] || die not_managed "the pane was present at the lock and is now absent; this call did not stamp or overwrite"
+      printf '%s' "$e" | jq -c '. + {already_managed:true}'
+      return 7 ;;
+    *) die lock_unavailable "handover was not stored; the registry and generation were not changed and no webhook was sent" ;;
+  esac
+}
 do_handover_hc() { # do_handover_hc <terminal> <note> <owner>
   pane="$1"; note="$2"; howner="$3"
   js=$(hc_get_json "$pane") || die pane_not_found "terminal $pane not found"
@@ -1469,8 +1498,8 @@ do_handover_hc() { # do_handover_hc <terminal> <note> <owner>
       seen_status:(if $s=="" then null else $s end), seen_at:$sn}' \
     --arg o "$howner" --arg p "$addr" --arg task "$task" --arg n "$name" --arg k "$happ" --arg r "$repo" --arg cwd "$cwd" \
     --arg note "$note" --arg t "$(iso_now)" --arg s "$st" --argjson sn "$(now)" --arg hs "$PLACE_SPACE" --argjson hsc "$hsc" \
-    --arg ht "$PLACE_TAB" --argjson htc "$htc") \
-    || die lock_unavailable "handover was not stored; the registry and generation were not changed and no webhook was sent"
+    --arg ht "$PLACE_TAB" --argjson htc "$htc")
+  handover_insert_rc $? "$addr" || return 0
   if valid_space_id "$ho_sp" && valid_space_id "$ho_tab"; then
     "$HC" label "$addr" bac=managed "bac_task=$task" >/dev/null 2>&1 || log "hc label failed for $addr"
   elif valid_space_id "$ho_sp"; then
@@ -1535,8 +1564,8 @@ do_handover() { # do_handover <pane> <note> [owner] -> prints entry
       created_workspace:false, backend:"herdr", owner:(if $o=="" then null else $o end),
       seen_status:(if $s=="" then null else $s end), seen_at:$sn}' \
     --arg o "$howner" --arg p "$pane" --arg ws "$ws" --arg task "$task" --arg n "$name" --arg k "$kind" --arg r "$repo" --arg cwd "$cwd" \
-    --arg note "$note" --arg t "$(iso_now)" --arg s "$st" --argjson sn "$(now)") \
-    || die lock_unavailable "handover was not stored; the registry and generation were not changed and no webhook was sent"
+    --arg note "$note" --arg t "$(iso_now)" --arg s "$st" --argjson sn "$(now)")
+  handover_insert_rc $? "$pane" || return 0
   set_marker "$pane" "$task"
   e=$(entry_for_pane "$pane")
   built=$(build_event handover "$st" "$e" "$(jq -cn --arg n "$note" '{note:(if $n=="" then null else $n end)}')") \
@@ -1914,8 +1943,8 @@ launch_blocked() {
   save_pending_prompt "$1" "$prompt"
   callback_started=false
   gen=$(paired_generation "$1" require \
-    'if .panes[$p] then (.panes[$p] |= (del(.launching_until) + {armed:true, last_status:"blocked", blocked_reason:$r})) else . end' \
-    --arg p "$1" --arg r "$2")
+    'if .panes[$p] then (.panes[$p] |= (del(.launching_until) + {armed:true, last_status:"blocked", blocked_reason:$r, seen_status:"blocked", seen_at:$sn})) else . end' \
+    --arg p "$1" --arg r "$2" --argjson sn "$(now)")
   rc=$?
   if [ "$rc" = 0 ]; then
     e=$(entry_for_pane "$1")

@@ -205,6 +205,27 @@ def pane_in(doc, pane):
     return isinstance(panes, dict) and pane in panes
 
 
+def row_owner(doc, pane):
+    panes = doc.get("panes") if isinstance(doc, dict) else None
+    row = panes.get(pane) if isinstance(panes, dict) else None
+    if not isinstance(row, dict):
+        return ""
+    owner = row.get("owner")
+    if isinstance(owner, str):
+        return owner
+    return ""
+
+
+def named_arg(jq_args, name):
+    i = 0
+    while i < len(jq_args):
+        flag = jq_args[i]
+        if flag in ("--arg", "--argjson") and i + 2 < len(jq_args) and jq_args[i + 1] == name:
+            return jq_args[i + 2]
+        i += 1
+    return ""
+
+
 def seq_payload(src, pane, prev):
     doc = load_doc(src)
     if doc is None:
@@ -270,6 +291,18 @@ def paired(lockfile, registry, seqfile, pane, mode, jq_filter, jq_args, orig):
     before = load_doc(reg_src)
     if before is None:
         sys.exit(1)
+    had = pane_in(before, pane)
+    # insert must not replace an existing row or mint a generation for that attempt.
+    # end's owner check is a different path and does not apply here.
+    if mode == "insert" and had:
+        have = row_owner(before, pane)
+        want = named_arg(jq_args, "o")
+        if have and have != want:
+            sys.exit(6)
+        sys.exit(7)
+    # A late status after unregister must not create a partial pane or a generation.
+    if mode == "status" and not had:
+        sys.exit(4)
     prev = previous_generation(seq_src, pane)
     if prev is None or prev >= 9007199254740992:
         sys.exit(1)
