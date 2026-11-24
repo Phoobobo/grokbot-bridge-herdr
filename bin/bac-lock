@@ -281,7 +281,7 @@ def generation(lockfile, seqfile, pane, orig):
 
 
 def paired(lockfile, registry, seqfile, pane, mode, jq_filter, jq_args, orig):
-    if mode not in ("end", "require", "insert", "status"):
+    if mode not in ("end", "require", "insert", "status", "present"):
         sys.exit(1)
     if not same_dir(lockfile, registry, "managed.json") or not same_dir(lockfile, seqfile, "event-seq.json"):
         sys.exit(1)
@@ -292,14 +292,23 @@ def paired(lockfile, registry, seqfile, pane, mode, jq_filter, jq_args, orig):
     if before is None:
         sys.exit(1)
     had = pane_in(before, pane)
-    # insert must not replace an existing row or mint a generation for that attempt.
-    # end's owner check is a different path and does not apply here.
-    if mode == "insert" and had:
+    # insert/present must not replace an existing row or mint a generation.
+    # The row written to stdout is the object examined under this lock.
+    if mode in ("insert", "present") and had:
         have = row_owner(before, pane)
         want = named_arg(jq_args, "o")
+        if have and want == "":
+            sys.exit(8)
         if have and have != want:
             sys.exit(6)
+        row = before.get("panes", {}).get(pane)
+        if not isinstance(row, dict) or not isinstance(row.get("pane_id"), str) or row.get("pane_id") == "":
+            sys.exit(1)
+        sys.stdout.write(json.dumps(row, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
         sys.exit(7)
+    if mode == "present" and not had:
+        sys.exit(4)
     # A late status after unregister must not create a partial pane or a generation.
     if mode == "status" and not had:
         sys.exit(4)
@@ -441,7 +450,7 @@ def main(argv):
         sys.stderr.write("bac-lock: %s\n" % exc)
         return 1
     sys.stderr.write(
-        "usage: bac-lock generation LOCK SEQ PANE | jq-apply LOCK DEST FILTER [jq-args] | paired LOCK REG SEQ PANE end|require|insert|status FILTER [jq-args]\n"
+        "usage: bac-lock generation LOCK SEQ PANE | jq-apply LOCK DEST FILTER [jq-args] | paired LOCK REG SEQ PANE end|require|insert|status|present FILTER [jq-args]\n"
     )
     return 1
 

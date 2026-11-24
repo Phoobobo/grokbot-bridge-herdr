@@ -116,11 +116,15 @@ bac_lock() {
 # paired_generation <pane> <end|require|insert> <jq-filter> [jq args...]
 # Prints the generation on success. Non-zero means this call did not replace
 # managed.json or event-seq.json and did not publish a generation.
-# 4: pane already absent. 6: insert saw another owner. 7: insert saw the same row.
+# 4: pane already absent. 6: another owner. 7: stdout is the locked row. 8: owner required.
 paired_generation() {
   pane="$1"; mode="$2"; filter="$3"; shift 3
   n=$(bac_lock paired "$(LOCK_FILE)" "$REGISTRY" "$(SEQ_FILE)" "$pane" "$mode" "$filter" "$@" 2>>"$LOG")
   rc=$?
+  if [ "$rc" = 7 ]; then
+    printf '%s' "$n"
+    return 7
+  fi
   [ "$rc" = 0 ] || return "$rc"
   case "$n" in
     ''|*[!0-9]*) return 1 ;;
@@ -1433,17 +1437,19 @@ ctx_pane() {
 toast() { "$HERDR" notification show "$1" --body "$2" --sound none >/dev/null 2>&1 || true; }
 
 # ---------- handover / reclaim ----------
-# handover_insert_rc <rc> <pane>
+# handover_insert_rc <rc> <pane> <locked-row>
 # 0 continues into labels and the handover webhook.
-# 6 and 7 do not stamp and do not replace the row.
+# 6, 7, and 8 do not stamp and do not replace the row.
+# 7 prints the row captured under that same lock, not a later read.
 handover_insert_rc() {
   case "$1" in
     0) return 0 ;;
-    6) die_owner owner_mismatch "handover did not replace the existing row; the registry was not changed and no webhook was sent" "" "$howner" ;;
+    6) die_owner owner_mismatch "pane is owned by another caller" "" "$howner" ;;
+    8) die_owner owner_required "this task has an owner; pass --owner matching it" "" "" ;;
     7)
-      e=$(entry_for_pane "$2")
-      [ -n "$e" ] || die not_managed "the pane was present at the lock and is now absent; this call did not stamp or overwrite"
-      printf '%s' "$e" | jq -c '. + {already_managed:true}'
+      [ -n "${3:-}" ] || die io "handover lock did not return the verified row"
+      printf '%s' "$3" | jq -c 'if type == "object" and (.pane_id | type) == "string" and .pane_id != "" then . + {already_managed:true} else error("not the locked row") end' \
+        || die io "handover could not emit the locked row"
       return 7 ;;
     *) die lock_unavailable "handover was not stored; the registry and generation were not changed and no webhook was sent" ;;
   esac
@@ -1453,13 +1459,10 @@ do_handover_hc() { # do_handover_hc <terminal> <note> <owner>
   js=$(hc_get_json "$pane") || die pane_not_found "terminal $pane not found"
   addr=$(printf '%s' "$js" | jq -r '.address // empty' 2>/dev/null)
   [ -n "$addr" ] || die pane_not_found "terminal $pane not found"
-  existing=$(entry_for_pane "$addr")
-  if [ -n "$existing" ]; then
-    ENTRY=$existing
-    CALLER_OWNER=$howner
-    enforce_owner strict
-    printf '%s' "$existing" | jq -c '. + {already_managed:true}'
-    return 0
+  snap=$(paired_generation "$addr" present '.' --arg o "$howner" --arg p "$addr")
+  prc=$?
+  if [ "$prc" != 4 ]; then
+    handover_insert_rc "$prc" "$addr" "$snap" || return 0
   fi
   cwd=$(printf '%s' "$js" | jq -r '.cwd // empty')
   name=$(printf '%s' "$js" | jq -r '.name // empty')
@@ -1499,7 +1502,7 @@ do_handover_hc() { # do_handover_hc <terminal> <note> <owner>
     --arg o "$howner" --arg p "$addr" --arg task "$task" --arg n "$name" --arg k "$happ" --arg r "$repo" --arg cwd "$cwd" \
     --arg note "$note" --arg t "$(iso_now)" --arg s "$st" --argjson sn "$(now)" --arg hs "$PLACE_SPACE" --argjson hsc "$hsc" \
     --arg ht "$PLACE_TAB" --argjson htc "$htc")
-  handover_insert_rc $? "$addr" || return 0
+  handover_insert_rc $? "$addr" "$gen" || return 0
   if valid_space_id "$ho_sp" && valid_space_id "$ho_tab"; then
     "$HC" label "$addr" bac=managed "bac_task=$task" >/dev/null 2>&1 || log "hc label failed for $addr"
   elif valid_space_id "$ho_sp"; then
@@ -1533,13 +1536,10 @@ do_handover() { # do_handover <pane> <note> [owner] -> prints entry
   fi
   if [ "$be" = hc ]; then do_handover_hc "$pane" "$note" "$howner"; return; fi
   info=$("$HERDR" pane get "$pane" 2>/dev/null) || die pane_not_found "pane $pane not found"
-  existing=$(entry_for_pane "$pane")
-  if [ -n "$existing" ]; then
-    ENTRY=$existing
-    CALLER_OWNER=$howner
-    enforce_owner strict
-    printf '%s' "$existing" | jq -c '. + {already_managed:true}'
-    return 0
+  snap=$(paired_generation "$pane" present '.' --arg o "$howner" --arg p "$pane")
+  prc=$?
+  if [ "$prc" != 4 ]; then
+    handover_insert_rc "$prc" "$pane" "$snap" || return 0
   fi
   ag=$("$HERDR" agent get "$pane" 2>/dev/null | jq -c '.result.agent // empty')
   ws=$(printf '%s' "$info" | jq -r '.result.pane.workspace_id')
@@ -1565,7 +1565,7 @@ do_handover() { # do_handover <pane> <note> [owner] -> prints entry
       seen_status:(if $s=="" then null else $s end), seen_at:$sn}' \
     --arg o "$howner" --arg p "$pane" --arg ws "$ws" --arg task "$task" --arg n "$name" --arg k "$kind" --arg r "$repo" --arg cwd "$cwd" \
     --arg note "$note" --arg t "$(iso_now)" --arg s "$st" --argjson sn "$(now)")
-  handover_insert_rc $? "$pane" || return 0
+  handover_insert_rc $? "$pane" "$gen" || return 0
   set_marker "$pane" "$task"
   e=$(entry_for_pane "$pane")
   built=$(build_event handover "$st" "$e" "$(jq -cn --arg n "$note" '{note:(if $n=="" then null else $n end)}')") \
