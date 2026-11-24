@@ -1,3 +1,5 @@
 .DS_Store
 config.toml
 *.log
+__pycache__/
+*.pyc
