@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+# Isolated lock helper for bac. Not installed globally.
+# Holds an fcntl exclusive lock on a regular file and commits one file
+# replace before exiting. The kernel drops the lock when this process
+# exits. This program never renames or removes the lock file.
+import errno
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+
+
+def parent_alive(orig):
+    raw = os.environ.get("BAC_LOCK_OWNER_PID", "")
+    watch = int(raw) if raw.isdigit() else orig
+    try:
+        os.kill(watch, 0)
+    except OSError:
+        return False
+    return True
+
+
+def acquire(fd, orig):
+    deadline = time.time() + float(os.environ.get("BAC_LOCK_TIMEOUT_SEC", "4"))
+    while True:
+        if not parent_alive(orig):
+            sys.exit(3)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.time() >= deadline:
+                sys.exit(2)
+            time.sleep(0.05)
+
+
+def wait_step(name, orig):
+    step_dir = os.environ.get("BAC_LOCK_STEP", "")
+    if not step_dir or not os.path.isfile(os.path.join(step_dir, "enable")):
+        return
+    if os.path.isfile(os.path.join(step_dir, name + ".skip")):
+        return
+    marker = os.path.join(step_dir, "%s.%d" % (name, os.getpid()))
+    with open(marker, "w") as handle:
+        handle.write("%d\n" % os.getpid())
+    go = os.path.join(step_dir, name + ".go")
+    deadline = time.time() + 20
+    while not os.path.isfile(go):
+        if not parent_alive(orig):
+            sys.exit(3)
+        if time.time() >= deadline:
+            sys.exit(3)
+        time.sleep(0.05)
+
+
+def replace(dest, payload, orig):
+    if not parent_alive(orig):
+        sys.exit(3)
+    tmp = "%s.tmp.%d" % (dest, os.getpid())
+    try:
+        with open(tmp, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if not parent_alive(orig):
+            sys.exit(3)
+        os.replace(tmp, dest)
+        os.chmod(dest, 0o600)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def generation(lockfile, seqfile, pane, orig):
+    fd = os.open(lockfile, os.O_CREAT | os.O_RDWR, 0o600)
+    os.set_inheritable(fd, False)
+    acquire(fd, orig)
+    wait_step("held", orig)
+    if not parent_alive(orig):
+        sys.exit(3)
+    if os.path.isfile(seqfile) and os.path.getsize(seqfile) > 0:
+        with open(seqfile, "rb") as handle:
+            src = handle.read()
+    else:
+        src = b'{"version":1,"panes":{}}\n'
+    proc = subprocess.run(
+        [
+            "jq",
+            "-c",
+            "--arg",
+            "p",
+            pane,
+            "(.panes[$p] // 0) as $cur | ($cur + 1) as $n | .panes[$p] = $n | {doc:., n:$n}",
+        ],
+        input=src,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0:
+        sys.exit(1)
+    parsed = json.loads(proc.stdout.decode("utf-8"))
+    number = parsed.get("n")
+    if not isinstance(number, int) or isinstance(number, bool):
+        sys.exit(1)
+    doc = parsed.get("doc")
+    if not isinstance(doc, dict):
+        sys.exit(1)
+    payload = (json.dumps(doc) + "\n").encode("utf-8")
+    replace(seqfile, payload, orig)
+    sys.stdout.write("%d\n" % number)
+    sys.stdout.flush()
+
+
+def jq_apply(lockfile, dest, jq_filter, jq_args, orig):
+    fd = os.open(lockfile, os.O_CREAT | os.O_RDWR, 0o600)
+    os.set_inheritable(fd, False)
+    acquire(fd, orig)
+    wait_step("held", orig)
+    if not parent_alive(orig):
+        sys.exit(3)
+    if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+        with open(dest, "rb") as handle:
+            src = handle.read()
+    else:
+        src = b'{"version":1,"panes":{}}\n'
+    proc = subprocess.run(
+        ["jq", *jq_args, jq_filter],
+        input=src,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0:
+        sys.exit(1)
+    replace(dest, proc.stdout if proc.stdout.endswith(b"\n") else proc.stdout + b"\n", orig)
+    sys.stdout.write("OK\n")
+    sys.stdout.flush()
+
+
+def main(argv):
+    orig = os.getppid()
+    op = argv[1] if len(argv) > 1 else ""
+    try:
+        if op == "generation" and len(argv) == 5:
+            generation(argv[2], argv[3], argv[4], orig)
+            return 0
+        if op == "jq-apply" and len(argv) >= 5:
+            jq_apply(argv[2], argv[3], argv[4], argv[5:], orig)
+            return 0
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        if getattr(exc, "errno", None) == errno.EAGAIN:
+            return 2
+        sys.stderr.write("bac-lock: %s\n" % exc)
+        return 1
+    sys.stderr.write("usage: bac-lock generation LOCK SEQ PANE | jq-apply LOCK DEST FILTER [jq-args]\n")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

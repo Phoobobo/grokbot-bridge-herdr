@@ -1,5 +1,5 @@
-# ~/.config/grokbot-bridge-herdr/config.toml   (chmod 600 — gbb refuses to send otherwise)
-# Copy:  mkdir -p ~/.config/grokbot-bridge-herdr && cp config.example.toml ~/.config/grokbot-bridge-herdr/config.toml && chmod 600 ~/.config/grokbot-bridge-herdr/config.toml
+# ~/.config/bot-as-collie/config.toml   (chmod 600 — bac refuses to send otherwise)
+# Copy:  mkdir -p ~/.config/bot-as-collie && cp config.example.toml ~/.config/bot-as-collie/config.toml && chmod 600 ~/.config/bot-as-collie/config.toml
 
 # Grok Bot routine webhook URL (shown in the routine's trigger panel).
 webhook_url = ""
@@ -16,7 +16,7 @@ debounce_sec = 15
 
 # Where NEW tasks are launched. Entries already in the registry keep their own backend
 # (rows written before 0.3.0, or with backend = "herdr", stay on the Herdr TUI session server).
-# Override one launch with --backend or GBB_BACKEND.
+# Override one launch with --backend or BAC_BACKEND.
 #   auto   default. hc when `hc server status` can reach or start the core; otherwise the Herdr TUI.
 #   herdr  Herdr TUI only (plugin hooks on pane.agent_status_changed), even if hc is running.
 #   hc     herdr-core / the Herdr app. Status comes from `hc events` (OSC 7501), not the plugin.
@@ -29,15 +29,15 @@ startup_settle_sec = 4
 # before the first prompt is typed. Codex can report "ready" while its splash is still animating and drops input.
 startup_ready_timeout_sec = 90
 
-# Optional per-kind default agent args for `gbb launch` (single line, double-quoted strings, JSON-style escapes).
+# Optional per-kind default agent args for `bac launch` (single line, double-quoted strings, JSON-style escapes).
 # Used only when launch is called without `-- <agent args>`; an explicit `--` (even with nothing after it) wins.
 # Each item is passed to the agent as one argument, so values with quotes/spaces are safe.
 # Empty or absent = the agent's own defaults (for codex: model / model_reasoning_effort in ~/.codex/config.toml,
-# which `gbb doctor` shows as codex_user_defaults). Pin them here if Grok Bot launches must not follow that file:
+# which `bac doctor` shows as codex_user_defaults). Pin them here if Grok Bot launches must not follow that file:
 # codex_args = ["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=\"xhigh\""]
 # grok_args = []
 
-# Optional: only allow `gbb launch` in repos under these paths (single line). Empty = any git repo.
+# Optional: only allow `bac launch` in repos under these paths (single line). Empty = any git repo.
 # allowed_repos = ["~/Workspace", "~/herdr-bridge-test"]
 
 # Optional extra receivers that get the identical payload (e.g. a local dots-tunnel-bridge, see README "Use with ChatGPT dots").
@@ -47,14 +47,15 @@ startup_ready_timeout_sec = 90
 # header_name = "X-Dots-Herdr-Token"
 # header_value = ""   # contents of ~/.config/dots-bridge/herdr_webhook_token
 
-# Optional named callback targets ("owners", docs/decisions/0004). A task launched with `gbb launch --owner <name>`
-# (or GBB_OWNER=<name>) sends its status callbacks to that owner's target INSTEAD of the primary webhook above.
+# Optional named callback targets ("owners", docs/decisions/0004). A task launched with `bac launch --owner <name>`
+# (or BAC_OWNER=<name>) sends its status callbacks to that owner's target INSTEAD of the primary webhook above.
 # The primary webhook is the fallback: used when a task has no owner, the owner has no entry here, or the
 # owner's POST fails (curl error / non-2xx; payload then has route = "fallback", fallback_reason = ...).
 # [[extra_webhooks]] still get every event; an extra whose url equals the owner's url is skipped (no duplicate).
 # Names: letters, digits, . _ - (max 40). Same table rules as [[extra_webhooks]]. Payload carries owner + route.
 #
-# ChatGPT dot via dots-tunnel-bridge (dots-bridge's gbb_launch passes --owner dot):
+# ChatGPT dot: the bridge must pass --owner from its own authenticated config, not from a client argument.
+# Today's dots tools are still named gbb_* until docs/bac/v1/MIGRATION.md is applied.
 # [[owners]]
 # name = "dot"
 # url = "http://127.0.0.1:8765/herdr/webhook"
@@ -62,7 +63,7 @@ startup_ready_timeout_sec = 90
 # header_value = ""   # contents of ~/.config/dots-bridge/herdr_webhook_token
 #
 # Another Grok Bot (e.g. 参谋长): create a webhook-triggered routine on THAT bot and copy its URL + header here;
-# that bot then launches with `gbb launch --owner canmouzhang ...` (or exports GBB_OWNER=canmouzhang).
+# that bot then launches with `bac launch --owner canmouzhang ...` (or exports BAC_OWNER=canmouzhang).
 # [[owners]]
 # name = "canmouzhang"
 # url = ""            # webhook URL from the routine's trigger panel on that bot
@@ -71,9 +72,9 @@ startup_ready_timeout_sec = 90
 #
 # Equivalent table form: [owners.canmouzhang] with url / header_name / header_value.
 
-# Env overrides: GBB_OWNER (default owner for launch/handover), GBB_WEBHOOK_URL, GBB_WEBHOOK_HEADER_NAME, GBB_WEBHOOK_HEADER_VALUE, GBB_CONFIG,
-# GBB_STATE_DIR (default ~/.local/state/grokbot-bridge-herdr), GBB_DATA_DIR (default ~/.local/share/grokbot-bridge-herdr),
-# GBB_DOTS_TOKEN_FILE (default ~/.config/dots-bridge/herdr_webhook_token), GBB_DOTS_PROBE_URL (default http://127.0.0.1:8765/).
+# Env overrides: BAC_OWNER (default owner for launch/handover), BAC_WEBHOOK_URL, BAC_WEBHOOK_HEADER_NAME, BAC_WEBHOOK_HEADER_VALUE, BAC_CONFIG,
+# BAC_STATE_DIR (default ~/.local/state/bot-as-collie), BAC_DATA_DIR (default ~/.local/share/bot-as-collie),
+# BAC_DOTS_TOKEN_FILE (default ~/.config/dots-bridge/herdr_webhook_token), BAC_DOTS_PROBE_URL (default http://127.0.0.1:8765/).
 
 # Modules (docs/decisions/0006). Omit `enabled` to follow the probe. `false` keeps the module off even when the
 # probe passes. `true` forces it on (dots posts are still only the dots-bridge endpoint, not every extra webhook).

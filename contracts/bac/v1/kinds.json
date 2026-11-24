@@ -1,0 +1,54 @@
+{
+  "contract": "bac.v1",
+  "negotiation": "bac capabilities",
+  "omitted_kind": {
+    "code": "kind_required",
+    "exit": 1,
+    "baseline_difference": "gbb 0.3.3 sets kind=grok when --kind is omitted (bin/gbb cmd_launch). bac does not. dots-tunnel-bridge gbb_launch defaults the Python argument to codex and then passes --kind explicitly; bac_launch must require the caller to choose."
+  },
+  "unknown_never_becomes": ["codex", "grok"],
+  "kinds": [
+    {
+      "id": "codex",
+      "support": "supported",
+      "verified_in": "bin/gbb",
+      "verified_at": "bbdfc4bbaece3ddafa3a9363b1d0f43b230aa5a6",
+      "evidence": "case \"$kind\" in grok | codex) is the only accept branch. Codex screen classification (hooks_review, question, dialog, fresh, ready) runs only when kind is codex. A model footer may be recorded as an observation; it is not a default.",
+      "launch": true,
+      "screen_classification": true,
+      "model_observation": "codex_footer_before_dot"
+    },
+    {
+      "id": "grok",
+      "support": "supported",
+      "verified_in": "bin/gbb",
+      "verified_at": "bbdfc4bbaece3ddafa3a9363b1d0f43b230aa5a6",
+      "evidence": "Same accept branch. ADR 0005: when Grok reports status, bac must not guess from the screen. No model footer parser exists.",
+      "launch": true,
+      "screen_classification": false,
+      "model_observation": null
+    },
+    {
+      "id": "pi",
+      "support": "rejected",
+      "reason": "not_implemented",
+      "verified_in": "bin/gbb",
+      "verified_at": "bbdfc4bbaece3ddafa3a9363b1d0f43b230aa5a6",
+      "evidence": "No pi branch in bin/gbb at the baseline. Launch and handover of a reported pi agent are errors. A migrated row keeps the pane and owner and stores kind null with kind_reported pi.",
+      "launch": false
+    },
+    {
+      "id": "antigravity",
+      "support": "rejected",
+      "reason": "not_implemented",
+      "verified_in": "bin/gbb",
+      "verified_at": "bbdfc4bbaece3ddafa3a9363b1d0f43b230aa5a6",
+      "evidence": "No antigravity branch in bin/gbb at the baseline. Same rejection as pi.",
+      "launch": false
+    }
+  ],
+  "extensible": {
+    "rule": "A later contract version may add a kind only by listing it here with support supported or rejected. An unlisted kind is kind_unsupported with kind_support unknown. It is never rewritten to codex or grok.",
+    "model_metadata": "model id is a separate object with provenance observed, config, or unknown. Kind does not imply a model."
+  }
+}

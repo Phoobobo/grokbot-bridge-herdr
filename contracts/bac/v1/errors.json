@@ -1,0 +1,40 @@
+{
+  "contract": "bac.v1",
+  "shape": {"ok": false, "error": {"code": "<code>", "message": "<text>"}},
+  "exit": 1,
+  "startup_blocked_exception": {
+    "exit": 0,
+    "shape_note": "ok false, state startup_blocked, prompt_pending true. Inherited from gbb so a caller can answer the dialog. The body may include screen lines because this is a CLI result, not a callback."
+  },
+  "codes": {
+    "usage": {"inherited": true},
+    "missing_dependency": {"inherited": true},
+    "not_managed": {"inherited": true},
+    "herdr_unavailable": {"inherited": true},
+    "config_error": {"inherited": true},
+    "task_exists": {"inherited": true},
+    "not_git": {"inherited": true},
+    "repo_not_allowed": {"inherited": true},
+    "worktree_exists": {"inherited": true},
+    "worktree_failed": {"inherited": true},
+    "workspace_failed": {"inherited": true},
+    "agent_start_failed": {"inherited": true, "pane_id": "absent"},
+    "registry_error": {"inherited": true},
+    "pane_not_found": {"inherited": true, "pane_id": "absent"},
+    "no_pane": {"inherited": true},
+    "no_pending_prompt": {"inherited": true},
+    "no_options": {"inherited": true},
+    "ambiguous_choice": {"inherited": true},
+    "bad_choice": {"inherited": true},
+    "answer_nav_failed": {"inherited": true},
+    "agent_blocked": {"inherited": true, "exit": 1, "sends_text": false},
+    "no_dialog": {"inherited": true},
+    "prompt_not_delivered": {"inherited": true},
+    "prompt_unconfirmed": {"inherited": true},
+    "unparsed_result": {"inherited": true},
+    "kind_required": {"inherited": false, "when": "--kind omitted on launch"},
+    "kind_unsupported": {"inherited": false, "when": "kind is not codex or grok, including pi and antigravity and any other string"},
+    "owner_required": {"inherited": false, "when": "the row has an owner and the command needs one (read, send, answer, keys, stop, reclaim, handover, owner) but --owner and BAC_OWNER are empty"},
+    "owner_mismatch": {"inherited": false, "when": "caller owner is set and differs from the row owner. Registry bytes unchanged."}
+  }
+}

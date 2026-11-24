@@ -1,0 +1,138 @@
+{
+  "contract": "bac.v1",
+  "argv0": "bac",
+  "stdout": "one JSON document",
+  "stderr": "not part of the contract",
+  "exit": {"ok": 0, "startup_blocked": 0, "error": 1},
+  "owner_flag": {
+    "flag": "--owner",
+    "env": "BAC_OWNER",
+    "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$",
+    "same_as_baseline": "bin/gbb OWNER_RE, also dots-tunnel-bridge OWNER_RE"
+  },
+  "owner_rules": [
+    "Read, send, answer, keys, stop, reclaim, handover, and owner require a matching --owner when the registry row's owner is non-null. Omitted caller owner is owner_required. A different caller owner is owner_mismatch. Neither reads terminal text nor writes the registry.",
+    "A row with owner null is the primary-webhook task. Those commands allow a local caller with no --owner.",
+    "status, list, result, wait, doctor, report, and capabilities do not return terminal text. With --owner, list and the task-scoped reads return owner_mismatch for a different owner instead of that row. Without --owner, list returns metadata for every managed row (local operator).",
+    "launch never attaches to an existing pane. handover is the only command that registers a pane or terminal the caller did not just create.",
+    "Re-handover of a pane already owned by the same caller returns the existing row. Re-handover by anyone else is owner_mismatch and does not replace the row."
+  ],
+  "commands": {
+    "launch": {
+      "usage": "bac launch --repo <path> --kind <codex|grok> --task <id> (--prompt <text> | --prompt-file <path>) [--worktree <branch> | --no-worktree] [--base <ref>] [--owner <name>] [--backend auto|herdr|hc] [-- <agent-arg>...]",
+      "required": ["--repo", "--kind", "--task", "--prompt|--prompt-file"],
+      "kind_default": null,
+      "creates_pane": true,
+      "adopts_existing_pane": false
+    },
+    "send": {
+      "usage": "bac send <task|pane> [--owner <name>] (--pending | <text>)",
+      "required": ["<task|pane>"],
+      "refuses_codex_dialog": true
+    },
+    "handover": {
+      "usage": "bac handover --pane <id> [--note <text>] [--owner <name>] [--backend herdr|hc]",
+      "required": ["--pane"],
+      "adopts_existing_pane": true,
+      "only_adopt_command": true
+    },
+    "read": {
+      "usage": "bac read <task|pane> [--owner <name>] [--lines <n>] [--visible]",
+      "required": ["<task|pane>"],
+      "returns_terminal_text": true,
+      "callback_may_carry_text": false
+    },
+    "status": {
+      "usage": "bac status <task|pane> [--owner <name>]",
+      "required": ["<task|pane>"],
+      "returns_model": true,
+      "returns_quota": true,
+      "returns_terminal_text": false
+    },
+    "stop": {
+      "usage": "bac stop <task|pane> [--owner <name>]",
+      "required": ["<task|pane>"],
+      "closes_only_created": true,
+      "never": ["herdr server stop", "hc server stop", "space.close", "tab.close"]
+    },
+    "list": {
+      "usage": "bac list [--owner <name>]",
+      "required": []
+    },
+    "answer": {
+      "usage": "bac answer <task|pane> [--owner <name>] <option-number|label>",
+      "required": ["<task|pane>", "<option-number|label>"],
+      "never_opt_in": "Help improve Grok"
+    },
+    "keys": {
+      "usage": "bac keys <task|pane> [--owner <name>] <key>...",
+      "required": ["<task|pane>", "<key>"]
+    },
+    "owner": {
+      "usage": "bac owner <task|pane> [--owner <caller>] (<name> | --clear)",
+      "required": ["<task|pane>"],
+      "dots_tool": false,
+      "note": "Only the current owner, or a local caller when owner is null, may transfer or clear. Dots does not get this tool."
+    },
+    "wait": {
+      "usage": "bac wait <task|pane> [--owner <name>] [--until <status>]... [--timeout <ms>]",
+      "required": ["<task|pane>"],
+      "dots_max_seconds": 120
+    },
+    "result": {
+      "usage": "bac result <task|pane> [--owner <name>]",
+      "required": ["<task|pane>"],
+      "returns_terminal_text": false
+    },
+    "reclaim": {
+      "usage": "bac reclaim --pane <id> [--owner <name>]",
+      "required": ["--pane"],
+      "kills_process": false
+    },
+    "doctor": {
+      "usage": "bac doctor",
+      "required": [],
+      "prints_secrets": false
+    },
+    "report": {
+      "usage": "bac report [--owner <name>]",
+      "required": [],
+      "prints_secrets": false
+    },
+    "capabilities": {
+      "usage": "bac capabilities",
+      "required": [],
+      "returns": "kinds.json plus model_freshness_sec and quota provenance unknown"
+    },
+    "test-webhook": {
+      "usage": "bac test-webhook [--owner <name>]",
+      "required": [],
+      "dots_tool": false,
+      "event": "test"
+    },
+    "version": {
+      "usage": "bac version",
+      "required": [],
+      "fields": ["ok", "version", "contract", "source"]
+    },
+    "hook": {
+      "usage": "bac hook",
+      "required": [],
+      "public": false,
+      "dots_tool": false
+    },
+    "action": {
+      "usage": "bac action handover|reclaim",
+      "required": [],
+      "public": false,
+      "dots_tool": false
+    },
+    "hc-watch": {
+      "usage": "bac hc-watch",
+      "required": [],
+      "public": false,
+      "dots_tool": false,
+      "note": "Internal watcher. Not a tool surface for driving hc. Callers use the commands above."
+    }
+  }
+}

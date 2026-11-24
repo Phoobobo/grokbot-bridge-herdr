@@ -1,0 +1,32 @@
+{
+  "expect": "launch_ok",
+  "body": {
+    "ok": true,
+    "task_id": "fix-login",
+    "pane_id": "t9",
+    "pane_id_source": "hc.address",
+    "backend": "hc",
+    "kind": "codex",
+    "owner": "dot",
+    "workspace_id": null,
+    "agent_name": "bac-fix-login",
+    "herdr_space": "sp0123456789abcdef0123456789abcdef",
+    "created_herdr_space": false,
+    "herdr_tab": "tb0123456789abcdef0123456789abcdef",
+    "created_herdr_tab": true,
+    "model": {
+      "id": null,
+      "provenance": "unknown",
+      "observed_at": null,
+      "freshness": "unknown",
+      "freshness_sec": null
+    },
+    "quota": {
+      "value": null,
+      "unit": null,
+      "provenance": "unknown",
+      "observed_at": null,
+      "freshness": "unknown"
+    }
+  }
+}

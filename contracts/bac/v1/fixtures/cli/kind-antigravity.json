@@ -1,0 +1,12 @@
+{
+  "expect": "kind_error",
+  "body": {
+    "ok": false,
+    "error": {
+      "code": "kind_unsupported",
+      "message": "kind antigravity is not implemented",
+      "kind": "antigravity",
+      "kind_support": "rejected"
+    }
+  }
+}

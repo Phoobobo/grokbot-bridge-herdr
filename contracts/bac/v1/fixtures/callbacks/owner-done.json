@@ -1,0 +1,27 @@
+{
+  "expect": "accept",
+  "payload": {
+    "version": 1,
+    "source": "bot-as-collie",
+    "event_id": "5cb0047d8b5de61f00884bcd7272a2330f697d3e91e836002c6a8144d794f0f8",
+    "generation": 3,
+    "attempt": 1,
+    "event": "agent_status",
+    "status": "done",
+    "owner": "dot",
+    "route": "owner",
+    "ts": "2026-11-23T00:00:00Z",
+    "task_id": "fix-login",
+    "pane_id": "t9",
+    "workspace_id": null,
+    "agent_kind": "codex",
+    "agent_name": "bac-fix-login",
+    "origin": "launched",
+    "backend": "hc",
+    "hostname": "fixture",
+    "repo": "/tmp/fixture-repo",
+    "worktree": "/tmp/fixture-repo",
+    "branch": "bac/fix-login",
+    "herdr_status": "done"
+  }
+}
