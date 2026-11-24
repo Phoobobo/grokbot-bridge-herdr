@@ -78,11 +78,35 @@ enforce_owner() {
 # The lock file is never renamed or removed. flock(1) is not required.
 SEQ_FILE() { printf '%s/event-seq.json' "$STATE_DIR"; }
 LOCK_FILE() { printf '%s/generation.lock' "$STATE_DIR"; }
+# Absolute path of this script. install.sh links ~/.local/bin/bac at the repo
+# copy, so dirname "$0" is not the directory that contains bac-lock.
+bac_resolved() {
+  p=$0
+  case "$p" in
+    */*) ;;
+    *) p=$(command -v "$p" 2>/dev/null || printf '%s' "$p") ;;
+  esac
+  i=0
+  while [ -L "$p" ] && [ "$i" -lt 8 ]; do
+    d=$(dirname "$p")
+    t=$(readlink "$p") || break
+    case "$t" in
+      /*) p=$t ;;
+      *) p="$d/$t" ;;
+    esac
+    i=$((i + 1))
+  done
+  d=$(dirname "$p")
+  b=$(basename "$p")
+  phys=$(cd "$d" 2>/dev/null && pwd -P) || { printf '%s' "$p"; return; }
+  printf '%s/%s' "$phys" "$b"
+}
+bac_root() { cd "$(dirname "$(bac_resolved)")/.." && pwd -P; }
 bac_lock() {
   command -v python3 >/dev/null 2>&1 || { log "python3 missing; generation lock not taken"; return 1; }
-  bac_dir=$(dirname "$0")
+  bac_dir=$(dirname "$(bac_resolved)")
   helper=$bac_dir/bac-lock
-  [ -f "$helper" ] || { log "bac-lock missing"; return 1; }
+  [ -f "$helper" ] || { log "bac-lock missing at $helper"; return 1; }
   if [ -n "${BAC_LOCK_SPAWN_SLEEP:-}" ]; then
     sleep "$BAC_LOCK_SPAWN_SLEEP" >/dev/null 2>&1 &
     printf '%s\n' "$!" >"$STATE_DIR/orphan.pid"
@@ -694,9 +718,20 @@ remember_status() { printf '%s %s\n' "$2" "$(now)" >"$1"; }
 # other: stopped before either file was replaced.
 commit_notify_end() {
   pane="$1"; entry="$2"; wev="$3"; ended="$4"
-  gen=$(paired_generation "$pane" end 'del(.panes[$p])' --arg p "$pane")
+  own="${CALLER_OWNER:-}"
+  gen=$(paired_generation "$pane" end \
+    'if ($own == "" or (.panes[$p].owner // "") == $own) then del(.panes[$p]) else . end' \
+    --arg p "$pane" --arg own "$own")
   rc=$?
   if [ "$rc" != 0 ]; then
+    if [ "$rc" = 1 ] && [ -n "$own" ]; then
+      cur=$(entry_for_pane "$pane")
+      got=$(printf '%s' "$cur" | jq -r '.owner // empty' 2>/dev/null || true)
+      if [ -n "$cur" ] && [ "$got" != "$own" ]; then
+        log "$wev $pane owner did not match at commit; registry was not changed"
+        return 6
+      fi
+    fi
     log "$wev $pane stopped before commit rc=$rc"
     return "$rc"
   fi
@@ -713,30 +748,48 @@ finish_commit_rc() { # finish_commit_rc <rc> <what>
     0) return 0 ;;
     4) die not_managed "$2 found the pane already absent; this call did not stamp or send a callback" ;;
     5) die event_committed "$2 already committed the registry change and generation. The callback may be unsent, or it was started and the history row was not appended. A retry will not send another event" ;;
+    6) die_owner owner_mismatch "$2 owner did not match at commit; the registry was not changed" "" "${CALLER_OWNER:-}" ;;
     *) die lock_unavailable "$2 stopped before commit; the registry and generation were not changed and no webhook was sent" ;;
   esac
 }
 
+# note_seen <pane> <status> — record an observation without a generation or webhook.
+note_seen() {
+  bac_lock jq-apply "$(LOCK_FILE)" "$REGISTRY" \
+    'if .panes[$p] then .panes[$p].seen_status=$s | .panes[$p].seen_at=$t else . end' \
+    --arg p "$1" --arg s "$2" --argjson t "$(now)" >/dev/null 2>>"$LOG"
+}
 # deliver_status <pane> <entry> <raw> <final> <reason> — debounce + webhook. Same pairs as the TUI hook.
+# The seen/publish decision and the generation increment share one fcntl commit.
 deliver_status() {
   pane="$1"; entry="$2"; raw="$3"; st="$4"; reason="$5"
   [ -n "$entry" ] || return 0
   lastf="$LAST_DIR/$(printf '%s' "$pane" | tr ':' '_')"
-  last=$(cat "$lastf" 2>/dev/null || true); last_st=${last%% *}; last_ts=${last#* }
   deb=$(cfg_get debounce_sec); deb=${deb:-15}
-  case "$last_st:$st" in
-    done:idle | idle:done | idle:idle | done:done) log "debounced $pane $last_st->$st"; remember_status "$lastf" "$st"; return 0 ;;
-    blocked:blocked)
-      if [ $(($(now) - ${last_ts:-0})) -lt "$deb" ]; then log "debounced $pane blocked"; remember_status "$lastf" "$st"; return 0; fi ;;
-  esac
-  gen=$(paired_generation "$pane" require \
-    '.panes[$p].last_status=$s | .panes[$p].last_status_at=$t | .panes[$p].blocked_reason=(if $r == "" then null else $r end)' \
-    --arg p "$pane" --arg s "$st" --arg t "$(iso_now)" --arg r "$reason")
+  gen=$(bac_lock paired "$(LOCK_FILE)" "$REGISTRY" "$(SEQ_FILE)" "$pane" status \
+    '(.panes[$p].seen_status // "") as $prev | (.panes[$p].seen_at // 0) as $pts
+     | ( ($prev == "done" and ($s == "idle" or $s == "done"))
+         or ($prev == "idle" and ($s == "idle" or $s == "done"))
+         or ($prev == "blocked" and $s == "blocked" and (($now - $pts) < $deb)) ) as $drop
+     | .panes[$p].seen_status = $s | .panes[$p].seen_at = $now
+     | if $drop then . else
+         (.panes[$p].last_status = $s | .panes[$p].last_status_at = $t
+          | .panes[$p].blocked_reason = (if $r == "" then null else $r end))
+       end
+     | {publish:($drop|not), doc:.}' \
+    --arg p "$pane" --arg s "$st" --arg t "$(iso_now)" --arg r "$reason" \
+    --argjson now "$(now)" --argjson deb "$deb" 2>>"$LOG")
   rc=$?
   if [ "$rc" != 0 ]; then
-    log "status $pane stopped before commit rc=$rc; debounce file was left unchanged"
+    log "status $pane stopped before commit rc=$rc"
     return "$rc"
   fi
+  if [ "$gen" = debounce ]; then
+    log "debounced $pane -> $st"
+    remember_status "$lastf" "$st"
+    return 0
+  fi
+  case "$gen" in ''|*[!0-9]*) log "status $pane bad generation"; return 1 ;; esac
   built=$(build_event agent_status "$st" "$entry" "$(jq -cn --arg r "$reason" --arg h "$raw" \
     '{herdr_status:$h} + (if $r == "" then {} else {blocked_reason:$r} end)')") || {
     log "status $pane committed; callback was not built"
@@ -754,11 +807,13 @@ hc_emit_word() {
   pane="$1"; entry="$2"; word="$3"; sj="$4"
   lastf="$LAST_DIR/$(printf '%s' "$pane" | tr ':' '_')"
   if [ "$(printf '%s' "$entry" | jq -r 'if .armed == false then "no" else "yes" end')" = no ]; then
+    note_seen "$pane" "$word" || log "not armed $pane: seen-status was not recorded"
     printf '%s %s\n' "$word" "$(now)" >"$lastf"
     log "not armed yet $pane $word"
     return 0
   fi
   if [ "$word" = working ]; then
+    note_seen "$pane" "$word" || log "working $pane: seen-status was not recorded"
     printf '%s %s\n' "$word" "$(now)" >"$lastf"
     return 0
   fi
@@ -896,6 +951,9 @@ hc_watch_once() {
 }
 
 cmd_hc_watch() {
+  # Inherited from the launcher: ignored SIGHUP survives exec, and this
+  # process is not a job of the launch shell. $$ is this process.
+  trap '' HUP
   BAC_CTX=hc-watch
   SCREEN_BACKEND=hc
   pidf="$STATE_DIR/hc-watch.pid"
@@ -918,7 +976,11 @@ ensure_hc_watch() {
     old=$(cat "$pidf" 2>/dev/null || true)
     if [ -n "${old:-}" ] && kill -0 "$old" 2>/dev/null; then return 0; fi
   fi
-  ( cmd_hc_watch ) </dev/null >/dev/null 2>&1 &
+  # A new process, not a subshell of launch. Its pid file stores its own
+  # $$, and it keeps running after launch exits so a later done can be delivered.
+  export BAC_STATE_DIR="$STATE_DIR" BAC_DATA_DIR="$DATA_DIR" BAC_CONFIG="$CONFIG_FILE"
+  self=$(bac_resolved)
+  (trap '' HUP; exec "$self" hc-watch) </dev/null >/dev/null 2>&1 &
 }
 
 # wait_hc_ready <terminal> <kind> — 0 ready, 1 timeout, 3 dialog (WAIT_STATE).
@@ -1267,7 +1329,7 @@ launch_with_hc() {
   htc=false; [ "$PLACE_TAB_CREATED" = 1 ] && htc=true
   registry_update '.panes[$p] = {pane_id:$p, workspace_id:null, task_id:$task, agent_name:$n, kind:$k, repo:$r,
       worktree:$wt, branch:$b, base_commit:$bc, origin:"launched", created_workspace:false, created_terminal:true,
-      backend:"hc", created_at:$t, last_status:null, armed:false,
+      backend:"hc", created_at:$t, last_status:null, armed:false, seen_status:"idle", seen_at:0,
       herdr_space:(if $hs=="" then null else $hs end), created_herdr_space:$hsc,
       herdr_tab:(if $ht=="" then null else $ht end), created_herdr_tab:$htc,
       agent_args:$aa, owner:(if $o == "" then null else $o end), launching_until:$lu}' \
@@ -1278,6 +1340,7 @@ launch_with_hc() {
     || die registry_error "registry write failed"
   word=$(hc_status_word "$addr")
   [ -n "$word" ] || word=none
+  note_seen "$addr" "$word" || log "launch $addr seen-status was not recorded"
   printf '%s %s\n' "$word" "$(now)" >"$LAST_DIR/$(printf '%s' "$addr" | tr ':' '_')"
   set_marker "$addr" "$tid"
   name_created_place "$repo" "$tid"
@@ -1288,7 +1351,7 @@ launch_with_hc() {
     launch_blocked "$addr" "$WAIT_STATE"
     exit 0
   fi
-  arm_pane "$addr"
+  arm_pane "$addr" || die registry_error "pane was not armed; the prompt was not sent and launch was not successful"
   hc_send_text "$addr" "$kind" "$prompt"; prc=$?
   if [ "$prc" = 2 ]; then
     br=$(printf '%s' "${PROMPT_RESULT:-}" | jq -r '.error.blocked_reason // "agent_blocked"' 2>/dev/null)
@@ -1317,11 +1380,12 @@ cmd_hook() {
       # Launched panes stay unarmed until bac sends the first prompt, so agent startup
       # (shell -> agent idle, possibly via working/unknown) never wakes Grok Bot.
       if [ "$(printf '%s' "$entry" | jq -r 'if .armed == false then "no" else "yes" end')" = no ]; then
+        note_seen "$pane" "$st" || log "not armed $pane: seen-status was not recorded"
         remember_status "$lastf" "$st"
         log "not armed yet $pane $st"; exit 0
       fi
       case "$st" in
-        working | unknown | "") remember_status "$lastf" "$st"; exit 0 ;;
+        working | unknown | "") note_seen "$pane" "$st" || log "working $pane: seen-status was not recorded"; remember_status "$lastf" "$st"; exit 0 ;;
       esac
       reason=""
       if [ "$(printf '%s' "$entry" | jq -r '.kind // empty')" = codex ] && [ "$st" != working ]; then
@@ -1370,6 +1434,12 @@ do_handover_hc() { # do_handover_hc <terminal> <note> <owner>
   fi
   cwd=$(printf '%s' "$js" | jq -r '.cwd // empty')
   name=$(printf '%s' "$js" | jq -r '.name // empty')
+  happ=$(printf '%s' "$js" | jq -r 'if (.status|type) == "object" then (.status.app // empty) else empty end')
+  case "$happ" in
+    "" | grok | codex) ;;
+    pi | antigravity) die_kind kind_unsupported "kind $happ is not implemented" "$happ" rejected ;;
+    *) die_kind kind_unsupported "kind $happ is unknown" "$happ" unknown ;;
+  esac
   st=$(printf '%s' "$js" | jq -r 'if (.status|type) == "object" then (.status.state // empty) else empty end')
   task="ho-$(printf '%s' "$addr" | tr -c 'A-Za-z0-9' '-' | sed 's/-*$//')-$(now)"
   repo=""; [ -n "$cwd" ] && repo=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || true)
@@ -1390,14 +1460,15 @@ do_handover_hc() { # do_handover_hc <terminal> <note> <owner>
   hsc=false; [ "${PLACE_CREATED:-0}" = 1 ] && hsc=true
   htc=false; [ "${PLACE_TAB_CREATED:-0}" = 1 ] && htc=true
   gen=$(paired_generation "$addr" insert '.panes[$p] = {pane_id:$p, workspace_id:null, task_id:$task, agent_name:(if $n=="" then null else $n end),
-      kind:null, repo:(if $r=="" then null else $r end), worktree:(if $r=="" then null else $r end),
+      kind:(if $k=="" then null else $k end), repo:(if $r=="" then null else $r end), worktree:(if $r=="" then null else $r end),
       cwd:$cwd, origin:"handover", note:(if $note=="" then null else $note end), created_at:$t,
       last_status:(if $s=="" then null else $s end), created_workspace:false, created_terminal:false, backend:"hc",
       herdr_space:(if $hs=="" then null else $hs end), created_herdr_space:$hsc,
       herdr_tab:(if $ht=="" then null else $ht end), created_herdr_tab:$htc,
-      owner:(if $o=="" then null else $o end), armed:true}' \
-    --arg o "$howner" --arg p "$addr" --arg task "$task" --arg n "$name" --arg r "$repo" --arg cwd "$cwd" \
-    --arg note "$note" --arg t "$(iso_now)" --arg s "$st" --arg hs "$PLACE_SPACE" --argjson hsc "$hsc" \
+      owner:(if $o=="" then null else $o end), armed:true,
+      seen_status:(if $s=="" then null else $s end), seen_at:$sn}' \
+    --arg o "$howner" --arg p "$addr" --arg task "$task" --arg n "$name" --arg k "$happ" --arg r "$repo" --arg cwd "$cwd" \
+    --arg note "$note" --arg t "$(iso_now)" --arg s "$st" --argjson sn "$(now)" --arg hs "$PLACE_SPACE" --argjson hsc "$hsc" \
     --arg ht "$PLACE_TAB" --argjson htc "$htc") \
     || die lock_unavailable "handover was not stored; the registry and generation were not changed and no webhook was sent"
   if valid_space_id "$ho_sp" && valid_space_id "$ho_tab"; then
@@ -1461,9 +1532,10 @@ do_handover() { # do_handover <pane> <note> [owner] -> prints entry
   gen=$(paired_generation "$pane" insert '.panes[$p] = {pane_id:$p, workspace_id:$ws, task_id:$task, agent_name:(if $n=="" then null else $n end),
       kind:(if $k=="" then null else $k end), repo:(if $r=="" then null else $r end), worktree:(if $r=="" then null else $r end),
       cwd:$cwd, origin:"handover", note:(if $note=="" then null else $note end), created_at:$t, last_status:(if $s=="" then null else $s end),
-      created_workspace:false, backend:"herdr", owner:(if $o=="" then null else $o end)}' \
+      created_workspace:false, backend:"herdr", owner:(if $o=="" then null else $o end),
+      seen_status:(if $s=="" then null else $s end), seen_at:$sn}' \
     --arg o "$howner" --arg p "$pane" --arg ws "$ws" --arg task "$task" --arg n "$name" --arg k "$kind" --arg r "$repo" --arg cwd "$cwd" \
-    --arg note "$note" --arg t "$(iso_now)" --arg s "$st") \
+    --arg note "$note" --arg t "$(iso_now)" --arg s "$st" --argjson sn "$(now)") \
     || die lock_unavailable "handover was not stored; the registry and generation were not changed and no webhook was sent"
   set_marker "$pane" "$task"
   e=$(entry_for_pane "$pane")
@@ -1529,8 +1601,8 @@ repo_allowed() {
   done | grep -q yes
 }
 
-arm_pane() { # arm_pane <pane>: from now on status changes produce webhooks
-  registry_update 'if .panes[$p] then .panes[$p].armed = true else . end' --arg p "$1"
+arm_pane() { # arm_pane <pane>: from now on status changes produce webhooks. Non-zero: not armed.
+  registry_update 'if .panes[$p] then .panes[$p].armed = true else error("missing") end' --arg p "$1"
 }
 
 # screen_tail <pane> [lines] — last non-blank lines of the visible screen.
@@ -1759,7 +1831,7 @@ EOF
 
   # Register before start so status hooks for this pane are tracked from the first event.
   registry_update '.panes[$p] = {pane_id:$p, workspace_id:$ws, task_id:$task, agent_name:$n, kind:$k, repo:$r,
-      worktree:$wt, branch:$b, base_commit:$bc, origin:"launched", created_workspace:true, backend:"herdr", created_at:$t, last_status:null, armed:false,
+      worktree:$wt, branch:$b, base_commit:$bc, origin:"launched", created_workspace:true, backend:"herdr", created_at:$t,       last_status:null, armed:false, seen_status:"idle", seen_at:0,
       agent_args:$aa, owner:(if $o == "" then null else $o end), launching_until:$lu}' \
     --arg o "$owner" --argjson lu "$(($(now) + 600))" --argjson aa "$args_json" --arg p "$pane" --arg ws "$ws" --arg task "$tid" --arg n "$name" --arg k "$kind" --arg r "$repo" --arg wt "$wt" \
     --arg b "$branch" --arg bc "$base_commit" --arg t "$(iso_now)" || die registry_error "registry write failed"
@@ -1795,7 +1867,7 @@ EOF
     exit 0
   fi
   # Never opt in to the Grok "Help improve Grok" data-sharing banner; it is left untouched.
-  arm_pane "$pane"
+  arm_pane "$pane" || die registry_error "pane was not armed; the prompt was not sent and launch was not successful"
   BAC_PROMPT_KIND="$kind" prompt_with_retry "$name" "$pane" "$prompt"; prc=$?
   if [ "$prc" = 2 ]; then
     br=$(printf '%s' "${PROMPT_RESULT:-}" | jq -r '.error.blocked_reason // "agent_blocked"' 2>/dev/null)
@@ -2015,7 +2087,7 @@ cmd_send() {
     esac
   fi
   if [ "${SCREEN_BACKEND:-}" = hc ]; then
-    arm_pane "$PANE"
+    arm_pane "$PANE" || die registry_error "pane was not armed; the text was not sent"
     hc_send_text "$PANE" "$k" "$text"; prc=$?
     [ "$prc" = 0 ] && [ "$pending" = 1 ] && clear_pending_prompt "$PANE"
     [ "$prc" = 0 ] && [ "$pending" = 0 ] && [ -f "$(pending_file "$PANE")" ] && clear_pending_prompt "$PANE"
@@ -2026,7 +2098,7 @@ cmd_send() {
       jq -cn --argjson prc "$prc" --arg p "$PANE" '{ok:($prc==0), pane_id:$p, status:null, error:{code:"unparsed_result"}}'
     return
   fi
-  arm_pane "$PANE"
+  arm_pane "$PANE" || die registry_error "pane was not armed; the text was not sent"
   BAC_PROMPT_KIND="$k" prompt_with_retry "$(agent_target)" "$PANE" "$text"; prc=$?
   [ "$prc" = 0 ] && [ "$pending" = 1 ] && clear_pending_prompt "$PANE"
   [ "$prc" = 0 ] && [ "$pending" = 0 ] && [ -f "$(pending_file "$PANE")" ] && clear_pending_prompt "$PANE" # superseded by a manual prompt
@@ -2111,7 +2183,7 @@ cmd_answer() {
   sleep 2
   after=$(screen_bottom "$PANE" 30); still=false
   if dialog_open "$after" && [ "$(printf '%s\n' "$after" | options_from_text)" = "$opts" ]; then still=true; fi
-  arm_pane "$PANE"
+  arm_pane "$PANE" || die registry_error "the dialog was answered but the pane was not armed; no success result was returned"
   sent=null
   pf=$(pending_file "$PANE")
   if [ "$still" = false ] && [ -f "$pf" ]; then
@@ -2586,7 +2658,7 @@ cmd_migrate() {
     esac
   done
   [ -n "$src" ] && [ -n "$dst" ] || die usage "bac migrate --fixture <src-dir> --dest <dst-dir>"
-  root=$(cd "$(dirname "$0")/.." && pwd -P)
+  root=$(bac_root) || die io "could not resolve the bac install root from $0"
   sh "$root/contracts/bac/v1/migrate-fixture.sh" "$src" "$dst"
 }
 

@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -93,25 +94,44 @@ def previous_generation(src, pane):
 
 
 def run_jq(cmd, src, orig):
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    # jq reads a file and writes files. A stdin/stdout pipe pair deadlocks
+    # when the document is larger than the pipe buffer, because this process
+    # would wait for jq to exit before reading.
+    in_path = out_path = err_path = None
     try:
-        proc.stdin.write(src)
-        proc.stdin.close()
-    except (BrokenPipeError, OSError):
-        pass
-    while proc.poll() is None:
-        if not parent_alive(orig):
-            proc.kill()
-            proc.wait()
-            sys.exit(3)
-        time.sleep(0.05)
-    out = proc.stdout.read() if proc.stdout is not None else b""
-    return proc.returncode, out
+        in_fd, in_path = tempfile.mkstemp(prefix="bac-jq-")
+        os.write(in_fd, src)
+        os.close(in_fd)
+        out_fd, out_path = tempfile.mkstemp(prefix="bac-jq-")
+        os.close(out_fd)
+        err_fd, err_path = tempfile.mkstemp(prefix="bac-jq-")
+        os.close(err_fd)
+        with open(in_path, "rb") as fin, open(out_path, "wb") as fout, open(err_path, "wb") as ferr:
+            proc = subprocess.Popen(cmd, stdin=fin, stdout=fout, stderr=ferr)
+        while proc.poll() is None:
+            if not parent_alive(orig):
+                proc.kill()
+                proc.wait()
+                sys.exit(3)
+            time.sleep(0.05)
+        with open(out_path, "rb") as handle:
+            out = handle.read()
+        if proc.returncode != 0:
+            try:
+                with open(err_path, "rb") as handle:
+                    err = handle.read(400)
+            except OSError:
+                err = b""
+            if err:
+                sys.stderr.write(err.decode("utf-8", "replace"))
+        return proc.returncode, out
+    finally:
+        for path in (in_path, out_path, err_path):
+            if path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
 
 def read_bytes(path, default):
@@ -240,7 +260,7 @@ def generation(lockfile, seqfile, pane, orig):
 
 
 def paired(lockfile, registry, seqfile, pane, mode, jq_filter, jq_args, orig):
-    if mode not in ("end", "require", "insert"):
+    if mode not in ("end", "require", "insert", "status"):
         sys.exit(1)
     if not same_dir(lockfile, registry, "managed.json") or not same_dir(lockfile, seqfile, "event-seq.json"):
         sys.exit(1)
@@ -256,6 +276,54 @@ def paired(lockfile, registry, seqfile, pane, mode, jq_filter, jq_args, orig):
     code, out = run_jq(["jq", *jq_args, jq_filter], reg_src, orig)
     if code != 0:
         sys.exit(1)
+    if mode == "status":
+        try:
+            wrapped = json.loads(out.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
+            sys.exit(1)
+        if not isinstance(wrapped, dict) or not isinstance(wrapped.get("publish"), bool):
+            sys.exit(1)
+        doc = wrapped.get("doc")
+        if not isinstance(doc, dict) or not pane_in(doc, pane):
+            sys.exit(4)
+        reg_payload = (json.dumps(doc, separators=(",", ":")) + "\n").encode("utf-8")
+        if not wrapped["publish"]:
+            if not parent_alive(orig):
+                sys.exit(3)
+            replace(registry, reg_payload, orig)
+            sys.stdout.write("debounce\n")
+            sys.stdout.flush()
+            return
+        if prev is None or prev >= 9007199254740992:
+            sys.exit(1)
+        seq_out = seq_payload(seq_src, pane, prev)
+        if previous_generation(seq_out, pane) != prev + 1:
+            sys.exit(1)
+        if not parent_alive(orig):
+            sys.exit(3)
+        journal = {
+            "v": 1,
+            "registry_name": "managed.json",
+            "seq_name": "event-seq.json",
+            "registry": reg_payload.decode("utf-8"),
+            "seq": seq_out.decode("utf-8"),
+        }
+        replace(
+            pending_path(lockfile),
+            (json.dumps(journal, separators=(",", ":")) + "\n").encode("utf-8"),
+            orig,
+        )
+        replace(seqfile, seq_out, orig)
+        replace(registry, reg_payload, orig)
+        if not parent_alive(orig):
+            sys.exit(3)
+        try:
+            os.remove(pending_path(lockfile))
+        except OSError:
+            pass
+        sys.stdout.write("%d\n" % (prev + 1))
+        sys.stdout.flush()
+        return
     try:
         after = json.loads(out.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError):
@@ -340,7 +408,7 @@ def main(argv):
         sys.stderr.write("bac-lock: %s\n" % exc)
         return 1
     sys.stderr.write(
-        "usage: bac-lock generation LOCK SEQ PANE | jq-apply LOCK DEST FILTER [jq-args] | paired LOCK REG SEQ PANE end|require|insert FILTER [jq-args]\n"
+        "usage: bac-lock generation LOCK SEQ PANE | jq-apply LOCK DEST FILTER [jq-args] | paired LOCK REG SEQ PANE end|require|insert|status FILTER [jq-args]\n"
     )
     return 1
 
