@@ -125,6 +125,10 @@ paired_generation() {
     printf '%s' "$n"
     return 7
   fi
+  if [ "$rc" = 0 ] && [ "$mode" = insert ]; then
+    printf '%s' "$n"
+    return 0
+  fi
   [ "$rc" = 0 ] || return "$rc"
   case "$n" in
     ''|*[!0-9]*) return 1 ;;
@@ -1454,6 +1458,22 @@ handover_insert_rc() {
     *) die lock_unavailable "handover was not stored; the registry and generation were not changed and no webhook was sent" ;;
   esac
 }
+# handover_emit_new <generation-and-row> <status> <note>
+# The first line is the generation from the insert commit. The rest is the
+# row object from that same commit, not a later registry read.
+handover_emit_new() {
+  nl=$(printf '\n')
+  gen=${1%%"$nl"*}
+  row=${1#*"$nl"}
+  case "$gen" in ''|*[!0-9]*) die io "handover commit did not return a generation" ;; esac
+  e=$(printf '%s' "$row" | jq -c 'if type == "object" and (.pane_id | type) == "string" and .pane_id != "" and (.task_id | type) == "string" and .task_id != "" then . else error("not the committed row") end') \
+    || die io "handover commit did not return the locked row"
+  built=$(build_event handover "$2" "$e" "$(jq -cn --arg n "$3" '{note:(if $n=="" then null else $n end)}')") \
+    || die event_committed "handover is stored and generation is committed; the callback was not built. A retry sees the pane as already managed and will not send another handover event"
+  publish_built "$built" "$gen" \
+    || die event_committed "handover is stored and generation is committed; the callback was not started. A retry sees the pane as already managed and will not send another handover event"
+  printf '%s' "$e"
+}
 do_handover_hc() { # do_handover_hc <terminal> <note> <owner>
   pane="$1"; note="$2"; howner="$3"
   js=$(hc_get_json "$pane") || die pane_not_found "terminal $pane not found"
@@ -1514,14 +1534,9 @@ do_handover_hc() { # do_handover_hc <terminal> <note> <owner>
   fi
   name_created_place "${repo:-$cwd}" "$task"
   ensure_hc_watch
-  e=$(entry_for_pane "$addr")
-  built=$(build_event handover "$st" "$e" "$(jq -cn --arg n "$note" '{note:(if $n=="" then null else $n end)}')") \
-    || die event_committed "handover is stored and generation is committed; the callback was not built. A retry sees the pane as already managed and will not send another handover event"
-  publish_built "$built" "$gen" \
-    || die event_committed "handover is stored and generation is committed; the callback was not started. A retry sees the pane as already managed and will not send another handover event"
   [ -n "$st" ] && printf '%s %s\n' "$st" "$(now)" >"$LAST_DIR/$(printf '%s' "$addr" | tr ':' '_')"
   log "handover $addr task=$task backend=hc"
-  printf '%s' "$e"
+  handover_emit_new "$gen" "$st" "$note"
 }
 
 do_handover() { # do_handover <pane> <note> [owner] -> prints entry
@@ -1566,15 +1581,11 @@ do_handover() { # do_handover <pane> <note> [owner] -> prints entry
     --arg o "$howner" --arg p "$pane" --arg ws "$ws" --arg task "$task" --arg n "$name" --arg k "$kind" --arg r "$repo" --arg cwd "$cwd" \
     --arg note "$note" --arg t "$(iso_now)" --arg s "$st" --argjson sn "$(now)")
   handover_insert_rc $? "$pane" "$gen" || return 0
-  set_marker "$pane" "$task"
-  e=$(entry_for_pane "$pane")
-  built=$(build_event handover "$st" "$e" "$(jq -cn --arg n "$note" '{note:(if $n=="" then null else $n end)}')") \
-    || die event_committed "handover is stored and generation is committed; the callback was not built. A retry sees the pane as already managed and will not send another handover event"
-  publish_built "$built" "$gen" \
-    || die event_committed "handover is stored and generation is committed; the callback was not started. A retry sees the pane as already managed and will not send another handover event"
+  "$HERDR" pane report-metadata "$pane" --source "$META_SOURCE" --display-agent "bac: $task" \
+    --token "bac=managed" --token "bac_task=$task" >/dev/null 2>&1 || log "marker set failed for $pane"
   [ -n "$st" ] && printf '%s %s\n' "$st" "$(now)" >"$LAST_DIR/$(printf '%s' "$pane" | tr ':' '_')"
   log "handover $pane task=$task"
-  printf '%s' "$e"
+  handover_emit_new "$gen" "$st" "$note"
 }
 do_reclaim() { # do_reclaim <pane> <event>
   e=$(entry_for_pane "$1")

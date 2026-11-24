@@ -386,6 +386,14 @@ def paired(lockfile, registry, seqfile, pane, mode, jq_filter, jq_args, orig):
             sys.exit(1)
     elif not has:
         sys.exit(1)
+    committed_row = None
+    if mode == "insert":
+        panes = after.get("panes")
+        committed_row = panes.get(pane) if isinstance(panes, dict) else None
+        pane_id = committed_row.get("pane_id") if isinstance(committed_row, dict) else None
+        task_id = committed_row.get("task_id") if isinstance(committed_row, dict) else None
+        if not isinstance(pane_id, str) or pane_id == "" or not isinstance(task_id, str) or task_id == "":
+            sys.exit(1)
     reg_payload = out if out.endswith(b"\n") else out + b"\n"
     seq_out = seq_payload(seq_src, pane, prev)
     if previous_generation(seq_out, pane) != prev + 1:
@@ -413,6 +421,8 @@ def paired(lockfile, registry, seqfile, pane, mode, jq_filter, jq_args, orig):
     except OSError:
         pass
     sys.stdout.write("%d\n" % (prev + 1))
+    if committed_row is not None:
+        sys.stdout.write(json.dumps(committed_row, separators=(",", ":")) + "\n")
     sys.stdout.flush()
 
 
