@@ -289,7 +289,7 @@ notify() {
   # event_id to the primary. That can deliver twice to one logical consumer that watches both. Consumers dedupe
   # on event_id. Restart does not replay a payload that was never stamped. Extras and the primary are trusted
   # metadata receivers, not an isolation boundary.
-  payload=$(stamp_event "$1") || { log "event stamp failed"; return 0; }
+  payload=$(stamp_event "$1") || { log "event stamp failed"; return 1; }
   n_owner=$(printf '%s' "$payload" | jq -r '.owner // empty' 2>/dev/null)
   tmo=$(webhook_timeout); skip_url=""; n_reason=""
   if [ -n "$n_owner" ]; then
@@ -663,9 +663,11 @@ deliver_status() {
       if [ $(($(now) - ${last_ts:-0})) -lt "$deb" ]; then log "debounced $pane blocked"; return 0; fi ;;
   esac
   registry_update '.panes[$p].last_status=$s | .panes[$p].last_status_at=$t | .panes[$p].blocked_reason=(if $r == "" then null else $r end)' \
-    --arg p "$pane" --arg s "$st" --arg t "$(iso_now)" --arg r "$reason"
+    --arg p "$pane" --arg s "$st" --arg t "$(iso_now)" --arg r "$reason" \
+    || { log "status not delivered: registry was not updated"; return 1; }
   notify "$(build_event agent_status "$st" "$entry" "$(jq -cn --arg r "$reason" --arg h "$raw" \
-    '{herdr_status:$h} + (if $r == "" then {} else {blocked_reason:$r} end)')")"
+    '{herdr_status:$h} + (if $r == "" then {} else {blocked_reason:$r} end)')")" \
+    || { log "status not delivered: event was not stamped"; return 1; }
 }
 
 # hc_emit_word <pane> <entry> <word> <status-json> — map one OSC word onto deliver_status.
@@ -724,11 +726,15 @@ hc_baseline_terminal() { # one Terminal from a snapshot: seed, or catch up a mis
 hc_on_closed() {
   entry=$(entry_for_pane "$1")
   [ -n "$entry" ] || return 0
-  registry_update 'del(.panes[$p])' --arg p "$1"
+  registry_update 'del(.panes[$p])' --arg p "$1" \
+    || { log "hc $2 $1 aborted: registry was not updated"; return 1; }
+  if ! notify "$(build_event pane_closed "" "$entry")"; then
+    log "hc $2 $1 aborted: event was not stamped"
+    return 1
+  fi
   printf '%s\n' "$entry" | jq -c --arg ev "$2" --arg t "$(iso_now)" '. + {ended:$ev, ended_at:$t}' >>"$HISTORY"
   idf=$(printf '%s' "$1" | tr ':' '_')
   rm -f "$LAST_DIR/$idf" "$LAST_DIR/$idf.reported" "$LAST_DIR/$idf.screenpoll"
-  notify "$(build_event pane_closed "" "$entry")"
   log "hc $2 $1"
 }
 
@@ -1269,15 +1275,19 @@ cmd_hook() {
         blocked:blocked) if [ $(($(now) - ${last_ts:-0})) -lt "$deb" ]; then log "debounced $pane blocked"; exit 0; fi ;;
       esac
       registry_update '.panes[$p].last_status=$s | .panes[$p].last_status_at=$t | .panes[$p].blocked_reason=(if $r == "" then null else $r end)' \
-        --arg p "$pane" --arg s "$st" --arg t "$(iso_now)" --arg r "$reason"
+        --arg p "$pane" --arg s "$st" --arg t "$(iso_now)" --arg r "$reason" \
+        || { log "hook status aborted: registry was not updated"; exit 1; }
       notify "$(build_event agent_status "$st" "$entry" "$(jq -cn --arg r "$reason" --arg h "$(printf '%s' "$js" | jq -r '.data.agent_status')" \
-        '{herdr_status:$h} + (if $r == "" then {} else {blocked_reason:$r} end)')")"
+        '{herdr_status:$h} + (if $r == "" then {} else {blocked_reason:$r} end)')")" \
+        || { log "hook status aborted: event was not stamped"; exit 1; }
       ;;
     pane.closed | pane.exited)
-      registry_update 'del(.panes[$p])' --arg p "$pane"
+      registry_update 'del(.panes[$p])' --arg p "$pane" \
+        || { log "hook pane close aborted: registry was not updated"; exit 1; }
+      notify "$(build_event pane_closed "" "$entry")" \
+        || { log "hook pane close aborted: event was not stamped"; exit 1; }
       printf '%s\n' "$entry" | jq -c --arg ev "$ev" --arg t "$(iso_now)" '. + {ended:$ev, ended_at:$t}' >>"$HISTORY"
       rm -f "$LAST_DIR/$(printf '%s' "$pane" | tr ':' '_')"
-      notify "$(build_event pane_closed "" "$entry")"
       ;;
   esac
   exit 0
@@ -1352,7 +1362,8 @@ do_handover_hc() { # do_handover_hc <terminal> <note> <owner>
   name_created_place "${repo:-$cwd}" "$task"
   ensure_hc_watch
   e=$(entry_for_pane "$addr")
-  notify "$(build_event handover "$st" "$e" "$(jq -cn --arg n "$note" '{note:(if $n=="" then null else $n end)}')")"
+  notify "$(build_event handover "$st" "$e" "$(jq -cn --arg n "$note" '{note:(if $n=="" then null else $n end)}')")" \
+    || die lock_unavailable "handover was stored but the event was not stamped; no webhook was sent"
   log "handover $addr task=$task backend=hc"
   printf '%s' "$e"
 }
@@ -1403,7 +1414,8 @@ do_handover() { # do_handover <pane> <note> [owner] -> prints entry
   [ -n "$st" ] && printf '%s %s\n' "$st" "$(now)" >"$LAST_DIR/$(printf '%s' "$pane" | tr ':' '_')"
   set_marker "$pane" "$task"
   e=$(entry_for_pane "$pane")
-  notify "$(build_event handover "$st" "$e" "$(jq -cn --arg n "$note" '{note:(if $n=="" then null else $n end)}')")"
+  notify "$(build_event handover "$st" "$e" "$(jq -cn --arg n "$note" '{note:(if $n=="" then null else $n end)}')")" \
+    || die lock_unavailable "handover was stored but the event was not stamped; no webhook was sent"
   log "handover $pane task=$task"
   printf '%s' "$e"
 }
@@ -1411,7 +1423,12 @@ do_reclaim() { # do_reclaim <pane> <event>
   e=$(entry_for_pane "$1")
   [ -n "$e" ] || return 1
   be=$(entry_backend "$e")
-  registry_update 'del(.panes[$p])' --arg p "$1"
+  registry_update 'del(.panes[$p])' --arg p "$1" \
+    || { log "$2 $1 aborted: registry was not updated"; return 1; }
+  if ! notify "$(build_event "$2" "" "$e")"; then
+    log "$2 $1 aborted: event was not stamped; history not appended"
+    return 1
+  fi
   printf '%s\n' "$e" | jq -c --arg ev "$2" --arg t "$(iso_now)" '. + {ended:$ev, ended_at:$t}' >>"$HISTORY"
   idf=$(printf '%s' "$1" | tr ':' '_')
   rm -f "$LAST_DIR/$idf" "$LAST_DIR/$idf.reported" "$LAST_DIR/$idf.screenpoll"
@@ -1421,7 +1438,6 @@ do_reclaim() { # do_reclaim <pane> <event>
   else
     clear_marker "$1"
   fi
-  notify "$(build_event "$2" "" "$e")"
   log "$2 $1"
   printf '%s' "$e"
 }
@@ -1443,7 +1459,7 @@ cmd_action() {
         # Launched panes can also be reclaimed: the user takes over, bac will not close it.
         :
       fi
-      e=$(do_reclaim "$pane" reclaim)
+      e=$(do_reclaim "$pane" reclaim) || die lock_unavailable "reclaim did not finish; registry was left unchanged and no success webhook was sent"
       toast "Reclaimed from Grok Bot" "$pane"
       jq -cn --argjson e "$e" '{ok:true,action:"reclaim",entry:$e}' ;;
     *) die usage "action handover|reclaim" ;;
@@ -2270,7 +2286,7 @@ hc_cmd_stop() {
     "$HC" rm --json "$PANE" >/dev/null 2>&1 || log "hc rm $PANE did not remove it (left for a later stop)"
   fi
   clear_pending_prompt "$PANE"
-  e=$(do_reclaim "$PANE" stopped)
+  e=$(do_reclaim "$PANE" stopped) || die lock_unavailable "stop did not finish; no success record was written"
   jq -cn --argjson e "$e" --argjson c "$closed" '{ok:true, task_id:$e.task_id, origin:$e.origin, workspace_closed:$c,
      worktree_kept:($e.worktree // null), session_id:null,
      note:(if $e.origin=="handover" then "handover terminal unregistered; it was left running"
@@ -2298,7 +2314,7 @@ cmd_reclaim_cli() {
   [ -n "$pane" ] || die usage "bac reclaim --pane <id> [--owner <name>]"
   require_entry "$pane"
   enforce_owner strict
-  e=$(do_reclaim "$pane" reclaim) || die not_managed "$pane not managed"
+  e=$(do_reclaim "$pane" reclaim) || die lock_unavailable "reclaim did not finish; registry was left unchanged and no success webhook was sent"
   jq -cn --argjson e "$e" '{ok:true, entry:$e}'
 }
 
@@ -2464,7 +2480,8 @@ cmd_test_webhook() {
   BAC_CTX="test"; towner=""
   while [ $# -gt 0 ]; do case "$1" in --owner) towner="$2"; shift 2 ;; *) die usage "bac test-webhook [--owner <name>]" ;; esac; done
   [ -z "$towner" ] || valid_owner "$towner" || die usage "owner must match $OWNER_RE"
-  notify "$(build_event test "" "$(jq -cn --arg o "$towner" 'if $o == "" then {} else {owner:$o} end')")"
+  notify "$(build_event test "" "$(jq -cn --arg o "$towner" 'if $o == "" then {} else {owner:$o} end')")" \
+    || die lock_unavailable "event was not stamped; no webhook was sent"
   if [ -n "${BAC_TEST_DRAIN_SEC:-}" ]; then
     sleep "$BAC_TEST_DRAIN_SEC"
   else

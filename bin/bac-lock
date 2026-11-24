@@ -76,6 +76,42 @@ def replace(dest, payload, orig):
                 pass
 
 
+def previous_generation(src, pane):
+    try:
+        data = json.loads(src.decode("utf-8") or "{}")
+    except (UnicodeError, json.JSONDecodeError):
+        return None
+    panes = data.get("panes") if isinstance(data, dict) else None
+    if not isinstance(panes, dict) or pane not in panes:
+        return 0
+    current = panes[pane]
+    if isinstance(current, bool) or not isinstance(current, int):
+        return None
+    return current
+
+
+def run_jq(cmd, src, orig):
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        proc.stdin.write(src)
+        proc.stdin.close()
+    except (BrokenPipeError, OSError):
+        pass
+    while proc.poll() is None:
+        if not parent_alive(orig):
+            proc.kill()
+            proc.wait()
+            sys.exit(3)
+        time.sleep(0.05)
+    out = proc.stdout.read() if proc.stdout is not None else b""
+    return proc.returncode, out
+
+
 def generation(lockfile, seqfile, pane, orig):
     fd = os.open(lockfile, os.O_CREAT | os.O_RDWR, 0o600)
     os.set_inheritable(fd, False)
@@ -88,7 +124,12 @@ def generation(lockfile, seqfile, pane, orig):
             src = handle.read()
     else:
         src = b'{"version":1,"panes":{}}\n'
-    proc = subprocess.run(
+    prev = previous_generation(src, pane)
+    # JSON numbers are IEEE doubles. 2**53 is the last integer that stays
+    # distinct from its successor, so a stored 2**53 must not be "incremented".
+    if prev is None or prev >= 9007199254740992:
+        sys.exit(1)
+    code, out = run_jq(
         [
             "jq",
             "-c",
@@ -97,16 +138,14 @@ def generation(lockfile, seqfile, pane, orig):
             pane,
             "(.panes[$p] // 0) as $cur | ($cur + 1) as $n | .panes[$p] = $n | {doc:., n:$n}",
         ],
-        input=src,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
+        src,
+        orig,
     )
-    if proc.returncode != 0:
+    if code != 0:
         sys.exit(1)
-    parsed = json.loads(proc.stdout.decode("utf-8"))
+    parsed = json.loads(out.decode("utf-8"))
     number = parsed.get("n")
-    if not isinstance(number, int) or isinstance(number, bool):
+    if isinstance(number, bool) or not isinstance(number, int) or number != prev + 1:
         sys.exit(1)
     doc = parsed.get("doc")
     if not isinstance(doc, dict):
@@ -129,16 +168,10 @@ def jq_apply(lockfile, dest, jq_filter, jq_args, orig):
             src = handle.read()
     else:
         src = b'{"version":1,"panes":{}}\n'
-    proc = subprocess.run(
-        ["jq", *jq_args, jq_filter],
-        input=src,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if proc.returncode != 0:
+    code, out = run_jq(["jq", *jq_args, jq_filter], src, orig)
+    if code != 0:
         sys.exit(1)
-    replace(dest, proc.stdout if proc.stdout.endswith(b"\n") else proc.stdout + b"\n", orig)
+    replace(dest, out if out.endswith(b"\n") else out + b"\n", orig)
     sys.stdout.write("OK\n")
     sys.stdout.flush()
 
