@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "panes": {
+    "t9": {
+      "pane_id": "t9",
+      "workspace_id": null,
+      "task_id": "fix-login",
+      "agent_name": "gb-fix-login",
+      "kind": "codex",
+      "repo": "/tmp/fixture-repo",
+      "worktree": "/tmp/fixture-repo",
+      "branch": "gbb/fix-login",
+      "origin": "launched",
+      "backend": "hc",
+      "owner": "dot",
+      "created_terminal": true,
+      "created_workspace": false,
+      "armed": true,
+      "last_status": "done"
+    },
+    "w1:p1": {
+      "pane_id": "w1:p1",
+      "workspace_id": "w1",
+      "task_id": "demo",
+      "agent_name": "gb-demo",
+      "kind": "grok",
+      "origin": "handover",
+      "backend": "herdr",
+      "owner": "canmouzhang",
+      "created_workspace": false,
+      "armed": true,
+      "last_status": "idle"
+    },
+    "t8": {
+      "pane_id": "t8",
+      "task_id": "side",
+      "agent_name": "gb-side",
+      "kind": "pi",
+      "origin": "handover",
+      "backend": "hc",
+      "owner": "dot",
+      "created_terminal": false,
+      "created_workspace": false,
+      "armed": true
+    },
+    "t7": {
+      "pane_id": "t7",
+      "task_id": "other",
+      "agent_name": "gb-other",
+      "kind": "nope",
+      "origin": "handover",
+      "backend": "hc",
+      "owner": "dot",
+      "created_terminal": false
+    },
+    "t6": {
+      "pane_id": "t6",
+      "task_id": "legacy",
+      "agent_name": "gb-legacy",
+      "origin": "launched",
+      "owner": null
+    }
+  }
+}

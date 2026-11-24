@@ -1,0 +1,10 @@
+{
+  "expect": "launch_absent_pane",
+  "body": {
+    "ok": false,
+    "error": {
+      "code": "agent_start_failed",
+      "message": "hc returned no address"
+    }
+  }
+}

@@ -7,8 +7,8 @@ set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P); T=$(mktemp -d)
 trap 'kill $SINK 2>/dev/null || true; wait $SINK 2>/dev/null || true; rm -rf "$T"' EXIT
 printf '#!/bin/sh\necho %s\n' "'{\"result\":{\"type\":\"ok\"}}'" >"$T/herdr"; chmod +x "$T/herdr"
-export HERDR_BIN_PATH="$T/herdr" GBB_STATE_DIR="$T/state" GBB_CONFIG="$T/config.toml"
-unset GBB_WEBHOOK_URL GBB_WEBHOOK_HEADER_NAME GBB_WEBHOOK_HEADER_VALUE GBB_OWNER 2>/dev/null || true
+export HERDR_BIN_PATH="$T/herdr" BAC_STATE_DIR="$T/state" BAC_CONFIG="$T/config.toml"
+unset BAC_WEBHOOK_URL BAC_WEBHOOK_HEADER_NAME BAC_WEBHOOK_HEADER_VALUE BAC_OWNER 2>/dev/null || true
 mkdir -p "$T/state" "$T/hits"
 cat >"$T/sink.py" <<'PY'
 import http.server, json, sys, os
@@ -61,9 +61,9 @@ fail() { echo "FAIL: $*"; ls -l "$T/hits"; cat "$T/state/bridge.log" 2>/dev/null
 hits() { [ -f "$T/hits/$1.jsonl" ] && grep -c . "$T/hits/$1.jsonl" || echo 0; }
 body() { tail -n 1 "$T/hits/$1.jsonl" | jq -c .body; }
 clear_hits() { rm -f "$T/hits"/*; }
-tw() { "$ROOT/bin/gbb" test-webhook "$@" >"$T/tw.json"; }
+tw() { "$ROOT/bin/bac" test-webhook "$@" >"$T/tw.json"; }
 
-doc=$("$ROOT/bin/gbb" doctor)
+doc=$("$ROOT/bin/bac" doctor)
 [ "$(printf '%s' "$doc" | jq -c '[.config.owners[].name]')" = '["dot","boss","broken"]' ] || fail "doctor owners: $doc"
 printf '%s' "$doc" | jq -e '.config.owners | all(.header_value_set)' >/dev/null || fail "doctor header_value_set"
 printf '%s' "$doc" | grep -q secret && fail "doctor leaked a secret"
@@ -96,17 +96,17 @@ clear_hits
 tw
 [ "$(hits primary)" = 1 ] && [ "$(body primary | jq -r '.route + "/" + (.owner // "null")')" = primary/null ] || fail "no owner"
 clear_hits
-"$ROOT/bin/gbb" test-webhook --owner 'bad name!' >/dev/null 2>&1 && fail "invalid owner accepted"
+"$ROOT/bin/bac" test-webhook --owner 'bad name!' >/dev/null 2>&1 && fail "invalid owner accepted"
 
 # 6. hook events carry the registry owner; gbb owner reassigns / clears it.
 echo '{"version":1,"panes":{"w1:p1":{"pane_id":"w1:p1","workspace_id":"w1","task_id":"t1","agent_name":"gb-t1","kind":"grok","origin":"launched","armed":true,"owner":"boss"}}}' >"$T/state/managed.json"
-ev() { HERDR_PLUGIN_EVENT=pane.agent_status_changed HERDR_PLUGIN_EVENT_JSON="{\"data\":{\"pane_id\":\"w1:p1\",\"agent_status\":\"$1\"}}" "$ROOT/bin/gbb" hook; }
+ev() { HERDR_PLUGIN_EVENT=pane.agent_status_changed HERDR_PLUGIN_EVENT_JSON="{\"data\":{\"pane_id\":\"w1:p1\",\"agent_status\":\"$1\"}}" "$ROOT/bin/bac" hook; }
 ev "done"; sleep 2
 [ "$(hits boss)" = 1 ] && [ "$(hits primary)" = 0 ] && [ "$(body boss | jq -r '.status + "/" + .owner')" = done/boss ] || fail "hook owner route"
-o=$("$ROOT/bin/gbb" owner t1 nobody)
+o=$("$ROOT/bin/bac" owner t1 --owner boss nobody)
 [ "$(printf '%s' "$o" | jq -r '.route + "/" + .fallback_reason')" = fallback/owner_not_configured ] || fail "gbb owner: $o"
-o=$("$ROOT/bin/gbb" owner t1 --clear)
+o=$("$ROOT/bin/bac" owner t1 --owner nobody --clear)
 [ "$(printf '%s' "$o" | jq -r '.route + "/" + (.owner // "null")')" = primary/null ] || fail "gbb owner --clear: $o"
-[ "$("$ROOT/bin/gbb" list | jq -r '.managed[0].owner // "null"')" = null ] || fail "list owner"
+[ "$("$ROOT/bin/bac" list | jq -r '.managed[0].owner // "null"')" = null ] || fail "list owner"
 grep -q secret "$T/state/bridge.log" && fail "secret in log"
 echo PASS

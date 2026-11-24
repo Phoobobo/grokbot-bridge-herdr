@@ -1,0 +1,10 @@
+{
+  "expect": "kind_required",
+  "body": {
+    "ok": false,
+    "error": {
+      "code": "kind_required",
+      "message": "--kind is required (codex or grok)"
+    }
+  }
+}

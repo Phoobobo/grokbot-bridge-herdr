@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased — bac 1.0.0
+
+The running command is `bac`. Webhook `source` is `bot-as-collie` and callback `version` is the integer 1. There is no `gbb` binary. See `docs/bac/v1/CONTRACT.md` for the v1 revisions after `ae859908` (durable generation, per-target `attempt`, owner is not authentication). Not a published release.
+
 ## 0.3.3 — 2026-11-03
 
 Pick the Herdr space from where its terminals were launched, not from the space's folder field.

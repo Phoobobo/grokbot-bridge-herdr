@@ -12,8 +12,8 @@ set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P); T=$(mktemp -d)
 SINK=""
 cleanup() {
-  if [ -n "${GBB_STATE_DIR:-}" ] && [ -f "$GBB_STATE_DIR/hc-watch.pid" ]; then
-    kill "$(cat "$GBB_STATE_DIR/hc-watch.pid")" 2>/dev/null || true
+  if [ -n "${BAC_STATE_DIR:-}" ] && [ -f "$BAC_STATE_DIR/hc-watch.pid" ]; then
+    kill "$(cat "$BAC_STATE_DIR/hc-watch.pid")" 2>/dev/null || true
   fi
   [ -n "$SINK" ] && kill "$SINK" 2>/dev/null || true
   rm -rf "$T"
@@ -62,8 +62,8 @@ H
 chmod +x "$T/bin/hc" "$T/bin/herdr" "$T/bin/herdr-app"
 printf '%s\n' '› Ask Codex to do anything' 'GPT-6.1-Sol xhigh · ~/x · Context 7% used · 12k in · 2k out' >"$T/screen"
 export HERDR_BIN_PATH="$T/bin/herdr" HC_BIN_PATH="$T/bin/hc" HERDR_APP_BIN_PATH="$T/bin/herdr-app" STUB_DIR="$T" HERDR_STUB="$T/herdr-calls"
-export GBB_STATE_DIR="$T/state" GBB_DATA_DIR="$T/data" GBB_CONFIG="$T/config.toml" GBB_HC_WATCH_ONCE=1
-unset GBB_WEBHOOK_URL GBB_WEBHOOK_HEADER_NAME GBB_WEBHOOK_HEADER_VALUE GBB_OWNER GBB_BACKEND 2>/dev/null || true
+export BAC_STATE_DIR="$T/state" BAC_DATA_DIR="$T/data" BAC_CONFIG="$T/config.toml" BAC_HC_WATCH_ONCE=1
+unset BAC_WEBHOOK_URL BAC_WEBHOOK_HEADER_NAME BAC_WEBHOOK_HEADER_VALUE BAC_OWNER BAC_BACKEND 2>/dev/null || true
 git -C "$T/repo" init -q
 git -C "$T/repo" config user.email t@example.com
 git -C "$T/repo" config user.name t
@@ -82,11 +82,11 @@ debounce_sec = 0
 TOML
 chmod 600 "$T/config.toml"
 reset_calls
-out=$("$ROOT/bin/gbb" launch --repo "$T/repo" --kind grok --task auto1 --prompt "hi" --no-worktree)
+out=$("$ROOT/bin/bac" launch --repo "$T/repo" --kind grok --task auto1 --prompt "hi" --no-worktree)
 printf '%s' "$out" | jq -e '.ok == true and .backend == "hc" and .pane_id == "t9"' >/dev/null || fail "auto launch: $out"
 [ "$(hc_runs | jq 'length')" = 1 ] || fail "auto did not hc run: $(hc_runs)"
 printf '%s' "$(herdr_cmds)" | jq -e 'index("workspace create") == null' >/dev/null || fail "auto created a herdr workspace: $(herdr_cmds)"
-[ "$("$ROOT/bin/gbb" list | jq -r '.managed[0].backend')" = hc ] || fail "auto registry backend"
+[ "$("$ROOT/bin/bac" list | jq -r '.managed[0].backend')" = hc ] || fail "auto registry backend"
 
 # --- config backend=hc, and --backend herdr overrides it ---
 cat >"$T/config.toml" <<'TOML'
@@ -99,46 +99,46 @@ codex_args = ["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=\"xhigh\""]
 TOML
 chmod 600 "$T/config.toml"
 reset_calls
-out=$("$ROOT/bin/gbb" launch --repo "$T/repo" --kind codex --task pin --prompt "review it" --owner boss)
+out=$("$ROOT/bin/bac" launch --repo "$T/repo" --kind codex --task pin --prompt "review it" --owner boss)
 printf '%s' "$out" | jq -e '.ok == true and .backend == "hc" and .pane_id == "t9" and .owner == "boss"' >/dev/null || fail "hc launch: $out"
 wt=$(printf '%s' "$out" | jq -r .worktree)
 run=$(hc_runs | jq -c '.[0]')
 printf '%s' "$run" | jq -e --arg wt "$wt" '
   .[0]=="run" and .[1]=="--bg" and .[2]=="--json" and index("--no-parent") and index("--no-notify") and index("--keep")
-  and index("grokbot=managed") and index("gbb_task=pin") and index("--cwd") and (.[index("--cwd")+1] == $wt)
+  and index("bac=managed") and index("bac_task=pin") and index("--cwd") and (.[index("--cwd")+1] == $wt)
   and (.[index("--")+1] == "codex") and index("-m") and index("gpt-6.1-sol")
   and index("model_reasoning_effort=\"xhigh\"")
   and (map(select(type=="string" and startswith("herdr.space="))) | length) == 1
   and (map(select(type=="string" and startswith("herdr.tab="))) | .[0] | test("^herdr\\.tab=tb[0-9a-f]{32}$"))
   and (.[index("--name")+1] | test("^[a-z0-9_-]{1,32}$"))' >/dev/null || fail "hc run argv: $run"
 printf '%s' "$(herdr_cmds)" | jq -e 'index("workspace create") == null' >/dev/null || fail "hc launch called herdr: $(herdr_cmds)"
-[ "$("$ROOT/bin/gbb" list | jq -r '[.managed[] | select(.task_id=="pin")][0].backend')" = hc ] || fail "pin registry backend"
+[ "$("$ROOT/bin/bac" list | jq -r '[.managed[] | select(.task_id=="pin")][0].backend')" = hc ] || fail "pin registry backend"
 reset_calls
-out=$("$ROOT/bin/gbb" launch --repo "$T/repo" --kind grok --task back --prompt "hi" --backend herdr --no-worktree)
+out=$("$ROOT/bin/bac" launch --repo "$T/repo" --kind grok --task back --prompt "hi" --backend herdr --no-worktree)
 printf '%s' "$out" | jq -e '.backend == "herdr"' >/dev/null || fail "--backend herdr: $out"
 [ "$(hc_runs | jq 'length')" = 0 ] || fail "--backend herdr still ran hc"
 
 # --- auto falls back to herdr when the hc server cannot start; explicit hc does not ---
 printf 'down\n' >"$T/hc-down"
 reset_calls
-out=$("$ROOT/bin/gbb" launch --repo "$T/repo" --kind grok --task down1 --prompt "hi" --backend auto --no-worktree)
+out=$("$ROOT/bin/bac" launch --repo "$T/repo" --kind grok --task down1 --prompt "hi" --backend auto --no-worktree)
 printf '%s' "$out" | jq -e '.ok == true and .backend == "herdr"' >/dev/null || fail "auto fallback: $out"
 [ "$(hc_runs | jq 'length')" = 0 ] || fail "fallback still hc run: $(hc_runs)"
 grep -q 'launching on herdr' "$T/state/bridge.log" || fail "fallback not logged"
 reset_calls
-out=$("$ROOT/bin/gbb" launch --repo "$T/repo" --kind grok --task forcedhc --prompt "hi" --backend hc --no-worktree)
+out=$("$ROOT/bin/bac" launch --repo "$T/repo" --kind grok --task forcedhc --prompt "hi" --backend hc --no-worktree)
 printf '%s' "$out" | jq -e '.ok == true and .backend == "hc"' >/dev/null || fail "explicit hc while down: $out"
 [ "$(hc_runs | jq 'length')" = 1 ] || fail "explicit hc did not run: $(hc_runs)"
 rm -f "$T/hc-down"
 reset_calls
-out=$("$ROOT/bin/gbb" launch --repo "$T/repo" --kind grok --task nohc --prompt "hi" --backend auto --no-worktree)
+out=$("$ROOT/bin/bac" launch --repo "$T/repo" --kind grok --task nohc --prompt "hi" --backend auto --no-worktree)
 # herdr is still present and hc is up again; this just clears hc-down before the next case
 printf '%s' "$out" | jq -e '.backend == "hc"' >/dev/null || fail "hc restored: $out"
 
 # --- auto with no herdr uses hc ---
 export HERDR_BIN_PATH="$T/bin/no-herdr"
 reset_calls
-out=$("$ROOT/bin/gbb" launch --repo "$T/repo" --kind grok --task onlyhc --prompt "hi" --backend auto)
+out=$("$ROOT/bin/bac" launch --repo "$T/repo" --kind grok --task onlyhc --prompt "hi" --backend auto)
 printf '%s' "$out" | jq -e '.ok == true and .backend == "hc"' >/dev/null || fail "auto-only-hc: $out"
 printf '%s' "$(hc_runs | jq -c '.[0]')" | jq -e '(.[index("--")+1] == "grok")' >/dev/null || fail "onlyhc argv: $(hc_runs)"
 export HERDR_BIN_PATH="$T/bin/herdr"
@@ -146,16 +146,16 @@ export HERDR_BIN_PATH="$T/bin/herdr"
 # --- commands against an hc row, and a legacy row that must ignore config backend=hc ---
 reset_calls
 echo '{"version":1,"panes":{"t9":{"pane_id":"t9","task_id":"s1","agent_name":"gb-s1","kind":"grok","origin":"launched","backend":"hc","armed":true},"w9:p9":{"pane_id":"w9:p9","workspace_id":"w9","task_id":"old","agent_name":"gb-old","kind":"grok","origin":"launched","armed":true}}}' >"$T/state/managed.json"
-send=$("$ROOT/bin/gbb" send s1 "hello there")
+send=$("$ROOT/bin/bac" send s1 "hello there")
 printf '%s' "$send" | jq -e '.ok == true and .pane_id == "t9"' >/dev/null || fail "hc send: $send"
 cat "$T"/call.* | jq -s -e 'map(select(.[0]=="send")) | .[0] == ["send","--json","t9","--","hello there"]' >/dev/null || fail "send argv: $(cat "$T"/call.* | jq -s 'map(select(.[0]=="send"))')"
 cat "$T"/call.* | jq -s -e 'all(.[]; index("--force") | not) and all(.[]; index("force") | not)' >/dev/null || fail "send used --force"
 reset_calls
-keys=$("$ROOT/bin/gbb" keys s1 enter)
+keys=$("$ROOT/bin/bac" keys s1 enter)
 printf '%s' "$keys" | jq -e '.ok == true' >/dev/null || fail "hc keys: $keys"
 cat "$T"/call.* | jq -s -e 'map(select(.[0]=="keys")) | .[0] == ["keys","--json","t9","enter"]' >/dev/null || fail "keys argv"
 reset_calls
-"$ROOT/bin/gbb" status old >/dev/null || fail "legacy status failed"
+"$ROOT/bin/bac" status old >/dev/null || fail "legacy status failed"
 [ -z "$(ls "$T"/call.* 2>/dev/null || true)" ] || fail "legacy status called hc: $(cat "$T"/call.*)"
 printf '%s' "$(herdr_cmds)" | jq -e 'index("agent get") != null' >/dev/null || fail "legacy status did not call herdr: $(herdr_cmds)"
 
@@ -203,12 +203,12 @@ cat >"$T/events.jsonl" <<'JSON'
 {"jsonrpc":"2.0","method":"event","params":{"seq":5,"terminal":"t7","type":"status","data":{"reported":true,"records":{},"status":{"state":"done","app":"grok"}}}}
 {"jsonrpc":"2.0","method":"heartbeat","params":{"seq":5}}
 JSON
-"$ROOT/bin/gbb" hc-watch
+"$ROOT/bin/bac" hc-watch
 [ -f "$T/hits/boss.jsonl" ] || fail "no owner delivery"
 [ ! -f "$T/hits/primary.jsonl" ] || fail "primary got an owner task"
 [ "$(grep -c . "$T/hits/boss.jsonl")" = 1 ] || fail "expected 1 done callback, got $(cat "$T/hits/boss.jsonl")"
 body=$(tail -n 1 "$T/hits/boss.jsonl" | jq -c .body)
-printf '%s' "$body" | jq -e '.source=="grokbot-bridge-herdr" and .version=="0.3.3" and .event=="agent_status" and .status=="done" and .task_id=="t1" and .pane_id=="t1" and .backend=="hc" and .owner=="boss" and .route=="owner" and .herdr_status=="done" and .repo=="/r"' >/dev/null || fail "done payload: $body"
+printf '%s' "$body" | jq -e '.source=="bot-as-collie" and .version==1 and .event=="agent_status" and .status=="done" and .task_id=="t1" and .pane_id=="t1" and .backend=="hc" and .owner=="boss" and .route=="owner" and .herdr_status=="done" and .repo=="/r"' >/dev/null || fail "done payload: $body"
 printf '%s' "$body" | grep -q SECRET_PROMPT_TEXT && fail "payload leaked the OSC message"
 grep -q primary-secret "$T/state/bridge.log" && fail "secret in log"
 rm -f "$T/hits"/*
@@ -217,14 +217,14 @@ cat >"$T/events.jsonl" <<'JSON'
 {"jsonrpc":"2.0","method":"event","params":{"seq":7,"terminal":"t1","type":"status","data":{"reported":true,"records":{},"status":{"state":"error","app":"grok"}}}}
 {"jsonrpc":"2.0","method":"event","params":{"seq":8,"terminal":"t1","type":"finished","data":{"reason":"exited","exit_code":0,"signal":null,"finished_ms":1}}}
 JSON
-"$ROOT/bin/gbb" hc-watch
+"$ROOT/bin/bac" hc-watch
 [ "$(grep -c . "$T/hits/boss.jsonl")" = 3 ] || fail "blocked/error/closed count: $(cat "$T/hits/boss.jsonl")"
 printf '%s\n' "$(jq -c .body "$T/hits/boss.jsonl")" | grep -q SECRET2 && fail "blocked payload leaked msg"
 jq -c .body "$T/hits/boss.jsonl" | jq -s -e '
   .[0].status=="blocked" and .[0].blocked_reason=="question" and .[0].herdr_status=="blocked"
   and .[1].status=="blocked" and .[1].blocked_reason=="error" and .[1].herdr_status=="error"
   and .[2].event=="pane_closed" and .[2].pane_id=="t1"' >/dev/null || fail "event map: $(jq -c .body "$T/hits/boss.jsonl")"
-[ "$("$ROOT/bin/gbb" list | jq '.managed | length')" = 0 ] || fail "finished row still registered"
+[ "$("$ROOT/bin/bac" list | jq '.managed | length')" = 0 ] || fail "finished row still registered"
 
 # --- Codex that never reports: a question screen becomes blocked ---
 rm -f "$T/hits"/* "$T/state/last"/*
@@ -234,7 +234,7 @@ echo '{"version":1,"panes":{"t2":{"pane_id":"t2","task_id":"cx","agent_name":"gb
 cat >"$T/events.jsonl" <<'JSON'
 {"jsonrpc":"2.0","method":"event","params":{"seq":1,"terminal":"t2","type":"foreground","data":{"pid":1,"name":"codex","cwd":"/w"}}}
 JSON
-"$ROOT/bin/gbb" hc-watch
+"$ROOT/bin/bac" hc-watch
 [ -f "$T/hits/primary.jsonl" ] || fail "unreported codex produced no callback"
 jq -c .body "$T/hits/primary.jsonl" | jq -s -e '.[0].status=="blocked" and .[0].blocked_reason=="question" and .[0].route=="primary" and .[0].task_id=="cx"' >/dev/null || fail "screen fallback: $(cat "$T/hits/primary.jsonl")"
 
@@ -245,14 +245,14 @@ cat >"$T/events.jsonl" <<'JSON'
 {"jsonrpc":"2.0","method":"event","params":{"seq":1,"terminal":"t3","type":"status","data":{"reported":true,"records":{},"status":{"state":"done","app":"grok"}}}}
 JSON
 printf 'hold\n' >"$T/events.hold"
-"$ROOT/bin/gbb" hc-watch &
+"$ROOT/bin/bac" hc-watch &
 WP=$!
 i=0
 while [ ! -f "$T/hits/primary.jsonl" ] && [ "$i" -lt 40 ]; do sleep 0.1; i=$((i + 1)); done
 [ -f "$T/hits/primary.jsonl" ] || fail "hc watcher did not deliver before the hook"
 HERDR_PLUGIN_EVENT=pane.agent_status_changed \
   HERDR_PLUGIN_EVENT_JSON='{"data":{"pane_id":"w1:p1","workspace_id":"w1","agent_status":"done","agent":"grok"}}' \
-  "$ROOT/bin/gbb" hook
+  "$ROOT/bin/bac" hook
 i=0
 while [ "$(grep -c . "$T/hits/primary.jsonl" 2>/dev/null || echo 0)" -lt 2 ] && [ "$i" -lt 40 ]; do sleep 0.1; i=$((i + 1)); done
 rm -f "$T/events.hold"

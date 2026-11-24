@@ -1,0 +1,10 @@
+{
+  "expect": "model",
+  "model": {
+    "id": "from-codex-config-model-key",
+    "provenance": "config",
+    "observed_at": "2026-11-23T00:00:00Z",
+    "freshness": "not_a_session_observation",
+    "freshness_sec": null
+  }
+}

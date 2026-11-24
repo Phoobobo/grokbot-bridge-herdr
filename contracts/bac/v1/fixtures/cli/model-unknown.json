@@ -1,0 +1,10 @@
+{
+  "expect": "model",
+  "model": {
+    "id": null,
+    "provenance": "unknown",
+    "observed_at": null,
+    "freshness": "unknown",
+    "freshness_sec": null
+  }
+}
