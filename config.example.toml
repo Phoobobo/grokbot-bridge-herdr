@@ -14,6 +14,14 @@ webhook_timeout_sec = 5
 # Repeated identical `blocked` events within this window are dropped.
 debounce_sec = 15
 
+# Where NEW tasks are launched. Entries already in the registry keep their own backend
+# (rows written before 0.3.0, or with backend = "herdr", stay on the Herdr TUI session server).
+# Override one launch with --backend or GBB_BACKEND.
+#   auto   default. hc when `hc server status` can reach or start the core; otherwise the Herdr TUI.
+#   herdr  Herdr TUI only (plugin hooks on pane.agent_status_changed), even if hc is running.
+#   hc     herdr-core / the Herdr app. Status comes from `hc events` (OSC 7501), not the plugin.
+# backend = "auto"
+
 # Seconds to let the agent TUI settle after `herdr agent start` before the first prompt.
 startup_settle_sec = 4
 
@@ -64,4 +72,14 @@ startup_ready_timeout_sec = 90
 # Equivalent table form: [owners.canmouzhang] with url / header_name / header_value.
 
 # Env overrides: GBB_OWNER (default owner for launch/handover), GBB_WEBHOOK_URL, GBB_WEBHOOK_HEADER_NAME, GBB_WEBHOOK_HEADER_VALUE, GBB_CONFIG,
-# GBB_STATE_DIR (default ~/.local/state/grokbot-bridge-herdr), GBB_DATA_DIR (default ~/.local/share/grokbot-bridge-herdr)
+# GBB_STATE_DIR (default ~/.local/state/grokbot-bridge-herdr), GBB_DATA_DIR (default ~/.local/share/grokbot-bridge-herdr),
+# GBB_DOTS_TOKEN_FILE (default ~/.config/dots-bridge/herdr_webhook_token), GBB_DOTS_PROBE_URL (default http://127.0.0.1:8765/).
+
+# Modules (docs/decisions/0006). Omit `enabled` to follow the probe. `false` keeps the module off even when the
+# probe passes. `true` forces it on (dots posts are still only the dots-bridge endpoint, not every extra webhook).
+# [modules.herdr_tui]
+# enabled = true
+# [modules.hc]
+# enabled = true
+# [modules.dots]
+# enabled = false

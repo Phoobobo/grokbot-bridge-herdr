@@ -1,0 +1,17 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck jq
+      - name: shellcheck
+        run: shellcheck -s sh -S warning -e SC2088,SC1010 bin/gbb install.sh uninstall.sh
+      - name: Offline tests
+        run: for t in tests/*.sh; do sh "$t" || exit 1; done
