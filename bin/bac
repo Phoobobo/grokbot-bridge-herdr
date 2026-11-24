@@ -1462,7 +1462,11 @@ handover_insert_rc() {
 # The first line is the generation from the insert commit. The rest is the
 # row object from that same commit, not a later registry read.
 handover_emit_new() {
-  nl=$(printf '\n')
+  # A quoted newline is a real newline. Command substitution would delete it:
+  # POSIX removes every trailing newline from $(...), so nl=$(printf '\n') is empty
+  # on dash and on bash 3.2, and ${1%%"$nl"*} then deletes the whole value.
+  nl='
+'
   gen=${1%%"$nl"*}
   row=${1#*"$nl"}
   case "$gen" in ''|*[!0-9]*) die io "handover commit did not return a generation" ;; esac
