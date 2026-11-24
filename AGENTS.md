@@ -18,9 +18,9 @@ Every commit and pull request must leave enough context that later work can trac
 ## Layout
 
 - `herdr-plugin.toml` — Herdr plugin manifest v1 (`phoobobo.bot-as-collie`): event hooks and pane actions. All entrypoints run `bin/bac`.
-- `bin/bac` — the whole implementation, POSIX sh + jq + git + curl. User-facing subcommands print one JSON document.
+- `bin/bac` — the whole implementation, POSIX sh + jq + git + curl. Generation exclusion is `bin/bac-lock` (python3, fcntl). User-facing subcommands print one JSON document.
 - `config.example.toml` — webhook config template. Real config lives in `~/.config/bot-as-collie/config.toml` (mode 600) and is never committed.
-- `install.sh` / `uninstall.sh` — symlink `bac` into `~/.local/bin` and link/unlink the plugin. `flock` is not required. `sha256sum` or macOS `shasum` is.
+- `install.sh` / `uninstall.sh` — symlink `bac` into `~/.local/bin` and link/unlink the plugin. `flock` is not required. `python3` is required for the lock helper. `sha256sum` or macOS `shasum` is.
 - `tests/hook-test.sh` — offline hook/debounce test with a stubbed `herdr`.
 - `tests/prompt-test.sh` — offline prompt delivery/retry test with a stubbed `herdr` (~45 s).
 - `tests/webhook-test.sh` — offline primary + `[[extra_webhooks]]` delivery test against a local HTTP sink.

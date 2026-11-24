@@ -15,18 +15,47 @@ fi
 src=$1
 dst=$2
 [ -d "$src" ] || { echo "refuse: src is not a directory" >&2; exit 2; }
-src_real=$(cd "$src" && pwd -P)
+
+# Physical path, following directory symlinks. A missing tail keeps the
+# physical ancestor plus that tail, so a not-yet-created dest compares
+# the same way as an existing one. This is not a production migrator.
+canon_path() {
+  cn_in=$1
+  [ -n "$cn_in" ] || { printf '\n'; return 0; }
+  if [ -d "$cn_in" ]; then
+    (cd "$cn_in" && pwd -P)
+    return 0
+  fi
+  cn_rest=
+  cn_cur=$cn_in
+  while [ ! -d "$cn_cur" ]; do
+    case "$cn_cur" in
+      /|.|"") break ;;
+    esac
+    cn_rest="/$(basename "$cn_cur")$cn_rest"
+    cn_next=$(dirname "$cn_cur")
+    [ "$cn_next" = "$cn_cur" ] && break
+    cn_cur=$cn_next
+  done
+  if [ -d "$cn_cur" ]; then
+    cn_base=$(cd "$cn_cur" && pwd -P) || { printf '%s\n' "$cn_in"; return 0; }
+    printf '%s%s\n' "$cn_base" "$cn_rest"
+    return 0
+  fi
+  printf '%s\n' "$cn_in"
+}
+
+src_real=$(canon_path "$src")
 if [ -e "$dst" ]; then
   [ -d "$dst" ] || { echo "refuse: dst exists and is not a directory" >&2; exit 2; }
-  dst_real=$(cd "$dst" && pwd -P)
 else
   dst_parent=$(dirname "$dst")
   [ -d "$dst_parent" ] || { echo "refuse: dst parent missing" >&2; exit 2; }
-  dst_real=$(cd "$dst_parent" && pwd -P)/$(basename "$dst")
 fi
+dst_real=$(canon_path "$dst")
 
 refuse_live() {
-  p=$1
+  p=$(canon_path "$1")
   home=${HOME:-}
   config_home=${XDG_CONFIG_HOME:-$home/.config}
   state_home=${XDG_STATE_HOME:-$home/.local/state}
@@ -39,8 +68,10 @@ refuse_live() {
     "$data_home/grokbot-bridge-herdr" \
     "$data_home/bot-as-collie"
   do
+    live_real=$(canon_path "$live")
+    [ -n "$live_real" ] || continue
     case "$p" in
-      "$live"|"$live"/*)
+      "$live_real"|"$live_real"/*)
         echo "refuse: live path $p" >&2
         exit 2
         ;;

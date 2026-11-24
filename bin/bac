@@ -2,8 +2,15 @@
 # bac — Grok Bot bridge for Herdr.
 # Grok Bot calls this over remote shell; Herdr calls it from plugin hooks/actions.
 # All user-facing subcommands print one JSON document on stdout.
-# Deps: jq, git, curl, and at least one of herdr (TUI) or hc (herdr-core). POSIX sh, macOS + Linux.
+# Deps: jq, git, curl, python3, sha256sum or shasum, and at least one of herdr (TUI) or hc (herdr-core). POSIX sh, macOS + Linux. flock is not used.
 set -u
+# Top-level pid. Command substitutions must not replace this: the helper
+# exits without committing if this pid dies, even when a subshell still
+# holds the helper's parent relationship.
+if [ -z "${BAC_LOCK_OWNER_PID:-}" ]; then
+  BAC_LOCK_OWNER_PID=$$
+  export BAC_LOCK_OWNER_PID
+fi
 
 BAC_VERSION="1.0.0"
 EMPTY_OBJ='{}'
@@ -67,38 +74,28 @@ enforce_owner() {
   fi
 }
 # Durable per-pane generation. Survives process exit and reclaim. Never reset when a pane id is reused.
-# The lock is mkdir plus a pid file. flock is not required: stock macOS does not ship it.
-# A live holder's directory is never removed. A dead pid, or a pid-less directory older than 5s, is residue.
+# Mutual exclusion is an fcntl lock held by bin/bac-lock for one commit.
+# The lock file is never renamed or removed. flock(1) is not required.
 SEQ_FILE() { printf '%s/event-seq.json' "$STATE_DIR"; }
-dir_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
+LOCK_FILE() { printf '%s/generation.lock' "$STATE_DIR"; }
+bac_lock() {
+  command -v python3 >/dev/null 2>&1 || { log "python3 missing; generation lock not taken"; return 1; }
+  bac_dir=$(dirname "$0")
+  helper=$bac_dir/bac-lock
+  [ -f "$helper" ] || { log "bac-lock missing"; return 1; }
+  if [ -n "${BAC_LOCK_SPAWN_SLEEP:-}" ]; then
+    sleep "$BAC_LOCK_SPAWN_SLEEP" >/dev/null 2>&1 &
+    printf '%s\n' "$!" >"$STATE_DIR/orphan.pid"
+  fi
+  python3 "$helper" "$@"
+}
 next_generation() {
   pane="${1:-}"
   [ -n "$pane" ] || pane=__none__
-  lock || return 1
-  seq=$(SEQ_FILE)
-  [ -s "$seq" ] || printf '%s\n' '{"version":1,"panes":{}}' >"$seq"
-  tmp="$seq.tmp.$$"
-  if ! jq -c --arg p "$pane" '(.panes[$p] // 0) as $cur | ($cur + 1) as $n | .panes[$p] = $n | {doc:., n:$n}' "$seq" >"$tmp"; then
-    rm -f "$tmp"
-    unlock
-    return 1
-  fi
-  n=$(jq -r '.n' "$tmp" 2>/dev/null || true)
+  n=$(bac_lock generation "$(LOCK_FILE)" "$(SEQ_FILE)" "$pane" 2>>"$LOG") || return 1
   case "$n" in
-    ''|*[!0-9]*)
-      rm -f "$tmp"
-      unlock
-      return 1 ;;
+    ''|*[!0-9]*) return 1 ;;
   esac
-  # Rename onto the live file. A failed jq or mv leaves the previous event-seq.json in place.
-  if ! jq '.doc' "$tmp" >"$tmp.doc" || ! mv "$tmp.doc" "$seq"; then
-    rm -f "$tmp" "$tmp.doc"
-    unlock
-    return 1
-  fi
-  chmod 600 "$seq" || true
-  rm -f "$tmp"
-  unlock
   printf '%s' "$n"
 }
 stamp_event() { # one logical event. attempt is per target and stays 1. Owner and fallback share event_id.
@@ -163,46 +160,13 @@ file_mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null; }
 expand_home() { case "$1" in "~") printf '%s' "$HOME" ;; "~/"*) printf '%s/%s' "$HOME" "${1#\~/}" ;; *) printf '%s' "$1" ;; esac; }
 abspath() { (cd "$1" 2>/dev/null && pwd -P); }
 
-lock() {
-  dir="$STATE_DIR/.lock"
-  i=0
-  while ! mkdir "$dir" 2>/dev/null; do
-    pid=$(cat "$dir/pid" 2>/dev/null || true)
-    if [ -n "$pid" ]; then
-      if ! kill -0 "$pid" 2>/dev/null; then
-        if [ "$(cat "$dir/pid" 2>/dev/null || true)" = "$pid" ]; then
-          rm -f "$dir/pid"
-          rmdir "$dir" 2>/dev/null || true
-        fi
-      fi
-    else
-      age=$(( $(date +%s) - $(dir_mtime "$dir") ))
-      if [ "$age" -gt 5 ]; then rm -rf "$dir"; fi
-    fi
-    i=$((i + 1))
-    if [ "$i" -gt 80 ]; then
-      log "lock busy pid=${pid:-none}; not removing a live holder"
-      return 1
-    fi
-    sleep 0.05
-  done
-  printf '%s\n' "$$" >"$dir/pid" || { rmdir "$dir" 2>/dev/null || true; return 1; }
-}
-unlock() {
-  dir="$STATE_DIR/.lock"
-  rm -f "$dir/pid"
-  rmdir "$dir" 2>/dev/null || rm -rf "$dir"
-}
-
 registry_read() { if [ -s "$REGISTRY" ]; then cat "$REGISTRY"; else printf '{"version":1,"panes":{}}'; fi; }
 # registry_update <jq-filter> [jq args...]
+# The helper reads, runs jq, and renames while it holds the fcntl lock.
+# A failed helper leaves the previous registry in place.
 registry_update() {
   f="$1"; shift
-  lock || return 1
-  tmp="$REGISTRY.tmp.$$"
-  if registry_read | jq "$@" "$f" >"$tmp" 2>>"$LOG"; then mv "$tmp" "$REGISTRY"; chmod 600 "$REGISTRY"; rc=0; else rm -f "$tmp"; rc=1; fi
-  unlock
-  return $rc
+  bac_lock jq-apply "$(LOCK_FILE)" "$REGISTRY" "$f" "$@" >/dev/null 2>>"$LOG"
 }
 entry_for_pane() { registry_read | jq -c --arg p "$1" '.panes[$p] // empty'; }
 # resolve <task-or-pane> -> entry JSON (with pane_id)
@@ -980,6 +944,34 @@ repo_key() {
   if [ -n "$rk_resolved" ]; then printf '%s\n' "$rk_resolved"; else printf '%s\n' "$rk_top"; fi
 }
 
+# canon_path <dir> — physical directory path. A missing tail keeps the
+# physical ancestor, so a symlink prefix and a git toplevel compare equal.
+canon_path() {
+  cn_in=$1
+  [ -n "$cn_in" ] || return 1
+  if [ -d "$cn_in" ]; then
+    (cd "$cn_in" && pwd -P) && return 0
+    return 1
+  fi
+  cn_rest=
+  cn_cur=$cn_in
+  while [ ! -d "$cn_cur" ]; do
+    case "$cn_cur" in
+      /|.|"") break ;;
+    esac
+    cn_rest="/$(basename "$cn_cur")$cn_rest"
+    cn_next=$(dirname "$cn_cur")
+    [ "$cn_next" = "$cn_cur" ] && break
+    cn_cur=$cn_next
+  done
+  if [ -d "$cn_cur" ]; then
+    cn_base=$(cd "$cn_cur" && pwd -P) || return 1
+    printf '%s%s\n' "$cn_base" "$cn_rest"
+    return 0
+  fi
+  return 1
+}
+
 # paths_same <a> <b> — 0 when both exist and are the same directory.
 paths_same() {
   [ -n "$1" ] && [ -n "$2" ] || return 1
@@ -999,9 +991,13 @@ cwd_place() {
   [ -n "$cp_dir" ] && [ -d "$cp_dir" ] || { printf '0\n'; return 0; }
   cp_top=$(git -C "$cp_dir" rev-parse --show-toplevel 2>/dev/null || true)
   [ -n "$cp_top" ] || cp_top=$cp_dir
+  cp_top_real=$(canon_path "$cp_top" || true)
+  [ -n "$cp_top_real" ] && cp_top=$cp_top_real
   if paths_same "$cp_top" "$cp_repo"; then printf '3\n'; return 0; fi
+  cp_wt=$(canon_path "$WORKTREE_ROOT" || true)
+  [ -n "$cp_wt" ] || cp_wt=$WORKTREE_ROOT
   case "$cp_top" in
-    "$WORKTREE_ROOT/$cp_base"-*)
+    "$cp_wt/$cp_base"-*)
       cp_a=$(repo_key "$cp_top" || true)
       cp_b=$(repo_key "$cp_repo" || true)
       if [ -n "$cp_a" ] && [ "$cp_a" = "$cp_b" ]; then printf '2\n'; return 0; fi
@@ -2069,7 +2065,9 @@ cmd_owner() {
   enforce_owner strict
   if [ -n "$v" ]; then
     if [ "$v" = --clear ]; then v=""; else valid_owner "$v" || die usage "owner must match $OWNER_RE"; fi
-    registry_update '.panes[$p].owner = (if $o == "" then null else $o end)' --arg p "$PANE" --arg o "$v"
+    if ! registry_update '.panes[$p].owner = (if $o == "" then null else $o end)' --arg p "$PANE" --arg o "$v"; then
+      die io "registry was not updated; the previous file is unchanged"
+    fi
     log "owner $PANE -> ${v:-<none>}"
     ENTRY=$(entry_for_pane "$PANE")
   fi
@@ -2436,10 +2434,13 @@ cmd_doctor() {
     --argjson cargs "$(cfg_array codex_args | jq -R . | jq -sc .)" --arg cdef "$(codex_user_defaults)" \
     --arg fl "$(command -v flock >/dev/null 2>&1 && echo yes || echo no)" \
     --arg sha "$(command -v sha256sum >/dev/null 2>&1 && echo sha256sum || { command -v shasum >/dev/null 2>&1 && echo shasum || echo; })" \
+    --arg py "$(command -v python3 >/dev/null 2>&1 && echo yes || echo no)" \
     --argjson modules "$mods" '
     {ok:true, version:$v, contract:"bac.v1", source:"bot-as-collie",
-     generation_lock:"mkdir", flock_required:false,
+     generation_lock:"fcntl", lock_helper:"python3", lock_reclaim:"kernel-release",
+     flock_required:false,
      flock_present:(if $fl == "yes" then true else false end),
+     python3:($py == "yes"),
      sha256:($sha != ""),
      herdr:$herdr, hc:(if $hcver == "" then null else $hcver end), backend:$be,
      modules:$modules,
@@ -2464,7 +2465,11 @@ cmd_test_webhook() {
   while [ $# -gt 0 ]; do case "$1" in --owner) towner="$2"; shift 2 ;; *) die usage "bac test-webhook [--owner <name>]" ;; esac; done
   [ -z "$towner" ] || valid_owner "$towner" || die usage "owner must match $OWNER_RE"
   notify "$(build_event test "" "$(jq -cn --arg o "$towner" 'if $o == "" then {} else {owner:$o} end')")"
-  t=$(cfg_get webhook_timeout_sec); sleep $(( ${t:-5} * 2 + 2 ))
+  if [ -n "${BAC_TEST_DRAIN_SEC:-}" ]; then
+    sleep "$BAC_TEST_DRAIN_SEC"
+  else
+    t=$(cfg_get webhook_timeout_sec); sleep $(( ${t:-5} * 2 + 2 ))
+  fi
   n=$(( $(cfg_extra_webhooks | grep -c .) + 2 ))
   jq -cn --arg l "$(tail -n 1 "$LOG")" --arg r "$(grep 'webhook' "$LOG" | tail -n "$n")" \
     '{ok:true, last_log:$l, recent_webhook_logs:($r|split("\n")|map(select(.!="")))}'

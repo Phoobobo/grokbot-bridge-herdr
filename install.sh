@@ -4,13 +4,13 @@
 set -eu
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 ROOT=$(cd "$(dirname "$0")" && pwd -P)
-for d in jq git curl; do command -v "$d" >/dev/null || { echo "missing dependency: $d" >&2; exit 1; }; done
+for d in jq git curl python3; do command -v "$d" >/dev/null || { echo "missing dependency: $d" >&2; exit 1; }; done
 if ! command -v sha256sum >/dev/null && ! command -v shasum >/dev/null; then
   echo "missing dependency: sha256sum (Linux) or shasum (macOS)" >&2
   exit 1
 fi
 if ! command -v flock >/dev/null; then
-  echo "note: flock is not on PATH. bac does not require it; the generation lock is mkdir. Stock macOS has no flock."
+  echo "note: flock is not on PATH. bac does not require it. The generation lock is fcntl inside bin/bac-lock (python3). Stock macOS has no flock."
 fi
 if ! command -v herdr >/dev/null && ! command -v hc >/dev/null; then
   echo "missing dependency: herdr (TUI) or hc (herdr-core)" >&2

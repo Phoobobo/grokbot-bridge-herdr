@@ -7,7 +7,9 @@ C="$ROOT/contracts/bac/v1"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 command -v jq >/dev/null || fail "jq missing"
-command -v sha256sum >/dev/null || fail "sha256sum missing"
+# shellcheck source=tests/lib/digest.sh
+. "$ROOT/tests/lib/digest.sh"
+digest_setup || fail "sha256sum or shasum missing"
 
 # --- identity vs this tree -------------------------------------------------
 impl=$(jq -r '.runtime_implemented' "$C/identity.json")
@@ -86,7 +88,7 @@ jq -e '.scenarios[] | select(.id == "duplicate-and-timeout") | .attempt_meaning 
 
 # --- callbacks -------------------------------------------------------------
 event_id() { # pane event status generation
-  printf 'bac.callback.v1\n%s\n%s\n%s\n%s' "$1" "$2" "$3" "$4" | sha256sum | awk '{print $1}'
+  digest_text "$(printf 'bac.callback.v1\n%s\n%s\n%s\n%s' "$1" "$2" "$3" "$4")"
 }
 
 callback_ok() { # payload json on stdin. Prints nothing. Nonzero = reject.
@@ -191,7 +193,7 @@ if jq -e ".quota | $quota_unknown" "$C/fixtures/cli/quota-guess-rejected.json" >
 fi
 
 # --- registry migration on an isolated copy --------------------------------
-sha() { sha256sum "$1" | awk '{print $1}'; }
+sha() { digest_file "$1"; }
 MIG="$C/migrate-fixture.sh"
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
@@ -263,6 +265,44 @@ if HOME="$T/home" sh "$MIG" "$T/home/.local/state/grokbot-bridge-herdr" "$T/live
 fi
 [ "$(sha "$T/home/.local/state/grokbot-bridge-herdr/managed.json")" = "$live_before" ] || fail "live refusal changed the file"
 [ ! -e "$T/live-out/managed.json" ] || fail "live refusal wrote output"
+
+# Directory symlink alias, same class as macOS /var -> /private/var.
+# The physical tree and the path passed in are different strings until pwd -P.
+mkdir -p "$T/phys-home"
+ln -s "$T/phys-home" "$T/link-home"
+mkdir -p "$T/link-home/.local/state/grokbot-bridge-herdr"
+cp "$T/ok/managed.json" "$T/ok/FIXTURE_OK" "$T/link-home/.local/state/grokbot-bridge-herdr/"
+alias_before=$(sha "$T/phys-home/.local/state/grokbot-bridge-herdr/managed.json")
+if HOME="$T/link-home" sh "$MIG" "$T/link-home/.local/state/grokbot-bridge-herdr" "$T/alias-out" >/dev/null 2>&1; then
+  fail "aliased live state was accepted"
+fi
+[ "$(sha "$T/phys-home/.local/state/grokbot-bridge-herdr/managed.json")" = "$alias_before" ] || fail "alias refusal changed the source"
+[ ! -e "$T/alias-out/managed.json" ] || fail "alias refusal wrote output"
+if HOME="$T/link-home" sh "$MIG" "$T/phys-home/.local/state/grokbot-bridge-herdr" "$T/alias-out2" >/dev/null 2>&1; then
+  fail "physical live state behind an aliased HOME was accepted"
+fi
+[ ! -e "$T/alias-out2/managed.json" ] || fail "physical live refusal wrote output"
+ln -s "$T/phys-home/.local/state" "$T/state-alias"
+if HOME="$T/link-home" sh "$MIG" "$T/ok" "$T/state-alias/grokbot-bridge-herdr/nested-out" >/dev/null 2>&1; then
+  fail "aliased live destination was accepted"
+fi
+[ "$(sha "$T/ok/managed.json")" = "$after" ] || fail "aliased dest refusal changed the source"
+[ ! -e "$T/phys-home/.local/state/grokbot-bridge-herdr/nested-out/managed.json" ] || fail "aliased dest refusal wrote output"
+mkdir -p "$T/xdg-phys"
+ln -s "$T/xdg-phys" "$T/xdg-link"
+mkdir -p "$T/xdg-link/bot-as-collie"
+cp "$T/ok/managed.json" "$T/ok/FIXTURE_OK" "$T/xdg-link/bot-as-collie/"
+xdg_before=$(sha "$T/xdg-phys/bot-as-collie/managed.json")
+if HOME="$T/not-home" XDG_STATE_HOME="$T/xdg-link" sh "$MIG" "$T/xdg-phys/bot-as-collie" "$T/xdg-out" >/dev/null 2>&1; then
+  fail "XDG_STATE_HOME symlink was accepted"
+fi
+[ "$(sha "$T/xdg-phys/bot-as-collie/managed.json")" = "$xdg_before" ] || fail "XDG alias refusal changed the source"
+[ ! -e "$T/xdg-out/managed.json" ] || fail "XDG alias refusal wrote output"
+mkdir -p "$T/safe-link-src"
+cp "$T/ok/managed.json" "$T/ok/FIXTURE_OK" "$T/safe-link-src/"
+ln -s "$T/safe-link-src" "$T/safe-link"
+sh "$MIG" "$T/safe-link" "$T/safe-link-out" >/dev/null || fail "non-live symlink fixture was refused"
+[ -f "$T/safe-link-out/managed.json" ] || fail "non-live symlink fixture wrote nothing"
 
 mkdir -p "$T/nomark"
 cp "$T/ok/managed.json" "$T/nomark/"

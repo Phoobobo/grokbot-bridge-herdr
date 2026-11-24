@@ -6,7 +6,7 @@
 
 哈希输入没有变，仍是 `bac.callback.v1`、pane、event、status、generation。变的是 generation 的寿命和投递保证的说法。
 
-1. **generation 持久化。** 计数写在状态目录的 `event-seq.json`，进程退出、`reclaim`、同一 pane id 再次 handover 都不清零。下一次逻辑事件用下一个整数，因此 `event_id` 不会和旧事件相撞。去抖丢掉的重复状态仍然不加。并发更新走同一把目录锁，写临时文件再改名。
+1. **generation 持久化。** 计数写在状态目录的 `event-seq.json`，进程退出、`reclaim`、同一 pane id 再次 handover 都不清零。下一次逻辑事件用下一个整数，因此 `event_id` 不会和旧事件相撞。去抖丢掉的重复状态仍然不加。并发更新由 `bin/bac-lock` 在一次 `fcntl` 独占里读改写 `event-seq.json`。锁文件不按名字删除或改名。`flock` 命令不是依赖。这是隔离候选，不是生产切换。
 2. **投递保证。** 每个目标最多一次 HTTP 尝试，所以每份 JSON 里的 `attempt` 恒为 1。这是「该目标的尝试次数」，不是「这个逻辑事件一共送出几次」。owner 超时或非 2xx 时，同一 `event_id` 还会再送给 primary。一个同时看着两边的消费者可能收到两份。重启不重放尚未盖章的事件，因此也会丢。这不是端到端的至多一次，也不是至少一次。消费者用 `event_id` 去重。
 3. **`--owner` 不是认证。** 能在这台机器上执行 `bac` 的人就是受信操作者，可以自己填 owner 字符串。bac 不另做登录服务。Dots 适配器必须用桥自己已经认证的主体写入 `--owner`（今天的 `DOTS_BRIDGE_GBB_OWNER`，切换后由桥配置绑定），不能把工具参数里的 owner 当成调用方身份。
 4. **extras 和 primary fallback 是有意的受信元数据接收者。** 它们收到 id 和状态，不收到终端正文。文档不把这条路径叫做硬隔离。
@@ -184,7 +184,7 @@ bac.callback.v1
 <generation 的十进制>
 ```
 
-四行之间各一个 `\n`，末尾没有额外的 `\n`。同一逻辑事件的 owner 投递和 primary 回退共用一个 `event_id`。`route`、`attempt`、`ts` 不参与计算。generation 只在真正发出一条新通知时加一；被 15 秒去抖丢掉的重复状态不加、也不发送。计数保存在 `event-seq.json`，`reclaim` 和进程重启都不把它清掉。同一后端 pane id 再次接管时，generation 从上次的下一个整数继续，所以新的 `event_id` 和旧的不同。去重范围是这个状态目录里的 pane id，不是进程内存。写入是临时文件再 `mv` 到 `event-seq.json`；jq 或 `mv` 失败时不改已有文件，也不把计数退回旧值。互斥用带 pid 的 mkdir 锁。活着的持有者不会被删掉。`flock` 不是依赖，macOS 默认没有它。`bac doctor` 的 `generation_lock` 是 `mkdir`，`flock_required` 是 false。
+四行之间各一个 `\n`，末尾没有额外的 `\n`。同一逻辑事件的 owner 投递和 primary 回退共用一个 `event_id`。`route`、`attempt`、`ts` 不参与计算。generation 只在真正发出一条新通知时加一；被 15 秒去抖丢掉的重复状态不加、也不发送。计数保存在 `event-seq.json`，`reclaim` 和进程重启都不把它清掉。同一后端 pane id 再次接管时，generation 从上次的下一个整数继续，所以新的 `event_id` 和旧的不同。去重范围是这个状态目录里的 pane id，不是进程内存。写入在持有 `fcntl` 锁的 `bin/bac-lock` 进程里完成。helper 在改名提交前退出、或 shell 被杀掉，都不把未完成的计数当成已发布，也不按 pid 去 `mv`/`rm` 锁路径。jq 或提交失败时旧文件保留。进程死后内核释放锁，不靠 pid 回收。`flock` 不是依赖。`bac doctor` 的 `generation_lock` 是 `fcntl`，`lock_helper` 是 `python3`，`flock_required` 是 false。回调字段没有因此改变。
 
 示例：pane `t9`、`agent_status`、`done`、generation `3` → `5cb0047d8b5de61f00884bcd7272a2330f697d3e91e836002c6a8144d794f0f8`。
 

@@ -256,6 +256,27 @@ out=$("$ROOT/bin/bac" launch --repo "$M" --kind grok --task place-gbb --prompt "
 printf '%s' "$out" | jq -e '.herdr_space == "spGBB" and .created_herdr_space == false' >/dev/null \
   || fail "gbb worktree space: $out"
 
+# DATA_DIR is a symlink. git's toplevel is the physical path. The worktree
+# must still reuse spGBB, and the other repo's worktree space must not win.
+reset_calls
+mkdir -p "$T/phys-data"
+ln -s "$T/phys-data" "$T/alias-data"
+git -C "$M" worktree add -q "$T/alias-data/worktrees/mosa-next-alias" -b gbb-alias
+alias_wt=$T/alias-data/worktrees/mosa-next-alias
+jq -n --arg box "$BOX" '{spaces:[
+  {id:"spGBB", name:"old", folder:"/stale", machine:null, active:false,
+    tabs:[{id:"tbG", name:"1", terminals:[{terminal:"tG"}]}]},
+  {id:"sp6ac043a819137bd811eb4f7b1820ddd8", name:"bytebox-test", folder:$box, machine:null, active:true,
+    tabs:[{id:"tbBOX", name:"1", terminals:[{terminal:"t18"}]}]}
+]}' >"$T/app-ls.json"
+jq -n --arg g "$alias_wt" --arg box "$BOX" '{terminals:[
+  {address:"tG", cwd:$g, state:"live"},
+  {address:"t18", cwd:$box, state:"live"}
+]}' >"$T/hc-ls.json"
+out=$(BAC_DATA_DIR="$T/alias-data" "$ROOT/bin/bac" launch --repo "$M" --kind grok --task place-alias --prompt "hi" --no-worktree)
+printf '%s' "$out" | jq -e '.herdr_space == "spGBB" and .created_herdr_space == false and .herdr_space != "sp6ac043a819137bd811eb4f7b1820ddd8"' >/dev/null \
+  || fail "aliased worktree root: $out"
+
 # --- remote space is ignored; a new id is minted and renamed to the repo directory ---
 reset_calls
 jq -n --arg repo "$T/repo" '{spaces:[

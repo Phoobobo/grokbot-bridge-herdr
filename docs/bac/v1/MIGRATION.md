@@ -55,7 +55,7 @@ Dots 侧：`--owner` 必须由桥用已认证主体填上（配置里的 owner�
 `contracts/bac/v1/migrate-fixture.sh <src-dir> <dst-dir>`
 
 - `src-dir` 必须有第一行是 `bac-migrate-fixture` 的 `FIXTURE_OK`，以及 `managed.json`。
-- 拒绝活的配置、状态、数据目录（`grokbot-bridge-herdr` 和 `bot-as-collie`），即使放了标记。
+- 拒绝活的配置、状态、数据目录（`grokbot-bridge-herdr` 和 `bot-as-collie`），即使放了标记。比较前对源、目标和每个活路径候选做 `pwd -P`（目录符号链接的两边都算），所以一条路径的另一种拼法不能绕过拒绝。拒绝时不写目标，也不改源文件。这不是生产迁移。
 - 不读 `config.toml`、token 文件、`secret.env`、`bridge.toml`。登记表里若出现 `header_value` / `token` / `secret` / `password` / `authorization` 字段，整次失败。
 - 成功：按 pane id 保留 `owner`、`task_id`、`backend`（缺省视为 `herdr`）。`codex`/`grok` 保持。`pi`/`antigravity` 的 `kind` 变为 null，`kind_support` 为 `rejected`。其他 kind 变为 null，`kind_support` 为 `unknown`，绝不写成 codex。
 - 失败：退出码 1，不写目标 `managed.json`，源文件字节不变。拒绝活路径或缺少标记时退出码 2。

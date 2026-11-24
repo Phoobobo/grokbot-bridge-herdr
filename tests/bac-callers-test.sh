@@ -328,17 +328,15 @@ seq_after=$(jq -r '.panes.__none__ // 0' "$T/state/event-seq.json")
 par=$(PATH="$nof" jq -r .body.event_id "$T/hits/primary.jsonl" | sort -u | wc -l | tr -d ' ')
 [ "$par" -eq 2 ] || fail "no-flock ids collided"
 doc=$(PATH="$nof" "$BAC" doctor)
-printf '%s' "$doc" | jq -e '.generation_lock=="mkdir" and .flock_required==false and .flock_present==false and .sha256==true' >/dev/null || fail "doctor without flock: $doc"
+printf '%s' "$doc" | jq -e '.generation_lock=="fcntl" and .lock_helper=="python3" and .lock_reclaim=="kernel-release" and .flock_required==false and .flock_present==false and .python3==true and .sha256==true' >/dev/null || fail "doctor without flock: $doc"
 
-# A live holder is not evicted, and a failed jq does not roll the counter backwards.
+# A leftover mkdir lock is not consulted and is not deleted by name.
 mkdir -p "$T/state/.lock"
 printf '%s\n' "$$" >"$T/state/.lock/pid"
-held=$(jq -c . "$T/state/event-seq.json")
-PATH="$nof" "$BAC" test-webhook >/dev/null &
-p1=$!
-if ! wait_pids 50 "$p1"; then kill "$p1" 2>/dev/null || true; fail "held-lock webhook exceeded 25s"; fi
-[ "$(cat "$T/state/.lock/pid")" = "$$" ] || fail "live lock was stolen"
-[ "$(jq -c . "$T/state/event-seq.json")" = "$held" ] || fail "live lock still advanced generation"
+before_left=$(jq -r '.panes.__none__ // 0' "$T/state/event-seq.json")
+PATH="$nof" "$BAC" test-webhook >/dev/null || fail "leftover mkdir lock blocked generation"
+[ -d "$T/state/.lock" ] && [ "$(cat "$T/state/.lock/pid")" = "$$" ] || fail "leftover mkdir lock was removed by name"
+[ "$(jq -r '.panes.__none__ // 0' "$T/state/event-seq.json")" -eq $((before_left + 1)) ] || fail "leftover mkdir lock did not leave generation monotonic"
 rm -rf "$T/state/.lock"
 badjq=$(mktemp -d)
 printf '%s\n' '#!/bin/sh' 'exit 1' >"$badjq/jq"
