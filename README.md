@@ -122,12 +122,12 @@ backend = "auto"   # 默认。hc 优先；herdr | hc 可强制
 
 - `auto`（不写也是这个）：`hc server status` 能连上或能启动 core，新任务就进 hc；hc 不在，或这次 status 失败，才退回 TUI。`backend = "herdr"` 或 `gbb launch --backend herdr` 始终走 TUI。`backend = "hc"` 不退回。
 - 登记表里每条任务记下 `backend`。没有这个字段、或写着 `herdr` 的旧记录，status / send / read / stop / handover 仍走 herdr 会话服务。TUI 插件钩子和 `hc events` 一起跑，各管各的记录。
-- `hc` 上的启动是 `hc run --bg`（`grok` 或 `codex`，参数仍是 `grok_args` / `codex_args`），prompt 用 `hc send`（从不加 `--force`，以免替你答对话框）。终端在 `hc ls` 里，Herdr app 能看到、`hc attach` 能接管。
+- `hc` 上的启动是 `hc run --bg --keep`（`grok` 或 `codex`，参数仍是 `grok_args` / `codex_args`），prompt 用 `hc send`（从不加 `--force`，以免替你答对话框）。终端带 `herdr.space`，出现在该仓库主检出目录所在的 Herdr space 里（看终端的启动目录，不看 space 的 folder；同仓库的另一个 worktree 不算），单独一个新 tab，标题是 `gbb · <任务 id>`（`herdr.tab` 用 gbb 新生成的 id，不占用已有 tab；hc 的 `--name` 仍是 `gb-<任务>`）。没有对应 space 时 app 会建一个，名字是仓库目录名。`hc ls` 的 `where` 是 `空间名 / tab`。`hc attach` 仍能接管，但不再是看到它的办法。
 - 状态由后台的 `hc events --label grokbot=managed` 推送，payload 和 owner / 主 webhook / `[[extra_webhooks]]` 的路由跟 TUI 一样。`working` 不发；`error` 以 `blocked`（`blocked_reason=error`，`herdr_status=error`）发出。OSC 的 `msg` 不进 payload。
 - Codex 和 Grok Build（≥ 1.0.52）自己发 OSC 7501，gbb 不包一层（再写一条会盖掉它们的根记录）。还没上报的 Codex 仍用原来的读屏判断。更老的、既不上报也不是这些画面的 Grok 会在 app 里跑，但不会编造 `done`。
-- `gbb stop` 只杀掉 gbb 创建的 hc 终端。交接来的只去掉 label、注销，不杀。从不执行 `hc server stop`。app 里没有 TUI 的命令面板动作，交接用 `gbb handover --pane <地址>`（不带 `:` 的 id 会先试 hc）。
+- `gbb stop` 只杀掉 gbb 创建的 hc 终端，不调用 `space.close` / `tab.close`。交接来的只去掉 gbb 的 label、注销，不杀，也不把它从 space 里拿走。从不执行 `hc server stop`。app 里没有 TUI 的命令面板动作，交接用 `gbb handover --pane <地址>`（不带 `:` 的 id 会先试 hc）。还没进任何 space 的终端，交接时会放进对应仓库的 space。
 
-设计见 [docs/decisions/0005](docs/decisions/0005-herdr-core-backend.md)。
+设计见 [docs/decisions/0005](docs/decisions/0005-herdr-core-backend.md)、[0007](docs/decisions/0007-place-hc-terminals-in-the-app.md)。
 
 ### 模块（按探测开关）
 
@@ -187,10 +187,12 @@ gbb launch --repo <path> --kind grok|codex --task <id> [--worktree <branch>|--no
            (--prompt <text> | --prompt-file <f>) [--owner <name>] [--backend auto|herdr|hc] [-- <agent args>]
     git worktree under ~/.local/share/grokbot-bridge-herdr/worktrees/<repo>-<task> (branch gbb/<task>),
     new Herdr workspace with --no-focus, `herdr agent start` with retry, settle, prompt with stall retry,
-    registers the pane. --backend hc uses `hc run --bg` (herdr-core) instead of a TUI workspace.
+    registers the pane. --backend hc uses `hc run --bg --keep` (herdr-core) instead of a TUI workspace,
+    and labels `herdr.space` so the Herdr app shows it (new tab in the repo's space; see docs/decisions/0007).
     Without `--`, uses codex_args / grok_args from the config. Waits for the input box
     before the first prompt. Returns task_id, pane_id, agent_name, kind, agent_args, worktree, branch, owner,
-    agent_model (codex footer), status, session_id, prompt_pending, prompt_error — or state:"startup_blocked"
+    agent_model (codex footer), status, session_id, prompt_pending, prompt_error, and on hc also
+    herdr_space and created_herdr_space — or state:"startup_blocked"
     with blocked_reason + screen when a startup dialog is showing (the prompt is kept, not typed).
 gbb list                          managed panes + live status
 gbb status <task|pane>            herdr agent info + git status/log + session id + resume command,
@@ -226,12 +228,12 @@ backend = "auto"   # default: hc when its server is up; herdr | hc force one
 
 - `auto` (also what you get when `backend` is unset) launches new tasks on hc when `hc server status` can reach or start the core. It uses the Herdr TUI only when `hc` is missing or that call fails. `backend = "herdr"` or `gbb launch --backend herdr` always uses the TUI. `backend = "hc"` does not fall back.
 - Each registry row stores `backend`. A row with no field, or `backend = "herdr"`, keeps using the herdr session server for status, send, read, stop, and handover. The TUI plugin hook and the `hc events` watcher run side by side, each for its own rows.
-- An hc launch is `hc run --bg` of `grok` or `codex` (same `grok_args` / `codex_args`), then `hc send` for the prompt. gbb never passes `--force` (that flag can answer a dialog). The terminal shows up in `hc ls` and in the Herdr app; `hc attach <name>` takes it over.
+- An hc launch is `hc run --bg --keep` of `grok` or `codex` (same `grok_args` / `codex_args`), then `hc send` for the prompt. gbb never passes `--force` (that flag can answer a dialog). The terminal is labeled `herdr.space` and shows up in the Herdr app: the space whose terminals were launched in that checkout (the space's folder field is ignored; another worktree of the repo does not count), otherwise a new space named after the repo directory, always in a new tab titled `gbb · <task>` (`herdr.tab` is an id gbb minted, so an existing tab is not split or renamed; the hc name stays `gb-<task>`). `hc ls` then reports `where` as `space / tab`. `hc attach <name>` still works; it is not required to see the terminal.
 - A background `hc events --label grokbot=managed` posts callbacks through the same owner / primary / `[[extra_webhooks]]` routing. `working` is not posted. `error` is posted as `blocked` with `blocked_reason=error` and `herdr_status=error`. The OSC `msg` is not included.
 - Codex and Grok Build (≥ 1.0.52) emit OSC 7501 themselves, and hc answers the capability query, so gbb does not wrap them (a second writer would replace their root record). A Codex that has not reported yet still uses the existing screen classification. An older Grok that reports nothing still runs in the app; gbb does not invent `done` for it.
-- `gbb stop` kills and removes only hc terminals gbb created. A handover is unlabeled and unregistered, not killed. gbb never runs `hc server stop`. The app has no TUI command-palette action; hand a terminal over with `gbb handover --pane <address>` (an id without `:` is tried as hc first).
+- `gbb stop` kills and removes only hc terminals gbb created. It does not call `space.close` or `tab.close`. A handover is unregistered, not killed, and not pulled out of its space; a terminal that was not in one is placed the same way as a launch. gbb never runs `hc server stop`. The app has no TUI command-palette action; hand a terminal over with `gbb handover --pane <address>` (an id without `:` is tried as hc first).
 
-Rationale: [docs/decisions/0005](docs/decisions/0005-herdr-core-backend.md).
+Rationale: [docs/decisions/0005](docs/decisions/0005-herdr-core-backend.md), [0007](docs/decisions/0007-place-hc-terminals-in-the-app.md).
 
 ### Modules (on only when the probe passes)
 
@@ -338,7 +340,7 @@ Each extra target (max 5) gets the identical payload in its own background curl,
 ### Webhook payload
 
 ```json
-{"source":"grokbot-bridge-herdr","version":"0.3.1","event":"agent_status","hostname":"mbp",
+{"source":"grokbot-bridge-herdr","version":"0.3.3","event":"agent_status","hostname":"mbp",
  "task_id":"demo","pane_id":"wAX:p1","workspace_id":"wAX","agent_kind":"grok","agent_name":"gb-demo",
  "origin":"launched","owner":"dot","backend":"herdr","repo":"/Users/me/repo","worktree":"/Users/me/.local/share/grokbot-bridge-herdr/worktrees/repo-demo",
  "branch":"gbb/demo","status":"done","ts":"2026-10-28T00:00:00Z","herdr_status":"done","route":"owner"}
@@ -355,7 +357,7 @@ gbb result e2e && gbb stop e2e
 tail ~/.local/state/grokbot-bridge-herdr/bridge.log
 ```
 
-With `backend` unset, the same launch goes to herdr-core when `hc` is up (`hc ls` shows the terminal; the callback has `"backend":"hc"`). Pass `--backend herdr` to force the TUI for that launch.
+With `backend` unset, the same launch goes to herdr-core when `hc` is up (`hc ls` shows `where: "<space> / <tab>"`, the Herdr app shows a new tab in that repo's space, and the callback has `"backend":"hc"`). Pass `--backend herdr` to force the TUI for that launch.
 
 Architecture and rationale: [docs/decisions/0001-architecture.md](docs/decisions/0001-architecture.md); ChatGPT dots integration: [0003](docs/decisions/0003-dots-bridge-tools-and-extra-webhooks.md).
 
