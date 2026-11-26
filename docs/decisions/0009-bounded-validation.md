@@ -30,6 +30,7 @@ filters `hc events` by that label on the server. Placement creates fresh space
 and tab ids without enumerating existing terminals or the app. Naming skips
 app discovery. The mode requires explicit state/data/config and disabled Dots;
 it forces hc for launch, disables list discovery, and permits handover only
-for a terminal carrying the same scope label. Ordinary unscoped behavior is
+for a terminal carrying the same scope label. Webhook environment overrides
+are ignored so routing comes only from the dedicated config. Ordinary unscoped behavior is
 unchanged. This is a local routing boundary, not authentication: scope strings
 and state paths must be new and chosen by the trusted operator.

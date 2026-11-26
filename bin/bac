@@ -2775,6 +2775,8 @@ if [ -n "${BAC_ISOLATED_SCOPE:-}" ]; then
   [ -n "${BAC_STATE_DIR:-}" ] && [ -n "${BAC_DATA_DIR:-}" ] && [ -n "${BAC_CONFIG:-}" ] \
     || die usage "isolated scope requires explicit BAC_STATE_DIR, BAC_DATA_DIR and BAC_CONFIG"
   [ "$(module_config_enabled dots)" = false ] || die usage "isolated scope requires modules.dots enabled=false"
+  # Use only the dedicated config, never inherited production routing overrides.
+  unset BAC_WEBHOOK_URL BAC_WEBHOOK_HEADER_NAME BAC_WEBHOOK_HEADER_VALUE
   # Pin backend selection so auto discovery cannot start or inspect a TUI backend.
   export BAC_BACKEND=hc
 fi
