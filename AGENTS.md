@@ -49,5 +49,5 @@ Every commit and pull request must leave enough context that later work can trac
 ## Verify
 
 - The Mac handoff prohibits `tests/run.sh`, lock/kill/concurrency and equivalent capacity/fault probes on every machine. Do not invoke `tests/bac-callers-test.sh` or `tests/lock-fcntl-test.sh`; do not recreate their prohibited cases under another name.
-- Use shellcheck and syntax checks without executing the helper. The reviewed serial checks are `sh tests/bac-contract-test.sh`, `sh tests/dots-disabled-test.sh`, and `sh tests/scoped-routing-test.sh`. They are not live E2E evidence.
+- Use shellcheck and syntax checks without executing the helper. The reviewed serial checks are `sh tests/bac-contract-test.sh`, `sh tests/dots-disabled-test.sh`, `sh tests/scoped-routing-test.sh`, and `sh tests/status-mapping-test.sh`. They are not live E2E evidence.
 - Real acceptance uses new state/data/config, a new `BAC_ISOLATED_SCOPE`, and disabled Dots. Do not install, change default CLIs, inspect other sessions, or use the old publication directory. Verify actual completion through a loopback SuperBot receiver, persisted callback, and matching task/pane/owner/assignment read/result. See ADR 0009. Never treat doctor output or a watcher PID alone as E2E success.

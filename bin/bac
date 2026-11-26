@@ -830,6 +830,15 @@ deliver_status() {
 hc_emit_word() {
   pane="$1"; entry="$2"; word="$3"; sj="$4"
   lastf="$LAST_DIR/$(printf '%s' "$pane" | tr ':' '_')"
+  # Only v1 completion states can become callbacks. Backend observations such
+  # as unknown are useful for debounce, but are not completion claims.
+  case "$word" in
+    working | done | idle | blocked | error) ;;
+    *)
+      note_seen "$pane" "$word" || log "ignored status $pane: seen-status was not recorded"
+      remember_status "$lastf" "$word"
+      return 0 ;;
+  esac
   if [ "$(printf '%s' "$entry" | jq -r 'if .armed == false then "no" else "yes" end')" = no ]; then
     note_seen "$pane" "$word" || log "not armed $pane: seen-status was not recorded"
     printf '%s %s\n' "$word" "$(now)" >"$lastf"
