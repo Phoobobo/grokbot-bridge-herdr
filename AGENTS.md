@@ -48,5 +48,6 @@ Every commit and pull request must leave enough context that later work can trac
 
 ## Verify
 
-- `sh tests/run.sh` (offline, fail-fast, ~2 min) and `shellcheck -s sh -S warning bin/bac contracts/bac/v1/migrate-fixture.sh tests/bac-contract-test.sh tests/bac-callers-test.sh tests/run.sh install.sh uninstall.sh`.
-- On a machine with Herdr: `bac doctor`, then a launch in a scratch repo. That live check is not what the offline suite replaces.
+- The Mac handoff prohibits `tests/run.sh`, lock/kill/concurrency and equivalent capacity/fault probes on every machine. Do not invoke `tests/bac-callers-test.sh` or `tests/lock-fcntl-test.sh`; do not recreate their prohibited cases under another name.
+- Use shellcheck and syntax checks without executing the helper. The reviewed serial checks are `sh tests/bac-contract-test.sh`, `sh tests/dots-disabled-test.sh`, and `sh tests/scoped-routing-test.sh`. They are not live E2E evidence.
+- Real acceptance uses new state/data/config, a new `BAC_ISOLATED_SCOPE`, and disabled Dots. Do not install, change default CLIs, inspect other sessions, or use the old publication directory. Verify actual completion through a loopback SuperBot receiver, persisted callback, and matching task/pane/owner/assignment read/result. See ADR 0009. Never treat doctor output or a watcher PID alone as E2E success.

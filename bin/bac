@@ -31,6 +31,13 @@ LOG="$STATE_DIR/bridge.log"
 LAST_DIR="$STATE_DIR/last"
 WORKTREE_ROOT="$DATA_DIR/worktrees"
 
+# Refuse incomplete isolation before creating any default state directory.
+if [ -n "${BAC_ISOLATED_SCOPE:-}" ]; then
+  if [ -z "${BAC_STATE_DIR:-}" ] || [ -z "${BAC_DATA_DIR:-}" ] || [ -z "${BAC_CONFIG:-}" ]; then
+    printf '%s\n' '{"ok":false,"error":{"code":"usage","message":"isolated scope requires explicit BAC_STATE_DIR, BAC_DATA_DIR and BAC_CONFIG"}}'
+    exit 1
+  fi
+fi
 mkdir -p "$STATE_DIR" "$LAST_DIR" 2>/dev/null
 chmod 700 "$STATE_DIR" 2>/dev/null
 
@@ -565,6 +572,15 @@ dots_eval() {
   [ "${DOTS_EVAL_DONE:-}" = 1 ] && return 0
   DOTS_EVAL_DONE=1
   DOTS_PROBE_OK=0
+  ov=$(module_config_enabled dots)
+  DOTS_CONFIG="$ov"
+  # Explicitly disabled means no token-file or network probe either.
+  if [ "$ov" = false ]; then
+    DOTS_ON=0
+    DOTS_PROBE_REASON="probe skipped: disabled in config"
+    DOTS_WHY="$DOTS_PROBE_REASON"
+    return 0
+  fi
   f=$(dots_token_file)
   if [ ! -f "$f" ]; then
     DOTS_PROBE_REASON="token file missing"
@@ -585,12 +601,7 @@ dots_eval() {
       *) DOTS_PROBE_REASON="token file mode is ${dm:-unknown}, must be 600" ;;
     esac
   fi
-  ov=$(module_config_enabled dots)
-  DOTS_CONFIG="$ov"
-  if [ "$ov" = false ]; then
-    DOTS_ON=0
-    DOTS_WHY="disabled in config; $DOTS_PROBE_REASON"
-  elif [ "$ov" = true ]; then
+  if [ "$ov" = true ]; then
     DOTS_ON=1
     if [ "$DOTS_PROBE_OK" = 1 ]; then DOTS_WHY="enabled in config; $DOTS_PROBE_REASON"; else DOTS_WHY="enabled in config; probe failed: $DOTS_PROBE_REASON"; fi
   elif [ "$DOTS_PROBE_OK" = 1 ]; then
@@ -956,8 +967,13 @@ hc_watch_once() {
   fifo="$STATE_DIR/hc-events.fifo"
   rm -f "$fifo"
   mkfifo "$fifo" || return 1
-  # No label filter: registry membership decides. Legacy grokbot=managed rows stay visible after migration.
-  "$HC" events --json >"$fifo" 2>>"$LOG" &
+  # Scope filtering happens in the backend, before any foreign events are read.
+  # Unscoped operation retains legacy registry routing.
+  set -- events --json
+  if [ -n "${BAC_ISOLATED_SCOPE:-}" ]; then
+    set -- "$@" --label "bac_scope=$BAC_ISOLATED_SCOPE"
+  fi
+  "$HC" "$@" >"$fifo" 2>>"$LOG" &
   HC_EV_PID=$!
   while IFS= read -r line || [ -n "$line" ]; do
     [ -n "$line" ] || continue
@@ -1259,6 +1275,12 @@ pick_space_from_terminals() {
 # Omitting herdr.tab is deliberate: the app then creates a tab instead of splitting one that exists.
 place_for_repo() {
   PLACE_SPACE=""; PLACE_CREATED=0; PLACE_APP=0
+  # A scoped acceptance run must not enumerate anybody else's terminals or spaces.
+  if [ -n "${BAC_ISOLATED_SCOPE:-}" ]; then
+    PLACE_SPACE=$(new_space_id)
+    PLACE_CREATED=1
+    return 0
+  fi
   pl_dir="$1"; pl_base=""
   if [ -n "$pl_dir" ] && [ -d "$pl_dir" ]; then
     pl_base=$(basename "$pl_dir")
@@ -1291,6 +1313,7 @@ place_for_repo() {
 # the terminal there keeps its hc name (gb-<task> on a launch, the program's name on handover).
 # Herdr shows the tab title in the tab bar. hc --name cannot hold "bac · …".
 name_created_place() { # name_created_place <repo-dir> <task-id>
+  [ -z "${BAC_ISOLATED_SCOPE:-}" ] || return 0
   [ "${PLACE_CREATED:-0}" = 1 ] || [ "${PLACE_TAB_CREATED:-0}" = 1 ] || return 0
   if [ "${PLACE_APP:-0}" != 1 ] && have_cmd "$HERDR_APP"; then
     rn_probe=$("$HERDR_APP" ls 2>/dev/null || true)
@@ -1338,10 +1361,15 @@ launch_with_hc() {
   PLACE_TAB=$(new_tab_id); PLACE_TAB_CREATED=1
   # --keep matches the app's own terminals (adoption turns keep on anyway).
   # --name stays gb-<task> (hc allows only a-z 0-9 - _). The tab title is bac_visible_name.
+  if [ -n "${BAC_ISOLATED_SCOPE:-}" ]; then
+    set -- --label "bac_scope=$BAC_ISOLATED_SCOPE" -- "$kind" "$@"
+  else
+    set -- -- "$kind" "$@"
+  fi
   out=$("$HC" run --bg --json --name "$name" --cwd "$wt" --no-parent --no-notify --keep \
     --label bac=managed --label "bac_task=$tid" \
     --label "herdr.space=$PLACE_SPACE" --label "herdr.tab=$PLACE_TAB" \
-    -- "$kind" "$@" 2>>"$LOG") || true
+    "$@" 2>>"$LOG") || true
   addr=$(printf '%s' "$out" | jq -r '.address // empty' 2>/dev/null || true)
   if [ -z "$addr" ]; then
     addr=$(printf '%s\n' "$out" | jq -Rr 'fromjson? | .address // empty' 2>/dev/null | tail -n 1)
@@ -1481,6 +1509,10 @@ handover_emit_new() {
 do_handover_hc() { # do_handover_hc <terminal> <note> <owner>
   pane="$1"; note="$2"; howner="$3"
   js=$(hc_get_json "$pane") || die pane_not_found "terminal $pane not found"
+  if [ -n "${BAC_ISOLATED_SCOPE:-}" ]; then
+    scope=$(printf '%s' "$js" | jq -r '.labels.bac_scope // empty')
+    [ "$scope" = "$BAC_ISOLATED_SCOPE" ] || die usage "isolated handover requires a terminal created in this scope"
+  fi
   addr=$(printf '%s' "$js" | jq -r '.address // empty' 2>/dev/null)
   [ -n "$addr" ] || die pane_not_found "terminal $pane not found"
   snap=$(paired_generation "$addr" present '.' --arg o "$howner" --arg p "$addr")
@@ -1547,6 +1579,9 @@ do_handover() { # do_handover <pane> <note> [owner] -> prints entry
   pane="$1"; note="$2"; howner="${3:-${BAC_OWNER:-}}"
   [ -z "$howner" ] || valid_owner "$howner" || die usage "owner must match $OWNER_RE"
   be="${HANDOVER_BACKEND:-}"
+  if [ -n "${BAC_ISOLATED_SCOPE:-}" ]; then
+    case "$be" in ""|hc) be=hc ;; *) die usage "isolated handover requires hc" ;; esac
+  fi
   if [ -z "$be" ]; then
     case "$pane" in
       *:*) be=herdr ;;
@@ -1826,6 +1861,9 @@ cmd_launch() {
   esac
   resolve_launch_backend "$flag_backend"
   if [ "$LAUNCH_BACKEND" = hc ]; then need "$HC"; SCREEN_BACKEND=hc; else need "$HERDR"; fi
+  if [ -n "${BAC_ISOLATED_SCOPE:-}" ] && [ "$LAUNCH_BACKEND" != hc ]; then
+    die usage "BAC_ISOLATED_SCOPE requires the hc backend"
+  fi
   [ -z "$owner" ] || valid_owner "$owner" || die usage "--owner/BAC_OWNER must match $OWNER_RE"
   [ "$explicit_args" = 1 ] || set -- # drop anything left over; only args after -- are agent args
   if [ "$explicit_args" = 0 ]; then
@@ -2010,6 +2048,7 @@ resume_cmd() { # kind session
 }
 
 cmd_list() {
+  [ -z "${BAC_ISOLATED_SCOPE:-}" ] || die usage "isolated scope uses status/read/result for explicit tasks; list discovery is disabled"
   CALLER_OWNER="${BAC_OWNER:-}"
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -2731,6 +2770,14 @@ U
 }
 
 cmd="${1:-help}"; [ $# -gt 0 ] && shift
+if [ -n "${BAC_ISOLATED_SCOPE:-}" ]; then
+  valid_owner "$BAC_ISOLATED_SCOPE" || die usage "invalid BAC_ISOLATED_SCOPE"
+  [ -n "${BAC_STATE_DIR:-}" ] && [ -n "${BAC_DATA_DIR:-}" ] && [ -n "${BAC_CONFIG:-}" ] \
+    || die usage "isolated scope requires explicit BAC_STATE_DIR, BAC_DATA_DIR and BAC_CONFIG"
+  [ "$(module_config_enabled dots)" = false ] || die usage "isolated scope requires modules.dots enabled=false"
+  # Pin backend selection so auto discovery cannot start or inspect a TUI backend.
+  export BAC_BACKEND=hc
+fi
 case "$cmd" in
   hook) cmd_hook "$@" ;;
   action) cmd_action "$@" ;;
