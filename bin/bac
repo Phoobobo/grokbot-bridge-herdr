@@ -496,7 +496,8 @@ classify_text() {
   t=$(cat)
   if printf '%s\n' "$t" | grep -Eiq 'hooks? needs? review|t trust all|continue without trusting'; then echo hooks_review; return; fi
   if printf '%s\n' "$t" | grep -Eq 'to answer[[:space:]]*$|[?] [0-9]+ questions?[[:space:]]*$'; then echo question; return; fi
-  if printf '%s\n' "$t" | grep -Eq 'enter (submit|confirm)' && printf '%s\n' "$t" | grep -Eq '^[[:space:]]*(› )?[[:space:]]*[0-9]+\. '; then
+  if printf '%s\n' "$t" | grep -Eiq 'trust this folder[?]|do you trust the (contents of this directory|files in this folder)[?]'; then echo dialog; return; fi
+  if printf '%s\n' "$t" | grep -Eq 'enter (submit|confirm|continue)' && printf '%s\n' "$t" | grep -Eq '^[[:space:]]*(› )?[[:space:]]*[0-9]+\. '; then
     if printf '%s\n' "$t" | grep -Eq 'enter submit'; then echo question; else echo dialog; fi
     return
   fi
@@ -1410,6 +1411,10 @@ launch_with_hc() {
     launch_blocked "$addr" "$WAIT_STATE"
     exit 0
   fi
+  if [ "$wrc" != 0 ]; then
+    launch_blocked "$addr" prompt_not_submitted
+    exit 0
+  fi
   arm_pane "$addr" || die registry_error "pane was not armed; the prompt was not sent and launch was not successful"
   hc_send_text "$addr" "$kind" "$prompt"; prc=$?
   if [ "$prc" = 2 ]; then
@@ -1786,6 +1791,13 @@ prompt_with_retry() {
   # Character-safe snippet (jq slices code points; `cut -c` on macOS slices bytes and breaks CJK text).
   snippet=$(printf '%s' "$text" | head -n 1 | jq -Rr '.[0:16]' 2>/dev/null)
   while [ "$attempt" -lt 4 ]; do
+    if [ "${BAC_PROMPT_KIND:-}" = codex ]; then
+      cs=$(screen_state "$pp")
+      case "$cs" in hooks_review | question | dialog)
+        PROMPT_RESULT=$(jq -cn --arg s "$cs" '{error:{code:"agent_blocked", blocked_reason:$s, message:"the agent is waiting on a dialog; the text was NOT sent"}}')
+        return 2 ;;
+      esac
+    fi
     attempt=$((attempt + 1))
     out=$("$HERDR" agent prompt "$n" "$text" --wait --until working --until blocked --until "done" --timeout 30000 2>&1)
     if printf '%s' "$out" | jq -e '.result' >/dev/null 2>&1; then
@@ -1955,6 +1967,10 @@ EOF
   WAIT_CWD="$wt" wait_input_ready "$pane" "$kind"; wrc=$?
   if [ "$wrc" = 3 ]; then
     launch_blocked "$pane" "$WAIT_STATE"
+    exit 0
+  fi
+  if [ "$wrc" != 0 ]; then
+    launch_blocked "$pane" prompt_not_submitted
     exit 0
   fi
   # Never opt in to the Grok "Help improve Grok" data-sharing banner; it is left untouched.
@@ -2213,7 +2229,7 @@ options_from_text() {
     }
     END { for (i=1; i<=cnt; i++) printf "%d\t%d\t%s\n", num[i], s[i], l[i] }'
 }
-dialog_open() { printf '%s\n' "$1" | grep -Eq 'enter (submit|confirm)'; }
+dialog_open() { printf '%s\n' "$1" | grep -Eq 'enter (submit|confirm|continue)'; }
 # press_keys <target> <key>... — herdr agent send-keys, or hc keys. Keys stay separate words.
 press_keys() {
   tgt="$1"; shift

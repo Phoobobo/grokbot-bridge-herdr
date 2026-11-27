@@ -34,3 +34,10 @@ for a terminal carrying the same scope label. Webhook environment overrides
 are ignored so routing comes only from the dedicated config. Ordinary unscoped behavior is
 unchanged. This is a local routing boundary, not authentication: scope strings
 and state paths must be new and chosen by the trusted operator.
+
+Live Codex 0.172 displayed a numbered folder-trust screen ending in
+`enter continue`, outside the older classifier's `submit|confirm` forms.
+Treat that screen as a dialog. A readiness timeout must preserve the prompt
+and report `prompt_not_submitted`, not attempt to send it anyway. Recheck
+Codex dialogs before each prompt retry. These checks do not select an option;
+only an explicit caller answer/keys instruction can do that.

@@ -12,7 +12,7 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck jq
       - name: shellcheck
-        run: shellcheck -s sh -S warning -e SC2088,SC1010 bin/bac contracts/bac/v1/migrate-fixture.sh tests/bac-contract-test.sh tests/dots-disabled-test.sh tests/scoped-routing-test.sh tests/status-mapping-test.sh install.sh uninstall.sh
+        run: shellcheck -s sh -S warning -e SC2088,SC1010 bin/bac contracts/bac/v1/migrate-fixture.sh tests/bac-contract-test.sh tests/dots-disabled-test.sh tests/scoped-routing-test.sh tests/status-mapping-test.sh tests/codex-dialog-test.sh install.sh uninstall.sh
       # Never invoke the aggregate runner: it includes prohibited lock,
       # process-kill and concurrency probes. New checks require explicit review.
       - name: Offline contract and fixture migration
@@ -26,3 +26,4 @@ jobs:
           sh tests/dots-disabled-test.sh
           sh tests/scoped-routing-test.sh
           sh tests/status-mapping-test.sh
+          sh tests/codex-dialog-test.sh
