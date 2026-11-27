@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+# Isolated lock helper for bac. Not installed globally.
+# Holds an fcntl exclusive lock on a regular file. A clean failure
+# returns before any state file is replaced. `paired` commits the
+# registry and the generation under that same lock. The kernel drops
+# the lock when this process exits. This program never renames or
+# removes the lock file.
+import errno
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+
+def parent_alive(orig):
+    raw = os.environ.get("BAC_LOCK_OWNER_PID", "")
+    watch = int(raw) if raw.isdigit() else orig
+    try:
+        os.kill(watch, 0)
+    except OSError:
+        return False
+    return True
+
+
+def acquire(fd, orig):
+    deadline = time.time() + float(os.environ.get("BAC_LOCK_TIMEOUT_SEC", "4"))
+    while True:
+        if not parent_alive(orig):
+            sys.exit(3)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.time() >= deadline:
+                sys.exit(2)
+            time.sleep(0.05)
+
+
+def wait_step(name, orig):
+    step_dir = os.environ.get("BAC_LOCK_STEP", "")
+    if not step_dir or not os.path.isfile(os.path.join(step_dir, "enable")):
+        return
+    if os.path.isfile(os.path.join(step_dir, name + ".skip")):
+        return
+    marker = os.path.join(step_dir, "%s.%d" % (name, os.getpid()))
+    with open(marker, "w") as handle:
+        handle.write("%d\n" % os.getpid())
+    go = os.path.join(step_dir, name + ".go")
+    deadline = time.time() + 20
+    while not os.path.isfile(go):
+        if not parent_alive(orig):
+            sys.exit(3)
+        if time.time() >= deadline:
+            sys.exit(3)
+        time.sleep(0.05)
+
+
+def replace(dest, payload, orig):
+    if not parent_alive(orig):
+        sys.exit(3)
+    tmp = "%s.tmp.%d" % (dest, os.getpid())
+    try:
+        with open(tmp, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if not parent_alive(orig):
+            sys.exit(3)
+        os.replace(tmp, dest)
+        os.chmod(dest, 0o600)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def previous_generation(src, pane):
+    try:
+        data = json.loads(src.decode("utf-8") or "{}")
+    except (UnicodeError, json.JSONDecodeError):
+        return None
+    panes = data.get("panes") if isinstance(data, dict) else None
+    if not isinstance(panes, dict) or pane not in panes:
+        return 0
+    current = panes[pane]
+    if isinstance(current, bool) or not isinstance(current, int):
+        return None
+    return current
+
+
+def run_jq(cmd, src, orig):
+    # jq reads a file and writes files. A stdin/stdout pipe pair deadlocks
+    # when the document is larger than the pipe buffer, because this process
+    # would wait for jq to exit before reading.
+    in_path = out_path = err_path = None
+    try:
+        in_fd, in_path = tempfile.mkstemp(prefix="bac-jq-")
+        os.write(in_fd, src)
+        os.close(in_fd)
+        out_fd, out_path = tempfile.mkstemp(prefix="bac-jq-")
+        os.close(out_fd)
+        err_fd, err_path = tempfile.mkstemp(prefix="bac-jq-")
+        os.close(err_fd)
+        with open(in_path, "rb") as fin, open(out_path, "wb") as fout, open(err_path, "wb") as ferr:
+            proc = subprocess.Popen(cmd, stdin=fin, stdout=fout, stderr=ferr)
+        while proc.poll() is None:
+            if not parent_alive(orig):
+                proc.kill()
+                proc.wait()
+                sys.exit(3)
+            time.sleep(0.05)
+        with open(out_path, "rb") as handle:
+            out = handle.read()
+        if proc.returncode != 0:
+            try:
+                with open(err_path, "rb") as handle:
+                    err = handle.read(400)
+            except OSError:
+                err = b""
+            if err:
+                sys.stderr.write(err.decode("utf-8", "replace"))
+        return proc.returncode, out
+    finally:
+        for path in (in_path, out_path, err_path):
+            if path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+
+def read_bytes(path, default):
+    if os.path.isfile(path) and os.path.getsize(path) > 0:
+        with open(path, "rb") as handle:
+            return handle.read()
+    return default
+
+
+def lock_dir(lockfile):
+    return os.path.dirname(os.path.abspath(lockfile))
+
+
+def pending_path(lockfile):
+    return os.path.join(lock_dir(lockfile), "commit-pending.json")
+
+
+def same_dir(lockfile, path, name):
+    directory = lock_dir(lockfile)
+    full = os.path.abspath(path)
+    return os.path.dirname(full) == directory and os.path.basename(full) == name
+
+
+def apply_pending(lockfile, orig):
+    path = pending_path(lockfile)
+    if not os.path.isfile(path):
+        return
+    with open(path, "rb") as handle:
+        doc = json.loads(handle.read().decode("utf-8"))
+    if not isinstance(doc, dict) or doc.get("v") != 1:
+        sys.exit(1)
+    if doc.get("registry_name") != "managed.json" or doc.get("seq_name") != "event-seq.json":
+        sys.exit(1)
+    registry = doc.get("registry")
+    seq = doc.get("seq")
+    if not isinstance(registry, str) or not isinstance(seq, str) or registry == "" or seq == "":
+        sys.exit(1)
+    directory = lock_dir(lockfile)
+    replace(os.path.join(directory, "managed.json"), registry.encode("utf-8"), orig)
+    replace(os.path.join(directory, "event-seq.json"), seq.encode("utf-8"), orig)
+    if not parent_alive(orig):
+        sys.exit(3)
+    os.remove(path)
+
+
+def open_locked(lockfile, orig):
+    fd = os.open(lockfile, os.O_CREAT | os.O_RDWR, 0o600)
+    os.set_inheritable(fd, False)
+    acquire(fd, orig)
+    wait_step("held", orig)
+    if not parent_alive(orig):
+        sys.exit(3)
+    apply_pending(lockfile, orig)
+    if not parent_alive(orig):
+        sys.exit(3)
+    return fd
+
+
+def load_doc(src):
+    try:
+        data = json.loads(src.decode("utf-8") or "null")
+    except (UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def pane_in(doc, pane):
+    panes = doc.get("panes") if isinstance(doc, dict) else None
+    return isinstance(panes, dict) and pane in panes
+
+
+def row_owner(doc, pane):
+    panes = doc.get("panes") if isinstance(doc, dict) else None
+    row = panes.get(pane) if isinstance(panes, dict) else None
+    if not isinstance(row, dict):
+        return ""
+    owner = row.get("owner")
+    if isinstance(owner, str):
+        return owner
+    return ""
+
+
+def named_arg(jq_args, name):
+    i = 0
+    while i < len(jq_args):
+        flag = jq_args[i]
+        if flag in ("--arg", "--argjson") and i + 2 < len(jq_args) and jq_args[i + 1] == name:
+            return jq_args[i + 2]
+        i += 1
+    return ""
+
+
+def seq_payload(src, pane, prev):
+    doc = load_doc(src)
+    if doc is None:
+        doc = {"version": 1, "panes": {}}
+    panes = doc.get("panes")
+    if not isinstance(panes, dict):
+        panes = {}
+        doc["panes"] = panes
+    if "version" not in doc:
+        doc["version"] = 1
+    doc["panes"][pane] = prev + 1
+    text = json.dumps(doc, separators=(",", ":")) + "\n"
+    return text.encode("utf-8")
+
+
+def generation(lockfile, seqfile, pane, orig):
+    open_locked(lockfile, orig)
+    if os.path.isfile(seqfile) and os.path.getsize(seqfile) > 0:
+        with open(seqfile, "rb") as handle:
+            src = handle.read()
+    else:
+        src = b'{"version":1,"panes":{}}\n'
+    prev = previous_generation(src, pane)
+    # JSON numbers are IEEE doubles. 2**53 is the last integer that stays
+    # distinct from its successor, so a stored 2**53 must not be "incremented".
+    if prev is None or prev >= 9007199254740992:
+        sys.exit(1)
+    code, out = run_jq(
+        [
+            "jq",
+            "-c",
+            "--arg",
+            "p",
+            pane,
+            "(.panes[$p] // 0) as $cur | ($cur + 1) as $n | .panes[$p] = $n | {doc:., n:$n}",
+        ],
+        src,
+        orig,
+    )
+    if code != 0:
+        sys.exit(1)
+    parsed = json.loads(out.decode("utf-8"))
+    number = parsed.get("n")
+    if isinstance(number, bool) or not isinstance(number, int) or number != prev + 1:
+        sys.exit(1)
+    doc = parsed.get("doc")
+    if not isinstance(doc, dict):
+        sys.exit(1)
+    payload = (json.dumps(doc) + "\n").encode("utf-8")
+    replace(seqfile, payload, orig)
+    sys.stdout.write("%d\n" % number)
+    sys.stdout.flush()
+
+
+def paired(lockfile, registry, seqfile, pane, mode, jq_filter, jq_args, orig):
+    if mode not in ("end", "require", "insert", "status", "present"):
+        sys.exit(1)
+    if not same_dir(lockfile, registry, "managed.json") or not same_dir(lockfile, seqfile, "event-seq.json"):
+        sys.exit(1)
+    open_locked(lockfile, orig)
+    reg_src = read_bytes(registry, b'{"version":1,"panes":{}}\n')
+    seq_src = read_bytes(seqfile, b'{"version":1,"panes":{}}\n')
+    before = load_doc(reg_src)
+    if before is None:
+        sys.exit(1)
+    had = pane_in(before, pane)
+    # insert/present must not replace an existing row or mint a generation.
+    # The row written to stdout is the object examined under this lock.
+    if mode in ("insert", "present") and had:
+        have = row_owner(before, pane)
+        want = named_arg(jq_args, "o")
+        if have and want == "":
+            sys.exit(8)
+        if have and have != want:
+            sys.exit(6)
+        row = before.get("panes", {}).get(pane)
+        if not isinstance(row, dict) or not isinstance(row.get("pane_id"), str) or row.get("pane_id") == "":
+            sys.exit(1)
+        sys.stdout.write(json.dumps(row, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+        sys.exit(7)
+    if mode == "present" and not had:
+        sys.exit(4)
+    # A late status after unregister must not create a partial pane or a generation.
+    if mode == "status" and not had:
+        sys.exit(4)
+    prev = previous_generation(seq_src, pane)
+    if prev is None or prev >= 9007199254740992:
+        sys.exit(1)
+    code, out = run_jq(["jq", *jq_args, jq_filter], reg_src, orig)
+    if code != 0:
+        sys.exit(1)
+    if mode == "status":
+        try:
+            wrapped = json.loads(out.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
+            sys.exit(1)
+        if not isinstance(wrapped, dict) or not isinstance(wrapped.get("publish"), bool):
+            sys.exit(1)
+        doc = wrapped.get("doc")
+        if not isinstance(doc, dict) or not pane_in(doc, pane):
+            sys.exit(4)
+        reg_payload = (json.dumps(doc, separators=(",", ":")) + "\n").encode("utf-8")
+        if not wrapped["publish"]:
+            if not parent_alive(orig):
+                sys.exit(3)
+            replace(registry, reg_payload, orig)
+            sys.stdout.write("debounce\n")
+            sys.stdout.flush()
+            return
+        if prev is None or prev >= 9007199254740992:
+            sys.exit(1)
+        seq_out = seq_payload(seq_src, pane, prev)
+        if previous_generation(seq_out, pane) != prev + 1:
+            sys.exit(1)
+        if not parent_alive(orig):
+            sys.exit(3)
+        journal = {
+            "v": 1,
+            "registry_name": "managed.json",
+            "seq_name": "event-seq.json",
+            "registry": reg_payload.decode("utf-8"),
+            "seq": seq_out.decode("utf-8"),
+        }
+        replace(
+            pending_path(lockfile),
+            (json.dumps(journal, separators=(",", ":")) + "\n").encode("utf-8"),
+            orig,
+        )
+        replace(seqfile, seq_out, orig)
+        replace(registry, reg_payload, orig)
+        if not parent_alive(orig):
+            sys.exit(3)
+        try:
+            os.remove(pending_path(lockfile))
+        except OSError:
+            pass
+        sys.stdout.write("%d\n" % (prev + 1))
+        sys.stdout.flush()
+        return
+    try:
+        after = json.loads(out.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        sys.exit(1)
+    if not isinstance(after, dict):
+        sys.exit(1)
+    had = pane_in(before, pane)
+    has = pane_in(after, pane)
+    if mode == "end":
+        if not had:
+            sys.exit(4)
+        if has:
+            sys.exit(1)
+    elif mode == "require":
+        if not had:
+            sys.exit(4)
+        if not has:
+            sys.exit(1)
+    elif not has:
+        sys.exit(1)
+    committed_row = None
+    if mode == "insert":
+        panes = after.get("panes")
+        committed_row = panes.get(pane) if isinstance(panes, dict) else None
+        pane_id = committed_row.get("pane_id") if isinstance(committed_row, dict) else None
+        task_id = committed_row.get("task_id") if isinstance(committed_row, dict) else None
+        if not isinstance(pane_id, str) or pane_id == "" or not isinstance(task_id, str) or task_id == "":
+            sys.exit(1)
+    reg_payload = out if out.endswith(b"\n") else out + b"\n"
+    seq_out = seq_payload(seq_src, pane, prev)
+    if previous_generation(seq_out, pane) != prev + 1:
+        sys.exit(1)
+    if not parent_alive(orig):
+        sys.exit(3)
+    journal = {
+        "v": 1,
+        "registry_name": "managed.json",
+        "seq_name": "event-seq.json",
+        "registry": reg_payload.decode("utf-8"),
+        "seq": seq_out.decode("utf-8"),
+    }
+    replace(
+        pending_path(lockfile),
+        (json.dumps(journal, separators=(",", ":")) + "\n").encode("utf-8"),
+        orig,
+    )
+    replace(seqfile, seq_out, orig)
+    replace(registry, reg_payload, orig)
+    if not parent_alive(orig):
+        sys.exit(3)
+    try:
+        os.remove(pending_path(lockfile))
+    except OSError:
+        pass
+    sys.stdout.write("%d\n" % (prev + 1))
+    if committed_row is not None:
+        sys.stdout.write(json.dumps(committed_row, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def jq_apply(lockfile, dest, jq_filter, jq_args, orig):
+    open_locked(lockfile, orig)
+    if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+        with open(dest, "rb") as handle:
+            src = handle.read()
+    else:
+        src = b'{"version":1,"panes":{}}\n'
+    code, out = run_jq(["jq", *jq_args, jq_filter], src, orig)
+    if code != 0:
+        sys.exit(1)
+    replace(dest, out if out.endswith(b"\n") else out + b"\n", orig)
+    sys.stdout.write("OK\n")
+    sys.stdout.flush()
+
+
+def main(argv):
+    orig = os.getppid()
+    op = argv[1] if len(argv) > 1 else ""
+    try:
+        if op == "generation" and len(argv) == 5:
+            generation(argv[2], argv[3], argv[4], orig)
+            return 0
+        if op == "jq-apply" and len(argv) >= 5:
+            jq_apply(argv[2], argv[3], argv[4], argv[5:], orig)
+            return 0
+        if op == "paired" and len(argv) >= 8:
+            paired(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8:], orig)
+            return 0
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        if getattr(exc, "errno", None) == errno.EAGAIN:
+            return 2
+        sys.stderr.write("bac-lock: %s\n" % exc)
+        return 1
+    sys.stderr.write(
+        "usage: bac-lock generation LOCK SEQ PANE | jq-apply LOCK DEST FILTER [jq-args] | paired LOCK REG SEQ PANE end|require|insert|status|present FILTER [jq-args]\n"
+    )
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

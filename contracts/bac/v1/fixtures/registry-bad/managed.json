@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "panes": {
+    "planned": {
+      "pane_id": "planned",
+      "task_id": "not-real",
+      "kind": "codex",
+      "owner": "dot",
+      "backend": "hc",
+      "origin": "launched"
+    }
+  }
+}

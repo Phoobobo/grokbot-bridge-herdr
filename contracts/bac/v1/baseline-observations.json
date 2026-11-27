@@ -1,0 +1,22 @@
+{
+  "commit": "bbdfc4bbaece3ddafa3a9363b1d0f43b230aa5a6",
+  "file": "bin/gbb",
+  "must_contain": [
+    "GBB_VERSION=\"0.3.3\"",
+    "case \"$kind\" in grok | codex) ;; *) die usage \"--kind must be grok or codex\" ;; esac",
+    "kind=\"grok\"; task=\"\"; wt_branch=\"\"; prompt=\"\"; pfile=\"\"; no_wt=0; base=\"\"; explicit_args=0; owner=\"${GBB_OWNER:-}\"; flag_backend=\"\"",
+    "source:\"grokbot-bridge-herdr\"",
+    ".result.root_pane.pane_id // empty",
+    ".address // empty",
+    "OWNER_RE='^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$'"
+  ],
+  "kinds_absent": ["pi", "antigravity"],
+  "quota_absent": true,
+  "notes": [
+    "Omitted --kind becomes grok in this file. bac v1 rejects that with kind_required.",
+    "pane_id for hc is the address field hc returns. pane_id for herdr is root_pane.pane_id. gbb does not mint either.",
+    "herdr_space (sp + 32 hex) and herdr_tab (tb + 32 hex) are placement ids, not pane ids.",
+    "Webhook version at this baseline is the semver string 0.3.3, not integer 1.",
+    "Handover of an already managed pane returns the existing row and does not check owner. bac v1 returns owner_mismatch instead."
+  ]
+}

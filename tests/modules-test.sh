@@ -33,8 +33,8 @@ esac
 H
 chmod +x "$T/bin/herdr" "$T/bin/hc"
 export HERDR_BIN_PATH="$T/bin/herdr" HC_BIN_PATH="$T/bin/hc" HERDR_DOWN="$T/herdr-down" HC_DOWN="$T/hc-down"
-export GBB_STATE_DIR="$T/state" GBB_CONFIG="$T/config.toml" GBB_DOTS_TOKEN_FILE="$T/token"
-unset GBB_WEBHOOK_URL GBB_WEBHOOK_HEADER_NAME GBB_WEBHOOK_HEADER_VALUE GBB_OWNER GBB_BACKEND GBB_DOTS_PROBE_URL 2>/dev/null || true
+export BAC_STATE_DIR="$T/state" BAC_CONFIG="$T/config.toml" BAC_DOTS_TOKEN_FILE="$T/token"
+unset BAC_WEBHOOK_URL BAC_WEBHOOK_HEADER_NAME BAC_WEBHOOK_HEADER_VALUE BAC_OWNER BAC_BACKEND BAC_DOTS_PROBE_URL 2>/dev/null || true
 fail() { echo "FAIL: $*"; cat "$T/state/bridge.log" 2>/dev/null; exit 1; }
 
 cat >"$T/sink.py" <<'PY'
@@ -99,13 +99,13 @@ header_name = "X-Other"
 header_value = "OTHERSECRET"
 TOML
 chmod 600 "$T/config.toml"
-rep=$("$ROOT/bin/gbb" report)
+rep=$("$ROOT/bin/bac" report)
 printf '%s' "$rep" | grep -q SUPERSECRETTOKEN && fail "report leaked primary secret"
 printf '%s' "$rep" | grep -q DOTSSECRETOKEN && fail "report leaked dots secret"
 printf '%s' "$rep" | grep -q OTHERSECRET && fail "report leaked other secret"
 printf '%s' "$rep" | grep -q '/herdr/webhook' && fail "report included a webhook path"
 printf '%s' "$rep" | jq -e --arg p "$P" '
-  .ok and .version == "0.3.1" and .backend_default == "auto" and .backend_effective == "none"
+  .ok and .version == "1.0.0" and .backend_default == "auto" and .backend_effective == "none"
   and .hc_watch.running == false
   and ([.modules[] | {id, probe_ok, enabled}] | sort_by(.id)) == (
     [{"id":"core","probe_ok":true,"enabled":true},
@@ -120,7 +120,7 @@ printf '%s' "$rep" | jq -e --arg p "$P" '
   and ([.tasks[] | select(.task_id=="old")][0] | .backend=="herdr" and .alive==false and .stale==true and .repo=="/repo" and .worktree=="/wt")
   and ([.tasks[] | select(.task_id=="new")][0] | .backend=="hc" and .owner=="dot" and .pane_id=="t1" and .alive==false and .stale==true)
 ' >/dev/null || fail "report shape off: $rep"
-doc=$("$ROOT/bin/gbb" doctor)
+doc=$("$ROOT/bin/bac" doctor)
 printf '%s' "$doc" | grep -q SUPERSECRETTOKEN && fail "doctor leaked a secret"
 printf '%s' "$doc" | jq -e '[.modules[].id] | sort == ["core","dots","hc","herdr_tui"]' >/dev/null || fail "doctor modules: $doc"
 printf '%s' "$doc" | jq -e '.modules[] | select(.id=="herdr_tui") | .enabled==false and (.reason|test("not running"))' >/dev/null || fail "doctor herdr reason"
@@ -129,7 +129,7 @@ printf '%s' "$doc" | jq -e '.modules[] | select(.id=="herdr_tui") | .enabled==fa
 rm -f "$T/hits"/*
 HERDR_PLUGIN_EVENT=pane.agent_status_changed \
   HERDR_PLUGIN_EVENT_JSON='{"data":{"pane_id":"w1:p1","agent_status":"done"}}' \
-  "$ROOT/bin/gbb" hook
+  "$ROOT/bin/bac" hook
 i=0; while { [ ! -f "$T/hits/primary.jsonl" ] || [ ! -f "$T/hits/other.jsonl" ]; } && [ "$i" -lt 40 ]; do sleep 0.1; i=$((i + 1)); done
 [ -f "$T/hits/primary.jsonl" ] || fail "primary not delivered while dots is off"
 [ -f "$T/hits/other.jsonl" ] || fail "non-dots extra was gated: $(ls "$T/hits" 2>/dev/null)"
@@ -139,7 +139,7 @@ grep -q 'dots module off' "$T/state/bridge.log" || fail "skip not logged"
 # --- probes on ---
 rm -f "$T/herdr-down" "$T/hc-down"
 printf 'token\n' >"$T/token"; chmod 600 "$T/token"
-rep=$("$ROOT/bin/gbb" report)
+rep=$("$ROOT/bin/bac" report)
 printf '%s' "$rep" | jq -e '
   ([.modules[] | select(.id=="herdr_tui")][0].probe_ok == true)
   and ([.modules[] | select(.id=="hc")][0].probe_ok == true)
@@ -153,7 +153,7 @@ printf '%s' "$rep" | jq -e '
 rm -f "$T/hits"/*
 HERDR_PLUGIN_EVENT=pane.agent_status_changed \
   HERDR_PLUGIN_EVENT_JSON='{"data":{"pane_id":"w1:p1","agent_status":"blocked"}}' \
-  "$ROOT/bin/gbb" hook
+  "$ROOT/bin/bac" hook
 i=0; while [ ! -f "$T/hits/dots8765.jsonl" ] && [ "$i" -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
 [ -f "$T/hits/dots8765.jsonl" ] || fail "dots endpoint not used when the probe passes"
 
@@ -166,11 +166,11 @@ TOML
 rm -f "$T/hits"/*
 HERDR_PLUGIN_EVENT=pane.agent_status_changed \
   HERDR_PLUGIN_EVENT_JSON='{"data":{"pane_id":"w1:p1","agent_status":"done"}}' \
-  "$ROOT/bin/gbb" hook
+  "$ROOT/bin/bac" hook
 sleep 1
 [ -f "$T/hits/primary.jsonl" ] || fail "primary missing under enabled=false"
 [ ! -f "$T/hits/dots8765.jsonl" ] || fail "enabled=false still delivered to dots"
-"$ROOT/bin/gbb" report | jq -e '.modules[] | select(.id=="dots") | .config==false and .enabled==false and .probe_ok==true' >/dev/null || fail "override false"
+"$ROOT/bin/bac" report | jq -e '.modules[] | select(.id=="dots") | .config==false and .enabled==false and .probe_ok==true' >/dev/null || fail "override false"
 
 # --- enabled = true forces hc on even when the server probe fails; herdr_tui forced off ---
 printf 'down\n' >"$T/hc-down"
@@ -186,12 +186,12 @@ enabled = true
 enabled = false
 TOML
 chmod 600 "$T/config.toml"
-"$ROOT/bin/gbb" report | jq -e '
+"$ROOT/bin/bac" report | jq -e '
   ([.modules[] | select(.id=="hc")][0] | .config==true and .enabled==true and .probe_ok==false)
   and ([.modules[] | select(.id=="herdr_tui")][0] | .config==false and .enabled==false and .probe_ok==true)
   and .backend_effective == "hc"
 ' >/dev/null || fail "force overrides"
-printf '%s' "$("$ROOT/bin/gbb" report)" | grep -q SUPERSECRETTOKEN && fail "report leaked after override"
+printf '%s' "$("$ROOT/bin/bac" report)" | grep -q SUPERSECRETTOKEN && fail "report leaked after override"
 
 # enabled=true forces dots delivery even when the token file (probe) is missing.
 rm -f "$T/token" "$T/hits"/*
@@ -211,9 +211,9 @@ TOML
 chmod 600 "$T/config.toml"
 HERDR_PLUGIN_EVENT=pane.agent_status_changed \
   HERDR_PLUGIN_EVENT_JSON='{"data":{"pane_id":"w1:p1","agent_status":"blocked"}}' \
-  "$ROOT/bin/gbb" hook
+  "$ROOT/bin/bac" hook
 i=0; while [ ! -f "$T/hits/dots8765.jsonl" ] && [ "$i" -lt 40 ]; do sleep 0.1; i=$((i + 1)); done
 [ -f "$T/hits/dots8765.jsonl" ] || fail "enabled=true did not deliver when the probe failed"
-"$ROOT/bin/gbb" report | jq -e '.modules[] | select(.id=="dots") | .config==true and .enabled==true and .probe_ok==false' >/dev/null || fail "force dots on"
-printf '%s' "$("$ROOT/bin/gbb" report)" | grep -q DOTSSECRETOKEN && fail "report leaked dots secret"
+"$ROOT/bin/bac" report | jq -e '.modules[] | select(.id=="dots") | .config==true and .enabled==true and .probe_ok==false' >/dev/null || fail "force dots on"
+printf '%s' "$("$ROOT/bin/bac" report)" | grep -q DOTSSECRETOKEN && fail "report leaked dots secret"
 echo PASS

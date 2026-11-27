@@ -20,7 +20,7 @@ case "$1 $2" in
 esac
 H
 chmod +x "$T/herdr"
-export HERDR_BIN_PATH="$T/herdr" GBB_STATE_DIR="$T/state" GBB_CONFIG="$T/c.toml" STUB_DIR="$T"
+export HERDR_BIN_PATH="$T/herdr" BAC_STATE_DIR="$T/state" BAC_CONFIG="$T/c.toml" STUB_DIR="$T"
 printf 'startup_ready_timeout_sec = 3\n' >"$T/c.toml"
 mkdir -p "$T/state"
 reset() {
@@ -29,12 +29,12 @@ reset() {
 }
 fail=0
 reset dropped
-out=$("$ROOT/bin/gbb" send t1 "hello there" 2>"$T/err")
+out=$("$ROOT/bin/bac" send t1 "hello there" 2>"$T/err")
 echo "dropped:  $out"
 printf '%s' "$out" | jq -e '.ok == false and .error.code == "prompt_not_delivered"' >/dev/null || fail=1
 grep -q unbound "$T/err" && { echo "stderr: $(cat "$T/err")"; fail=1; }
 reset composer
-out=$("$ROOT/bin/gbb" send t1 "hello there" 2>"$T/err")
+out=$("$ROOT/bin/bac" send t1 "hello there" 2>"$T/err")
 echo "composer: $out  calls: $(tr '\n' ' ' <"$T/calls")"
 printf '%s' "$out" | jq -e '.ok == true' >/dev/null || fail=1
 [ "$(grep -c prompt "$T/calls")" = 1 ] && grep -q 'keys enter' "$T/calls" || fail=1

@@ -1,0 +1,73 @@
+{
+  "contract": "bac.v1",
+  "runtime_implemented": true,
+  "git_repo": "Phoobobo/grokbot-bridge-herdr",
+  "repo_renamed": false,
+  "published": false,
+  "baseline": {
+    "commit": "bbdfc4bbaece3ddafa3a9363b1d0f43b230aa5a6",
+    "short": "bbdfc4b",
+    "unique_short": true,
+    "subject": "Place hc tasks in the checkout's space and title the tab",
+    "version": "0.3.3",
+    "pr": "https://github.com/Phoobobo/grokbot-bridge-herdr/pull/2",
+    "pr_head_matches_baseline": true,
+    "pr1": "https://github.com/Phoobobo/grokbot-bridge-herdr/pull/1",
+    "pr1_head": "b8a8b55caaa458db89c4be6b8532615d06efe916",
+    "note": "Branch for this contract starts at PR #2's head. PR #1 and PR #2 histories are not rewritten. main at 92e801a451555891cd1af41bf0f0abfc39adab8a is behind this baseline and is not the parent."
+  },
+  "names": {
+    "product": "BotAsCollie",
+    "cli": "bac",
+    "source": "bot-as-collie",
+    "contract_version": 1,
+    "plugin_id": "phoobobo.bot-as-collie",
+    "config_dir": "bot-as-collie",
+    "config_file": "config.toml",
+    "state_dir": "bot-as-collie",
+    "data_dir": "bot-as-collie",
+    "env_prefix": "BAC_",
+    "owner_env": "BAC_OWNER",
+    "agent_name_prefix": "bac-",
+    "tab_title_prefix": "bac · ",
+    "worktree_branch_prefix": "bac/",
+    "hc_label_managed": "bac=managed",
+    "hc_label_task": "bac_task",
+    "legacy_hc_label_managed": "grokbot=managed",
+    "legacy_hc_label_task": "gbb_task",
+    "mcp_tool_prefix": "bac_",
+    "callback_event_id_domain": "bac.callback.v1",
+    "registry_schema": "bac.registry.v1",
+    "model_freshness_sec": 900
+  },
+  "legacy_runtime_until_cutover": {
+    "cli": "gbb",
+    "source": "grokbot-bridge-herdr",
+    "plugin_id": "phoobobo.grokbot-bridge",
+    "version_field": "semver string, currently 0.3.3",
+    "config_dir": "grokbot-bridge-herdr",
+    "state_dir": "grokbot-bridge-herdr"
+  },
+  "consumers_verified": {
+    "dots_tunnel_bridge": {
+      "repo": "Phoobobo/dots-tunnel-bridge",
+      "commit": "a4b8e597060da1f3a714bc3b608278c3a2f219b0",
+      "html": "https://github.com/Phoobobo/dots-tunnel-bridge/commit/a4b8e597060da1f3a714bc3b608278c3a2f219b0",
+      "paths": [
+        "src/dots_bridge/herdr_tools.py",
+        "docs/HERDR.md",
+        "AGENTS.md"
+      ],
+      "verified_readonly": true,
+      "default_branch_tip_matches": true
+    },
+    "grok_bot": {
+      "verified": false,
+      "reason": "Described in this repo (ADR 0004, README) as the primary webhook consumer. No separate public client repository was read in this round."
+    },
+    "super_bot": {
+      "verified": false,
+      "reason": "No public repository was identified. Coordinator supplies its owner name and webhook. It is not a second CLI and it does not call hc directly."
+    }
+  }
+}
